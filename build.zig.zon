@@ -9,12 +9,12 @@
             .hash = "webidl_zig-0.1.0-FrIyV-bPBgBb-xc1PIvSRULxj9AVuKJ0mVNj-7nE9P5w",
         },
         .lattice = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/lattice#c55e0594f6c472d249fffeae584b409dcb6abd18",
-            .hash = "lattice-0.1.0-TdtxHEjACQBjn8EOf1DqRnXekwdM12o0QifswEV7oUPc",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/lattice#496ce3ad0278f426343ee919b387292d8c26f738",
+            .hash = "lattice-0.1.0-TdtxHEjACQAZXS2k1S9BsznXAvVtQyzgttk6TfMAwNa1",
         },
         .prism = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/prism.git#5a340216837e6682f2e688ae4b8fddc08488c189",
-            .hash = "prism-0.1.0-PSE12Dy9OABlru9Ydop5mbJ6GBeeQDjf6e4G5oM5zJEX",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/prism.git#c5229d2e6970f4afa0bdead6e374b78fdcceca4a",
+            .hash = "prism-0.1.0-PSE12Dy9OADInz978yIM9fTC8EkWv_p_sa-aHf1ei_ny",
         },
     },
     .paths = .{
