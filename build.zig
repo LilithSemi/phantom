@@ -110,19 +110,51 @@ fn addAppImports(app_mod: *std.Build.Module, phantom_mod: *std.Build.Module, imp
     }
 }
 
+/// The web page of an app as build outputs, before anything is installed.
+pub const WebDist = struct {
+    /// The directory that holds the page. Every path in `files` is relative to it.
+    dir: std.Build.LazyPath,
+    /// Every file of the page, relative to `dir`, as the page refers to it.
+    files: []const []const u8,
+};
+
 fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.AppOptions) *std.Build.Step {
+    const dist_dir = b.fmt("dist/{s}", .{opts.id});
+    const web = addWebDist(b, phantom_dep, opts);
+
+    const step = b.step(b.fmt("app-{s}", .{opts.id}), b.fmt("Package {s} (web)", .{opts.id}));
+    step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = web.dir,
+        .install_dir = .prefix,
+        .install_subdir = dist_dir,
+    }).step);
+
+    // Dev-serve: `zig build serve-<name>` serves dist/{id}/ over http via the first
+    // available runtime, using an inline zero-dependency static server that sets
+    // application/wasm for .wasm (required for WebAssembly.instantiateStreaming).
+    addServeStep(b, dist_dir, execName(b, opts.id, opts.exec_name), step);
+
+    return step;
+}
+
+/// Build the web page of an app without installing it, for a consumer that
+/// serves or embeds the files itself. The page is always built for
+/// wasm32-freestanding, whatever `opts.target` is.
+pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.AppOptions) WebDist {
+    const wasm_name = execName(b, opts.id, opts.exec_name);
+    const dist = b.addWriteFiles();
+    var files: std.ArrayList([]const u8) = .empty;
+
     // A wrong base_path is a caller mistake, not a runtime fault: fail the
     // build now with a message that says what was expected, rather than
     // install a page whose assets resolve to the wrong place.
     appmeta.validateBasePath(opts.base_path) catch {
-        return &b.addFail(b.fmt(
+        dist.step.dependOn(&b.addFail(b.fmt(
             "phantom.addApp: base_path must start and end with '/', got \"{s}\"",
             .{opts.base_path},
-        )).step;
+        )).step);
+        return .{ .dir = dist.getDirectory(), .files = &.{} };
     };
-
-    const wasm_name = execName(b, opts.id, opts.exec_name);
-    const dist_dir = b.fmt("dist/{s}", .{opts.id});
 
     // wasm32-freestanding target: no prism/lattice imported so the pure-Zig web
     // decls (web.init / web.WebApp, backend.dom) are analyzed without triggering
@@ -209,15 +241,12 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     // .bun / .deno / .tsc pin that strategy; an unavailable tool injects a
     // build-time failure step that names the tool (the wasm is still compiled).
 
-    const step = b.step(b.fmt("app-{s}", .{opts.id}), b.fmt("Package {s} (web)", .{opts.id}));
+    const wasm_file = b.fmt("{s}.wasm", .{wasm_name});
+    _ = dist.addCopyFile(wasm.getEmittedBin(), wasm_file);
+    addDistFile(b, &files, wasm_file);
 
-    // Install wasm into dist/{id}/
-    step.dependOn(&b.addInstallArtifact(wasm, .{
-        .dest_dir = .{ .override = .{ .custom = dist_dir } },
-    }).step);
-
-    // Build + install the webidl-runtime JS and generate a matching index.html.
-    const runtime_import = addRuntimeToStep(b, webidl_dep, dist_dir, step, opts.web_runtime);
+    // Build the webidl-runtime JS and generate a matching index.html.
+    const runtime_import = addRuntime(b, webidl_dep, dist, &files, opts.web_runtime);
 
     // The tab title and description come from the app's own localized text,
     // not the wasm binary's name, so a name with '&' or '"' cannot break the
@@ -227,14 +256,15 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     // A prerendered route installs THIS page one directory down, where `./`
     // resolves somewhere else, so the base tag has to be there even at the root.
     const prerendered = opts.url_strategy == .path and opts.prerender_routes.len > 0;
-    const html_lp = b.addWriteFiles().add("index.html", buildIndexHtml(b, opts.base_path, prerendered, name_html, summary_html));
-    step.dependOn(&b.addInstallFile(html_lp, b.fmt("{s}/index.html", .{dist_dir})).step);
+    const html = buildIndexHtml(b, opts.base_path, prerendered, name_html, summary_html);
+    _ = dist.add("index.html", html);
+    addDistFile(b, &files, "index.html");
 
     // The page's logic, as a file beside it. See `buildIndexHtml`: an inline
     // script is refused by any strict Content Security Policy, and a blank page
     // with one console violation is a bad first impression of a framework.
-    const boot_lp = b.addWriteFiles().add("boot.js", buildBootJs(b, runtime_import, wasm_name));
-    step.dependOn(&b.addInstallFile(boot_lp, b.fmt("{s}/boot.js", .{dist_dir})).step);
+    _ = dist.add("boot.js", buildBootJs(b, runtime_import, wasm_name));
+    addDistFile(b, &files, "boot.js");
 
     // The built-in fonts, as files, for the same reason and a sharper one.
     //
@@ -251,10 +281,9 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     // decided now. An unreferenced file is never fetched: only a `@font-face`
     // that some text actually matches costs a request.
     for ([_][]const u8{ "Neuropol.otf", "Mesmerize Rg.otf", "Mesmerize Sb.otf" }) |font_file| {
-        step.dependOn(&b.addInstallFile(
-            phantom_dep.builder.path(b.fmt("lib/phantom/text/fonts/{s}", .{font_file})),
-            b.fmt("{s}/{s}{s}", .{ dist_dir, phantom_font_dir, font_file }),
-        ).step);
+        const rel = b.fmt("{s}{s}", .{ phantom_font_dir, font_file });
+        _ = dist.addCopyFile(phantom_dep.builder.path(b.fmt("lib/phantom/text/fonts/{s}", .{font_file})), rel);
+        addDistFile(b, &files, rel);
     }
 
     // prerender_routes only means something with the .path strategy: a .hash
@@ -270,25 +299,25 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
 
     // With the .path strategy, write a standalone copy of the page at each
     // route so a static host answers a refresh with 200 instead of 404.
-    // "/gallery" becomes "dist/{id}/gallery/index.html", so a static host
-    // serves the same application for that path with no rewrite rule. A
-    // route with a '/' inside it, such as "/docs/intro", works the same way,
-    // because the install path keeps the separator.
+    // "/gallery" becomes "gallery/index.html", so a static host serves the
+    // same application for that path with no rewrite rule. A route with a '/'
+    // inside it, such as "/docs/intro", works the same way, because the path
+    // keeps the separator.
     if (opts.url_strategy == .path) {
         for (opts.prerender_routes) |route| {
             const trimmed = std.mem.trim(u8, route, "/");
             if (trimmed.len == 0) continue;
-            const dest = b.fmt("{s}/{s}/index.html", .{ dist_dir, trimmed });
-            step.dependOn(&b.addInstallFile(html_lp, dest).step);
+            const rel = b.fmt("{s}/index.html", .{trimmed});
+            _ = dist.add(rel, html);
+            addDistFile(b, &files, rel);
         }
     }
 
-    // Dev-serve: `zig build serve-<name>` serves dist/{id}/ over http via the first
-    // available runtime, using an inline zero-dependency static server that sets
-    // application/wasm for .wasm (required for WebAssembly.instantiateStreaming).
-    addServeStep(b, dist_dir, wasm_name, step);
+    return .{ .dir = dist.getDirectory(), .files = files.items };
+}
 
-    return step;
+fn addDistFile(b: *std.Build, files: *std.ArrayList([]const u8), rel: []const u8) void {
+    files.append(b.allocator, rel) catch @panic("OOM");
 }
 
 // Inline static server scripts. Each serves a directory on port 8080. A request
@@ -436,13 +465,17 @@ fn addServeStep(b: *std.Build, dist_dir: []const u8, name: []const u8, app_step:
     }
 }
 
-/// Wire the webidl-runtime build/install into step. Returns the JS import path
-/// to embed in the generated index.html (so HTML and runtime step agree).
-fn addRuntimeToStep(
+/// The modules of the multi-file webidl runtime. tsc compiles one `.ts` source
+/// for each, and the prebuilt dist holds one `.js` file for each.
+const webidl_runtime_modules = [_][]const u8{ "abi", "host", "index", "loader" };
+
+/// Write the webidl-runtime JS into `dist`. Returns the JS import path to embed
+/// in the generated index.html (so HTML and runtime agree).
+fn addRuntime(
     b: *std.Build,
     webidl_dep: *std.Build.Dependency,
-    dist_dir: []const u8,
-    step: *std.Build.Step,
+    dist: *std.Build.Step.WriteFile,
+    files: *std.ArrayList([]const u8),
     runtime: appmeta.WebRuntime,
 ) []const u8 {
     // The committed dist is the exception, not the rule: npm/.gitignore ignores
@@ -465,7 +498,7 @@ fn addRuntimeToStep(
         // .auto tries the committed dist first and falls back to tsc, so an
         // unresolved .auto always means tsc is the missing tool.
         const missing_tool: []const u8 = if (runtime == .auto) "tsc" else @tagName(runtime);
-        step.dependOn(&b.addFail(b.fmt(
+        dist.step.dependOn(&b.addFail(b.fmt(
             "phantom.addApp: the web target needs {s}, but it was not found in PATH",
             .{missing_tool},
         )).step);
@@ -482,16 +515,16 @@ fn addRuntimeToStep(
             const run = b.addSystemCommand(&.{ (b.findProgram(&.{"bun"}, &.{}) catch unreachable), "build", "--format", "esm", "--entrypoints" });
             run.addFileArg(bundle_entry);
             run.addArg("--outfile");
-            const js_lp = run.addOutputFileArg("webidl-runtime.js");
-            step.dependOn(&b.addInstallFile(js_lp, b.fmt("{s}/webidl-runtime.js", .{dist_dir})).step);
+            _ = dist.addCopyFile(run.addOutputFileArg("webidl-runtime.js"), "webidl-runtime.js");
+            addDistFile(b, files, "webidl-runtime.js");
         },
         .deno => {
             // deno bundle (Deno 2.8.3, native/offline). This is the browser single-file form.
             const run = b.addSystemCommand(&.{ (b.findProgram(&.{"deno"}, &.{}) catch unreachable), "bundle", "--platform", "browser" });
             run.addFileArg(bundle_entry);
             run.addArg("--output");
-            const js_lp = run.addOutputFileArg("webidl-runtime.js");
-            step.dependOn(&b.addInstallFile(js_lp, b.fmt("{s}/webidl-runtime.js", .{dist_dir})).step);
+            _ = dist.addCopyFile(run.addOutputFileArg("webidl-runtime.js"), "webidl-runtime.js");
+            addDistFile(b, files, "webidl-runtime.js");
         },
         .tsc => {
             // Compile the TS source directly (not the missing dist): --outDir
@@ -517,28 +550,28 @@ fn addRuntimeToStep(
                 "--outDir",
             });
             const out_dir = run.addOutputDirectoryArg("webidl-runtime");
-            run.addFileArg(webidl_dep.builder.path("npm/webidl-runtime/src/abi.ts"));
-            run.addFileArg(webidl_dep.builder.path("npm/webidl-runtime/src/host.ts"));
-            run.addFileArg(webidl_dep.builder.path("npm/webidl-runtime/src/index.ts"));
-            run.addFileArg(webidl_dep.builder.path("npm/webidl-runtime/src/loader.ts"));
+            for (webidl_runtime_modules) |name| {
+                run.addFileArg(webidl_dep.builder.path(b.fmt("npm/webidl-runtime/src/{s}.ts", .{name})));
+            }
             run.addFileArg(webidl_dep.builder.path("npm/webidl-runtime/src/node-fs.d.ts"));
-            step.dependOn(&b.addInstallDirectory(.{
-                .source_dir = out_dir,
-                .install_dir = .prefix,
-                .install_subdir = b.fmt("{s}/webidl-runtime", .{dist_dir}),
-                .include_extensions = &.{".js"},
-            }).step);
+            addRuntimeModules(b, out_dir, dist, files);
         },
-        .prebuilt => {
-            step.dependOn(&b.addInstallDirectory(.{
-                .source_dir = webidl_dep.builder.path("npm/webidl-runtime/dist"),
-                .install_dir = .prefix,
-                .install_subdir = b.fmt("{s}/webidl-runtime", .{dist_dir}),
-                .include_extensions = &.{".js"},
-            }).step);
-        },
+        .prebuilt => addRuntimeModules(b, webidl_dep.builder.path("npm/webidl-runtime/dist"), dist, files),
     }
     return appmeta.importPathFor(strategy);
+}
+
+fn addRuntimeModules(
+    b: *std.Build,
+    js_dir: std.Build.LazyPath,
+    dist: *std.Build.Step.WriteFile,
+    files: *std.ArrayList([]const u8),
+) void {
+    for (webidl_runtime_modules) |name| {
+        const rel = b.fmt("webidl-runtime/{s}.js", .{name});
+        _ = dist.addCopyFile(js_dir.path(b, b.fmt("{s}.js", .{name})), rel);
+        addDistFile(b, files, rel);
+    }
 }
 
 /// The page itself: a shell with no logic in it at all.
