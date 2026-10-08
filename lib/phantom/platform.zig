@@ -40,8 +40,42 @@ pub const OpenMode = enum {
     same_tab,
 };
 
+/// One thing that happened on a server-sent event stream. The slices are valid
+/// only for the call that receives them.
+pub const ServerEvent = union(enum) {
+    /// The connection is open, first time or after a reconnect.
+    open,
+    message: Message,
+    /// The connection dropped and the browser tries again by itself.
+    reconnecting,
+    /// The browser stopped, for example after a status that is not 200 or a
+    /// response that is not `text/event-stream`. No more events come.
+    closed,
+
+    pub const Message = struct {
+        /// The `event:` field, or "message" when the server sent none.
+        type: []const u8,
+        data: []const u8,
+        last_event_id: []const u8,
+    };
+};
+
+/// Receives the events of one stream. `ctx` must stay valid until the stream
+/// is closed.
+pub const ServerEventSink = struct {
+    ctx: *anyopaque,
+    on_event: *const fn (ctx: *anyopaque, event: ServerEvent) void,
+};
+
+/// An open server-sent event stream. Close it with `Platform.closeEventSource`.
+pub const EventSource = struct { id: u32 };
+
 pub const Platform = struct {
     ctx: ?*anyopaque = null,
+    /// Opens a server-sent event stream on `url`. `types` names the event types
+    /// to receive in addition to "message". Null when the stream cannot open.
+    open_event_source: ?*const fn (*anyopaque, url: []const u8, types: []const []const u8, sink: ServerEventSink) ?EventSource = null,
+    close_event_source: ?*const fn (*anyopaque, EventSource) void = null,
     /// Opens `url`, and reports whether the URL WAS opened rather than whether
     /// this hook exists. A browser refuses `window.open` when it decides the
     /// call is a popup, and it says so by handing back nothing; a hook that
@@ -118,6 +152,25 @@ pub const Platform = struct {
         const f = self.write_location orelse return;
         const c = self.ctx orelse return;
         f(c, path, mode);
+    }
+
+    /// Opens a server-sent event stream, such as a `text/event-stream` response.
+    /// The page reads it with the browser's `EventSource`, so the stream can stay
+    /// open, which a request through `std.http.Client` cannot do on the web.
+    ///
+    /// Null on a backend with no browser, and when no slot is free. Events go to
+    /// `sink` between frames, never while the tree builds.
+    pub fn openEventSource(self: Platform, url: []const u8, types: []const []const u8, sink: ServerEventSink) ?EventSource {
+        const f = self.open_event_source orelse return null;
+        const c = self.ctx orelse return null;
+        return f(c, url, types, sink);
+    }
+
+    /// Closes a stream. No event reaches its sink after this returns.
+    pub fn closeEventSource(self: Platform, source: EventSource) void {
+        const f = self.close_event_source orelse return;
+        const c = self.ctx orelse return;
+        f(c, source);
     }
 };
 

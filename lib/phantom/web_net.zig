@@ -81,6 +81,10 @@ pub const Request = struct {
 /// Runs one request to completion and returns the whole HTTP/1.1 response as an
 /// owned slice, or null when it never arrived.
 ///
+/// A response that does not end cannot be read. Server-sent events and a chunked
+/// body that the server keeps open never complete, so `send` never returns. Read
+/// server-sent events with `Platform.openEventSource`.
+///
 /// Blocking is the point and it is the hard part: on the web this is a suspension
 /// through JSPI where the browser has it, and a synchronous XMLHttpRequest where
 /// it does not. Both look the same from here.

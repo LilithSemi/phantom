@@ -6,6 +6,22 @@ const phantom = @import("../phantom.zig");
 /// than a need.
 pub const max_fonts = 16;
 
+/// How many server-sent event streams one page can hold open. A browser on
+/// HTTP/1.1 allows six connections to one origin, so more than this is a leak.
+pub const max_event_sources = 16;
+
+/// The low byte of an `EventSource` id is its slot, the rest counts how often
+/// the slot was used. An event for a closed stream then cannot reach the next
+/// stream in the same slot.
+const EventSourceSlot = struct {
+    sink: ?phantom.ServerEventSink = null,
+    generation: u24 = 0,
+
+    fn id(self: EventSourceSlot, index: usize) u32 {
+        return (@as(u32, self.generation) << 8) | @as(u32, @intCast(index));
+    }
+};
+
 /// Heap-allocated, page-lifetime web app. JS holds the pointer returned by init
 /// (as a usize) and passes it back to every dispatch entry. No module-level globals.
 pub const WebApp = struct {
@@ -23,6 +39,8 @@ pub const WebApp = struct {
     focus: phantom.FocusManager = .{},
     /// Sockets that are really `fetch`. See `web_net.zig`.
     net: phantom.web_net.Net,
+    /// The open server-sent event streams. See `Platform.openEventSource`.
+    event_sources: [max_event_sources]EventSourceSlot = @splat(.{}),
     /// The fonts already registered with the browser, so each is registered
     /// once. Page-lifetime, because a face registered on one frame has to still
     /// count as registered on the next.
@@ -61,6 +79,17 @@ pub const WebApp = struct {
         // An unconditional render would rebuild the whole DOM 60 times a
         // second, so repaint only when a callback marked something dirty.
         if (self.owner.dirty.items.len > 0) self.render();
+    }
+
+    /// Called by the page with one event of the stream `id`. An id that names
+    /// no open stream is dropped: the stream was closed while the event waited.
+    pub fn serverEvent(self: *WebApp, id: u32, event: phantom.ServerEvent) void {
+        const index = id & 0xff;
+        if (index >= max_event_sources) return;
+        const slot = self.event_sources[index];
+        const sink = slot.sink orelse return;
+        if (slot.id(index) != id) return;
+        sink.on_event(sink.ctx, event);
     }
 
     /// Register every font this frame draws with that has not been registered
@@ -359,6 +388,38 @@ fn readHostThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
         app.sink.report(.location_too_long, "the page host is longer than the buffer that reads it");
         return null;
     };
+}
+
+fn openEventSourceThunk(ctx: *anyopaque, url: []const u8, types: []const []const u8, sink: phantom.ServerEventSink) ?phantom.EventSource {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    const index = for (app.event_sources, 0..) |slot, i| {
+        if (slot.sink == null) break i;
+    } else return null;
+    const slot = &app.event_sources[index];
+
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(app.gpa);
+    for (types, 0..) |t, i| {
+        if (i > 0) joined.append(app.gpa, '\n') catch return null;
+        joined.appendSlice(app.gpa, t) catch return null;
+    }
+
+    slot.generation +%= 1;
+    const id = slot.id(index);
+    // `init` installs this thunk only when both event source hooks are set.
+    if (!app.ops.open_event_source.?(app.ops.ctx, id, url, joined.items)) return null;
+    slot.sink = sink;
+    return .{ .id = id };
+}
+
+fn closeEventSourceThunk(ctx: *anyopaque, source: phantom.EventSource) void {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    const index = source.id & 0xff;
+    if (index >= max_event_sources) return;
+    const slot = &app.event_sources[index];
+    if (slot.sink == null or slot.id(index) != source.id) return;
+    slot.sink = null;
+    app.ops.close_event_source.?(app.ops.ctx, source.id);
 }
 
 fn writeLocationThunk(ctx: *anyopaque, path: []const u8, mode: phantom.WriteMode) void {
@@ -681,6 +742,7 @@ pub fn init(
     // silently does nothing: `Platform.openUrl` must return false so
     // `Link.tap` reports `link_unsupported`, and `Platform.readLocation` must
     // return null so a missing hook cannot be mistaken for an empty address.
+    const has_event_source = ops.open_event_source != null and ops.close_event_source != null;
     owner.platform = .{
         .ctx = app,
         .open_url = if (ops.open_url != null) openUrlThunk else null,
@@ -688,6 +750,8 @@ pub fn init(
         .read_query = if (ops.read_query != null) readQueryThunk else null,
         .read_host = if (ops.read_host != null) readHostThunk else null,
         .write_location = if (ops.write_location != null) writeLocationThunk else null,
+        .open_event_source = if (has_event_source) openEventSourceThunk else null,
+        .close_event_source = if (has_event_source) closeEventSourceThunk else null,
         .strategy = strategy,
     };
 
@@ -1669,4 +1733,94 @@ test "a font already registered is not registered again, however many frames dra
         if (std.mem.startsWith(u8, line, "addFont(")) registered += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), registered);
+}
+
+const EventSpy = struct {
+    seen: [8]phantom.ServerEvent = undefined,
+    data: [8][32]u8 = undefined,
+    len: usize = 0,
+
+    fn sink(self: *EventSpy) phantom.ServerEventSink {
+        return .{ .ctx = self, .on_event = onEvent };
+    }
+
+    fn onEvent(ctx: *anyopaque, event: phantom.ServerEvent) void {
+        const self: *EventSpy = @ptrCast(@alignCast(ctx));
+        self.seen[self.len] = event;
+        if (event == .message) {
+            const d = event.message.data;
+            @memcpy(self.data[self.len][0..d.len], d);
+            self.seen[self.len].message.data = self.data[self.len][0..d.len];
+        }
+        self.len += 1;
+    }
+};
+
+test "an event source opens through the host and its events reach the sink until it closes" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    var spy = EventSpy{};
+    const source = app.owner.platform.openEventSource("/api/events", &.{ "line", "done" }, spy.sink()).?;
+    var want_buf: [64]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "openEventSource({d},/api/events,line\ndone)", .{source.id});
+    try std.testing.expect(logHas(rec.log.items, want));
+
+    app.serverEvent(source.id, .open);
+    app.serverEvent(source.id, .{ .message = .{ .type = "line", .data = "hello", .last_event_id = "7" } });
+    try std.testing.expectEqual(@as(usize, 2), spy.len);
+    try std.testing.expect(spy.seen[0] == .open);
+    try std.testing.expectEqualStrings("hello", spy.seen[1].message.data);
+
+    app.owner.platform.closeEventSource(source);
+    const closed = try std.fmt.bufPrint(&want_buf, "closeEventSource({d})", .{source.id});
+    try std.testing.expect(logHas(rec.log.items, closed));
+    app.serverEvent(source.id, .closed);
+    try std.testing.expectEqual(@as(usize, 2), spy.len);
+}
+
+test "an event for a closed stream does not reach the stream that took its slot" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    var first = EventSpy{};
+    var second = EventSpy{};
+    const old = app.owner.platform.openEventSource("/a", &.{}, first.sink()).?;
+    app.owner.platform.closeEventSource(old);
+    const new = app.owner.platform.openEventSource("/b", &.{}, second.sink()).?;
+    try std.testing.expect(old.id != new.id);
+
+    app.serverEvent(old.id, .open);
+    try std.testing.expectEqual(@as(usize, 0), second.len);
+    app.serverEvent(new.id, .open);
+    try std.testing.expectEqual(@as(usize, 1), second.len);
+}
+
+test "an event source is null when the host has no hook or every slot is in use" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+
+    var ops = rec.ops();
+    ops.open_event_source = null;
+    const bare = try init(gpa, ops, phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, bare);
+    var spy = EventSpy{};
+    try std.testing.expectEqual(@as(?phantom.EventSource, null), bare.owner.platform.openEventSource("/a", &.{}, spy.sink()));
+
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+    for (0..max_event_sources) |_| _ = app.owner.platform.openEventSource("/a", &.{}, spy.sink()).?;
+    try std.testing.expectEqual(@as(?phantom.EventSource, null), app.owner.platform.openEventSource("/a", &.{}, spy.sink()));
+}
+
+fn logHas(log: []const []u8, line: []const u8) bool {
+    for (log) |l| if (std.mem.eql(u8, l, line)) return true;
+    return false;
 }

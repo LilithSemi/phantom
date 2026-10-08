@@ -187,6 +187,9 @@ pub const Platform = platform.Platform;
 pub const UrlStrategy = platform.UrlStrategy;
 pub const WriteMode = platform.WriteMode;
 pub const OpenMode = platform.OpenMode;
+pub const ServerEvent = platform.ServerEvent;
+pub const ServerEventSink = platform.ServerEventSink;
+pub const EventSource = platform.EventSource;
 pub const link_widget = @import("phantom/widgets/link.zig");
 pub const Link = link_widget.Link;
 

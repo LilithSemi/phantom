@@ -397,6 +397,8 @@ export fn init(doc_handle: u32, body_handle: u32, window_handle: u32) usize {
         .write_location = writeLocation,
         .read_scroll_offset = readScrollOffset,
         .write_scroll_offset = writeScrollOffset,
+        .open_event_source = openEventSource,
+        .close_event_source = closeEventSource,
     };
     const strategy: phantom.UrlStrategy = if (strategy_is_hash) .hash else .path;
     const app = phantom.web.init(std.heap.wasm_allocator, ops, phantom.Root.plain(app_root.root), .{ .width = @floatFromInt(vw), .height = @floatFromInt(vh) }, @floatCast(dpr), strategy) catch return 0;
@@ -513,4 +515,52 @@ export fn dispatchText(app: usize, ptr: usize, len: usize) u32 {
     if (app == 0) return 0;
     const a: *phantom.web.WebApp = @ptrFromInt(app);
     return @intFromBool(a.dispatchText(buf[0..len]));
+}
+
+// ---------------------------------------------------------------------------
+// Server-sent events. The page holds one `EventSource` for each open stream,
+// keeps the events it receives, and hands them over between frames through
+// `serverEvent`, so an event never arrives while the tree builds.
+// ---------------------------------------------------------------------------
+
+extern "phantom" fn __phantom_event_source_open(id: u32, url_ptr: [*]const u8, url_len: usize, types_ptr: [*]const u8, types_len: usize) u32;
+extern "phantom" fn __phantom_event_source_close(id: u32) void;
+
+fn openEventSource(_: *anyopaque, id: u32, url: []const u8, types: []const u8) bool {
+    return __phantom_event_source_open(id, url.ptr, url.len, types.ptr, types.len) != 0;
+}
+
+fn closeEventSource(_: *anyopaque, id: u32) void {
+    __phantom_event_source_close(id);
+}
+
+/// The page allocates the three strings through `webidl_rt_alloc`, and they
+/// are freed here after the sink returns. `kind` is 0 for open, 1 for a
+/// message, 2 for reconnecting and 3 for closed.
+export fn serverEvent(
+    app: usize,
+    id: u32,
+    kind: u32,
+    type_ptr: u32,
+    type_len: u32,
+    data_ptr: u32,
+    data_len: u32,
+    last_id_ptr: u32,
+    last_id_len: u32,
+) void {
+    const type_s = rawSlice(type_ptr, type_len);
+    const data = rawSlice(data_ptr, data_len);
+    const last_id = rawSlice(last_id_ptr, last_id_len);
+    defer webidl.rt.freeStr(type_s);
+    defer webidl.rt.freeStr(data);
+    defer webidl.rt.freeStr(last_id);
+    if (app == 0) return;
+    const a: *phantom.web.WebApp = @ptrFromInt(app);
+    const event: phantom.ServerEvent = switch (kind) {
+        0 => .open,
+        1 => .{ .message = .{ .type = type_s, .data = data, .last_event_id = last_id } },
+        2 => .reconnecting,
+        else => .closed,
+    };
+    a.serverEvent(id, event);
 }

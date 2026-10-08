@@ -100,6 +100,11 @@ pub const DomOps = struct {
     /// key of zeros and no error. Everything downstream of this hook exists to
     /// stop that particular lie.
     fill_random: ?*const fn (ctx: *anyopaque, buf: []u8) bool = null,
+    /// Opens an `EventSource` on `url` that the page knows by `id`. `types` is
+    /// the extra event types to listen for, one on each line. Returns false
+    /// when the browser refuses the URL.
+    open_event_source: ?*const fn (ctx: *anyopaque, id: u32, url: []const u8, types: []const u8) bool = null,
+    close_event_source: ?*const fn (ctx: *anyopaque, id: u32) void = null,
     /// Puts `path` in the address bar without loading a new page, in `mode`.
     write_location: ?*const fn (ctx: *anyopaque, path: []const u8, mode: platform.WriteMode) void = null,
     /// Reads a scroll region's current offset (scrollLeft/scrollTop) from the
@@ -752,6 +757,17 @@ pub const Recorder = struct {
         self.setScrollOffset(node, offset);
     }
 
+    fn openEventSource(ctx: *anyopaque, id: u32, url: []const u8, types: []const u8) bool {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.rec("openEventSource({d},{s},{s})", .{ id, url, types });
+        return true;
+    }
+
+    fn closeEventSource(ctx: *anyopaque, id: u32) void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.rec("closeEventSource({d})", .{id});
+    }
+
     fn rec(self: *Recorder, comptime fmt: []const u8, args: anytype) void {
         const line = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
         self.log.append(self.gpa, line) catch {};
@@ -843,6 +859,8 @@ pub const Recorder = struct {
             .write_location = writeLocation,
             .read_scroll_offset = readScrollOffset,
             .write_scroll_offset = writeScrollOffset,
+            .open_event_source = openEventSource,
+            .close_event_source = closeEventSource,
         };
     }
 };
