@@ -13,18 +13,15 @@ let instance;
 // is a synchronous XMLHttpRequest, which does freeze the page for the
 // length of the request. Both fill the same struct and the wasm side
 // cannot tell which one answered.
+//
+// Gecko is skipped. Firefox 155 and 156 crash the content process on any
+// call through `WebAssembly.promising`, even into a function that does
+// nothing. `mozInnerScreenX` exists only in Gecko.
+const gecko = "mozInnerScreenX" in window;
 const jspi =
+  !gecko &&
   typeof WebAssembly.Suspending === "function" &&
   typeof WebAssembly.promising === "function";
-// Said out loud because the two paths behave differently in ways a
-// developer will otherwise put down to something else: the fallback
-// freezes the page for the length of a request and cannot carry a
-// binary body. Which one is in use should never be a guess.
-console.info(
-  jspi
-    ? "phantom: http suspends through JSPI"
-    : "phantom: no JSPI here, http blocks on a synchronous XMLHttpRequest",
-);
 
 const dec = new TextDecoder();
 const enc = new TextEncoder();
