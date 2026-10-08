@@ -350,13 +350,11 @@ pub fn requestUrl(gpa: Allocator, page_host: []const u8, req: Request) ![]u8 {
 /// browser can tell us about a reply.
 ///
 /// `headers` is the block a browser hands back, which is `\r\n` separated with a
-/// trailing separator and lower-cased names. It is passed through as it is: a
-/// header block does not have to be pretty to parse, and rewriting it would be a
-/// chance to change what the server said.
-///
-/// A `content-length` is appended when the block has none, which is what makes
-/// the reply readable as a message rather than as a stream that ends whenever the
-/// connection does.
+/// trailing separator and lower-cased names. It is passed through, except for the
+/// headers that frame the body. The browser has already removed the chunks and
+/// the compression, so `transfer-encoding`, `content-encoding` and the server's
+/// `content-length` describe bytes that are not here. They are dropped, and a
+/// `content-length` for `body` is written instead.
 ///
 /// `connection: close` is appended for a reason worth spelling out, because
 /// leaving it off looked harmless and was not. One connection here is ONE `fetch`
@@ -373,28 +371,25 @@ pub fn buildResponse(gpa: Allocator, status: u16, headers: []const u8, body: []c
     // treats the phrase as decoration, and inventing one would put words in the
     // server's mouth.
     try out.print(gpa, "HTTP/1.1 {d} \r\n", .{status});
-    try out.appendSlice(gpa, headers);
-    if (headers.len > 0 and !std.mem.endsWith(u8, headers, "\r\n")) {
+    var it = std.mem.splitSequence(u8, headers, "\r\n");
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (isFramingHeader(line)) continue;
+        try out.appendSlice(gpa, line);
         try out.appendSlice(gpa, "\r\n");
     }
-    if (!hasHeader(headers, "content-length")) {
-        try out.print(gpa, "content-length: {d}\r\n", .{body.len});
-    }
-    if (!hasHeader(headers, "connection")) {
-        try out.appendSlice(gpa, "connection: close\r\n");
-    }
+    try out.print(gpa, "content-length: {d}\r\n", .{body.len});
+    try out.appendSlice(gpa, "connection: close\r\n");
     try out.appendSlice(gpa, "\r\n");
     try out.appendSlice(gpa, body);
     return out.toOwnedSlice(gpa);
 }
 
-/// Whether `block` already carries `name`, matched case-insensitively at the
-/// start of a line, which is the only place a header name can be.
-fn hasHeader(block: []const u8, name: []const u8) bool {
-    var it = std.mem.splitSequence(u8, block, "\r\n");
-    while (it.next()) |line| {
-        if (line.len < name.len + 1) continue;
-        if (std.ascii.eqlIgnoreCase(line[0..name.len], name) and line[name.len] == ':') return true;
+fn isFramingHeader(line: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+    const name = std.mem.trim(u8, line[0..colon], " ");
+    for ([_][]const u8{ "transfer-encoding", "content-encoding", "content-length", "connection" }) |framing| {
+        if (std.ascii.eqlIgnoreCase(name, framing)) return true;
     }
     return false;
 }
@@ -487,7 +482,7 @@ test "a content length the browser did give is not repeated" {
     // and matching must ignore case because a browser lower-cases them.
     const res = try buildResponse(gpa, 204, "Content-Length: 0\r\n", "");
     defer gpa.free(res);
-    try std.testing.expectEqualStrings("HTTP/1.1 204 \r\nContent-Length: 0\r\nconnection: close\r\n\r\n", res);
+    try std.testing.expectEqualStrings("HTTP/1.1 204 \r\ncontent-length: 0\r\nconnection: close\r\n\r\n", res);
 }
 
 test "a header block with no trailing separator still ends before the body" {
@@ -500,14 +495,14 @@ test "a header block with no trailing separator still ends before the body" {
     );
 }
 
-test "hasHeader matches a whole name at the start of a line and nothing else" {
-    try std.testing.expect(hasHeader("content-length: 3\r\n", "content-length"));
-    try std.testing.expect(hasHeader("a: 1\r\nCONTENT-LENGTH: 3\r\n", "content-length"));
+test "isFramingHeader matches a whole header name and nothing else" {
+    try std.testing.expect(isFramingHeader("content-length: 3"));
+    try std.testing.expect(isFramingHeader("Transfer-Encoding: chunked"));
     // A name that only appears inside a value is not that header.
-    try std.testing.expect(!hasHeader("x-echo: content-length: 3\r\n", "content-length"));
+    try std.testing.expect(!isFramingHeader("x-echo: content-length: 3"));
     // A longer name that starts the same way is a different header.
-    try std.testing.expect(!hasHeader("content-length-hint: 3\r\n", "content-length"));
-    try std.testing.expect(!hasHeader("", "content-length"));
+    try std.testing.expect(!isFramingHeader("content-length-hint: 3"));
+    try std.testing.expect(!isFramingHeader(""));
 }
 
 // -- the connection table ---------------------------------------------------
@@ -647,10 +642,12 @@ test "a rebuilt response closes the connection, because one connection is one fe
     defer gpa.free(res);
     try std.testing.expect(std.mem.indexOf(u8, res, "connection: close\r\n") != null);
 
-    // A server that said something about the connection itself keeps its word.
+    // A server that asked to keep the connection alive was talking to the
+    // browser, not to this socket.
     const keep = try buildResponse(gpa, 200, "Connection: keep-alive\r\n", "");
     defer gpa.free(keep);
-    try std.testing.expect(std.mem.indexOf(u8, keep, "connection: close") == null);
+    try std.testing.expect(std.mem.indexOf(u8, keep, "keep-alive") == null);
+    try std.testing.expect(std.mem.indexOf(u8, keep, "connection: close\r\n") != null);
 }
 
 test "a different port on the page's own host is a different origin, not the page" {
@@ -680,4 +677,11 @@ test "a different port on the page's own host is a different origin, not the pag
     });
     defer gpa.free(own);
     try std.testing.expectEqualStrings("/api", own);
+}
+
+test "a reply the browser already un-chunked and decompressed is framed by the body it holds" {
+    const gpa = std.testing.allocator;
+    const res = try buildResponse(gpa, 200, "content-type: application/json\r\ntransfer-encoding: chunked\r\ncontent-encoding: gzip\r\ncontent-length: 99\r\nconnection: keep-alive\r\n", "[1]");
+    defer gpa.free(res);
+    try std.testing.expectEqualStrings("HTTP/1.1 200 \r\ncontent-type: application/json\r\ncontent-length: 3\r\nconnection: close\r\n\r\n[1]", res);
 }
