@@ -34,6 +34,7 @@ pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.A
     // App root module (the consumer's source exposing `root(*BuildContext) Widget`).
     const app_mod = b.createModule(.{ .root_source_file = opts.root, .target = opts.target, .optimize = opts.optimize });
     app_mod.addImport("phantom", phantom_mod);
+    addAppImports(app_mod, phantom_mod, opts.imports);
 
     // Generated native entry.
     //
@@ -100,6 +101,15 @@ pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.A
     return step;
 }
 
+fn addAppImports(app_mod: *std.Build.Module, phantom_mod: *std.Build.Module, imports: []const std.Build.Module.Import) void {
+    for (imports) |import| {
+        if (import.module.import_table.get("phantom") == null) {
+            import.module.addImport("phantom", phantom_mod);
+        }
+        app_mod.addImport(import.name, import.module);
+    }
+}
+
 fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.AppOptions) *std.Build.Step {
     // A wrong base_path is a caller mistake, not a runtime fault: fail the
     // build now with a message that says what was expected, rather than
@@ -142,6 +152,7 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
         .optimize = opts.optimize,
     });
     app_mod.addImport("phantom", phantom_wasm);
+    addAppImports(app_mod, phantom_wasm, opts.imports);
 
     // The web entry point is `build/web_entry.zig`, a real file rather than a
     // string in this one: it imports the consumer's source as `app_root`, calls

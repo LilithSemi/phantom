@@ -64,6 +64,11 @@ pub const AppOptions = struct {
     keywords: []const LocalizedText = &.{},
     icons: []const Icon = &.{},
     root: std.Build.LazyPath,
+    /// More modules for the app root. Build them for `target`, or for
+    /// wasm32-freestanding on the web. Each module that has no `phantom` import
+    /// gets the phantom module of this build. On the web, `addApp` makes that
+    /// module itself, so a caller cannot add it.
+    imports: []const std.Build.Module.Import = &.{},
     developer: []const u8 = "",
     license: []const u8 = "",
     target: std.Build.ResolvedTarget,
