@@ -722,7 +722,9 @@ pub fn init(
         .root = undefined,
         .view = view,
         .ops = ops,
-        .net = .{ .gpa = gpa },
+        // Wired before the tree mounts, because an `initState` or a first build
+        // that asks for its data would otherwise find no network.
+        .net = .{ .gpa = gpa, .hook = if (ops.http_send) |send| .{ .ctx = ops.ctx, .send = send } else null },
     };
     // Wire the instance Dispatcher (heap-stable) so Element.deinit forgets the
     // handlers of any unmounted hovered/pressed render object.
@@ -1446,6 +1448,7 @@ const FetchSpy = struct {
     host_len: usize = 0,
     body: [64]u8 = undefined,
     body_len: usize = 0,
+    port: u16 = 0,
 
     fn send(ctx: *anyopaque, gpa: std.mem.Allocator, req: phantom.web_net.Request) ?[]u8 {
         const self: *FetchSpy = @ptrCast(@alignCast(ctx));
@@ -1454,6 +1457,7 @@ const FetchSpy = struct {
         self.target_len = copyInto(&self.target, req.target);
         self.host_len = copyInto(&self.host, req.host);
         self.body_len = copyInto(&self.body, req.body);
+        self.port = req.port;
         if (self.fail) return null;
         return phantom.web_net.buildResponse(gpa, self.status, self.headers, self.reply) catch null;
     }
@@ -1823,4 +1827,76 @@ test "an event source is null when the host has no hook or every slot is in use"
 fn logHas(log: []const []u8, line: []const u8) bool {
     for (log) |l| if (std.mem.eql(u8, l, line)) return true;
     return false;
+}
+
+test "a page reached by an ip address requests its own origin like a page reached by name" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    var spy = FetchSpy{ .status = 200, .reply = "[]" };
+    app.net.hook = spy.hook();
+
+    var client: std.http.Client = .{ .allocator = gpa, .io = app.owner.io };
+    defer client.deinit();
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const res = try client.fetch(.{
+        .location = .{ .url = "http://100.125.242.55/api/sessions" },
+        .response_writer = &body.writer,
+    });
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("100.125.242.55", spy.host[0..spy.host_len]);
+    try std.testing.expectEqual(@as(u16, 80), spy.port);
+
+    const url = try phantom.web_net.requestUrl(gpa, "100.125.242.55", .{
+        .method = "GET",
+        .host = spy.host[0..spy.host_len],
+        .port = spy.port,
+        .target = spy.target[0..spy.target_len],
+        .headers = "",
+        .body = "",
+    });
+    defer gpa.free(url);
+    try std.testing.expectEqualStrings("/api/sessions", url);
+}
+
+const StartupFetch = struct {
+    pub fn widget(self: *const StartupFetch) phantom.Widget {
+        return phantom.StatefulWidget(StartupFetch, self);
+    }
+
+    pub const State = struct {
+        base: phantom.StateBase = .{},
+        status: ?std.http.Status = null,
+
+        pub fn initState(s: *State, _: *const StartupFetch) !void {
+            var client: std.http.Client = .{ .allocator = s.base.gpa(), .io = s.base.io() };
+            defer client.deinit();
+            const res = try client.fetch(.{ .location = .{ .url = "http://sigil.example/api/sites" } });
+            s.status = res.status;
+        }
+
+        pub fn build(_: *State, b: *phantom.BuildContext) anyerror!phantom.Widget {
+            return b.new(phantom.Text{ .text = "x" }).widget();
+        }
+    };
+};
+
+fn startupFetchRoot(b: *phantom.BuildContext) phantom.Widget {
+    return b.new(StartupFetch{}).widget();
+}
+
+test "a request made while the tree first mounts reaches the host" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(startupFetchRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    try std.testing.expect(app.sink.first == null);
+    try std.testing.expect(logHas(rec.log.items, "httpSend(GET,sigil.example,80,/api/sites)"));
 }

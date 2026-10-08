@@ -7,6 +7,7 @@ const image_mod = @import("../image/Image.zig");
 const icon_builtin = @import("../icon/builtin.zig");
 const svg_path = @import("../icon/svg_path.zig");
 const platform = @import("../platform.zig");
+const web_net = @import("../web_net.zig");
 const FaultSink = @import("../FaultSink.zig");
 
 /// The namespace an `<svg>` and its children must be created in. `createElement`
@@ -100,6 +101,9 @@ pub const DomOps = struct {
     /// key of zeros and no error. Everything downstream of this hook exists to
     /// stop that particular lie.
     fill_random: ?*const fn (ctx: *anyopaque, buf: []u8) bool = null,
+    /// Runs one HTTP request. See `web_net.Hook.send`. Null on a host with no
+    /// network, where every request fails as a transport failure.
+    http_send: ?*const fn (ctx: *anyopaque, gpa: std.mem.Allocator, req: web_net.Request) ?[]u8 = null,
     /// Opens an `EventSource` on `url` that the page knows by `id`. `types` is
     /// the extra event types to listen for, one on each line. Returns false
     /// when the browser refuses the URL.
@@ -757,6 +761,13 @@ pub const Recorder = struct {
         self.setScrollOffset(node, offset);
     }
 
+    /// Answers every request with an empty 200.
+    fn httpSend(ctx: *anyopaque, gpa: std.mem.Allocator, req: web_net.Request) ?[]u8 {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.rec("httpSend({s},{s},{d},{s})", .{ req.method, req.host, req.port, req.target });
+        return web_net.buildResponse(gpa, 200, "", "") catch null;
+    }
+
     fn openEventSource(ctx: *anyopaque, id: u32, url: []const u8, types: []const u8) bool {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
         self.rec("openEventSource({d},{s},{s})", .{ id, url, types });
@@ -859,6 +870,7 @@ pub const Recorder = struct {
             .write_location = writeLocation,
             .read_scroll_offset = readScrollOffset,
             .write_scroll_offset = writeScrollOffset,
+            .http_send = httpSend,
             .open_event_source = openEventSource,
             .close_event_source = closeEventSource,
         };

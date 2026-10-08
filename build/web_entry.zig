@@ -397,14 +397,12 @@ export fn init(doc_handle: u32, body_handle: u32, window_handle: u32) usize {
         .write_location = writeLocation,
         .read_scroll_offset = readScrollOffset,
         .write_scroll_offset = writeScrollOffset,
+        .http_send = httpSend,
         .open_event_source = openEventSource,
         .close_event_source = closeEventSource,
     };
     const strategy: phantom.UrlStrategy = if (strategy_is_hash) .hash else .path;
     const app = phantom.web.init(std.heap.wasm_allocator, ops, phantom.Root.plain(app_root.root), .{ .width = @floatFromInt(vw), .height = @floatFromInt(vh) }, @floatCast(dpr), strategy) catch return 0;
-    // Wired after init rather than through `DomOps`, because a connection needs
-    // an allocator per request and the DOM hooks do not take one.
-    app.net.hook = .{ .ctx = &dom_ctx, .send = httpSend };
     return @intFromPtr(app);
 }
 export fn dispatchTap(app: usize, x: f32, y: f32) void {
