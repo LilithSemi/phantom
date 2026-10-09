@@ -744,8 +744,8 @@ test "a span splits across rows, and each row takes its own width" {
         .{ .text = b, .font = &font, .size = 14, .metrics = m },
     }, .{ .width_of = firstNarrow });
     defer l.deinit(gpa);
-    // "beta gamma delta" is 160px wide; a row of 110px holds "beta gamma " (110px)
-    // at most, so "delta" takes a third row rather than joining the second.
+    // "beta gamma delta" is 160px wide. A row of 110px holds "beta gamma " (110px)
+    // at most. So "delta" goes on a third row and does not join the second.
     try std.testing.expectEqual(@as(usize, 3), l.rows.len);
     try std.testing.expectEqualStrings("alpha", a[l.rows[0].pieces[0].start..l.rows[0].pieces[0].end]);
     try std.testing.expectEqual(@as(usize, 1), l.rows[1].pieces[0].span);

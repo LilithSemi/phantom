@@ -36,6 +36,6 @@ requirement; this citation and `License.txt` are kept for provenance.
 ## Why vendored (not a build.zig.zon dependency)
 
 Typodermic distributes only a single 22MB, 729-font bundle, with no per-font URL.
-Vendoring the three ~40-50KB fonts we need is far smaller and, unlike a fetched
+Vendoring only the fonts we need is far smaller and, unlike a fetched
 dependency, needs no `zig.fetchDeps` fixed-output derivation: vendored fonts are
 plain source files included in the tree.

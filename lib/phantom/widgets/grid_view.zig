@@ -193,20 +193,22 @@ const RenderGridView = struct {
         gpa.destroy(self);
     }
 
-    fn scrollThunk(ctx: *anyopaque, dx: f32, dy: f32) void {
+    fn scrollThunk(ctx: *anyopaque, dx: f32, dy: f32) bool {
         const self: *RenderGridView = @ptrCast(@alignCast(ctx));
+        const before = self.offset;
         self.offset = scroll_view.clampOffset(
             .{ .x = self.offset.x + dx, .y = self.offset.y + dy },
             self.content,
             self.viewport,
         );
+        return self.offset.x != before.x or self.offset.y != before.y;
     }
 
     fn onKey(ctx: *anyopaque, ev: phantom.input.KeyEvent) bool {
         const self: *RenderGridView = @ptrCast(@alignCast(ctx));
         if (ev.action == .release) return false;
         const dy = scroll_view.keyScrollDelta(ev.keysym, self.base.size.height, self.content.height) orelse return false;
-        scrollThunk(self, 0, dy);
+        _ = scrollThunk(self, 0, dy);
         return true;
     }
 
@@ -599,16 +601,16 @@ test "the wheel scrolls a grid and clamps at both ends" {
 
     const ro = h.root.renderObject().?;
     const handlers = ro.pointer orelse return error.NoPointerHandlers;
-    handlers.on_scroll.?(handlers.ctx, 0, 40);
+    _ = handlers.on_scroll.?(handlers.ctx, 0, 40);
     try h.pump();
     try std.testing.expectApproxEqAbs(@as(f32, 40), (pushScrollOf(h.canvas.list.primitives.items) orelse return error.NoPushScroll).offset.y, 0.001);
 
     // Content 150 in a viewport 60 leaves 90 of travel, and no more.
-    handlers.on_scroll.?(handlers.ctx, 0, 999_999);
+    _ = handlers.on_scroll.?(handlers.ctx, 0, 999_999);
     try h.pump();
     try std.testing.expectApproxEqAbs(@as(f32, 90), (pushScrollOf(h.canvas.list.primitives.items) orelse return error.NoPushScroll).offset.y, 0.001);
 
-    handlers.on_scroll.?(handlers.ctx, 0, -999_999);
+    _ = handlers.on_scroll.?(handlers.ctx, 0, -999_999);
     try h.pump();
     try std.testing.expectEqual(@as(f32, 0), (pushScrollOf(h.canvas.list.primitives.items) orelse return error.NoPushScroll).offset.y);
 }

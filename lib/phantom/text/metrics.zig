@@ -201,7 +201,7 @@ test "Neuropol metrics: unitsPerEm, cmap A, advance of digit 0" {
 
 // -- synthetic sfnt bytes for the OS/2-fallback tests --
 //
-// All three bundled fonts (Neuropol, Mesmerize Rg, Mesmerize Sb) carry an OS/2
+// All six bundled fonts (Neuropol, Mesmerize and NK57) carry an OS/2
 // table, so no bundled font exercises the head.macStyle-only fallback path.
 // This builder makes a minimal sfnt with head, hhea, maxp, hmtx and cmap, and
 // no OS/2 table, so the fallback path itself gets real coverage.

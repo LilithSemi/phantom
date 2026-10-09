@@ -205,8 +205,7 @@ const RenderScrollView = struct {
                     .max_height = std.math.inf(f32),
                     .scale = c.scale,
                 },
-                // The height comes from the content, so a strip of code in a
-                // column is as tall as its lines and not as tall as the column.
+                // The height comes from the content, clamped to the constraints.
                 .horizontal => .{
                     .min_width = 0,
                     .max_width = std.math.inf(f32),
@@ -281,13 +280,15 @@ const RenderScrollView = struct {
         self.child = child;
     }
 
-    fn scrollThunk(ctx: *anyopaque, dx: f32, dy: f32) void {
+    fn scrollThunk(ctx: *anyopaque, dx: f32, dy: f32) bool {
         const self: *RenderScrollView = @ptrCast(@alignCast(ctx));
+        const before = self.offset;
         self.offset = clampOffset(
             .{ .x = self.offset.x + dx, .y = self.offset.y + dy },
             self.content,
             self.viewport,
         );
+        return self.offset.x != before.x or self.offset.y != before.y;
     }
 
     fn onKey(ctx: *anyopaque, ev: phantom.input.KeyEvent) bool {
@@ -297,7 +298,7 @@ const RenderScrollView = struct {
         // The wheel handler already adds the delta and clamps against the content and
         // the viewport. Call it rather than repeating the clamp, so one path cannot
         // drift from the other.
-        scrollThunk(self, 0, dy);
+        _ = scrollThunk(self, 0, dy);
         return true;
     }
 
@@ -522,15 +523,15 @@ test "ScrollView on_scroll: dy=50 clamps; huge dy clamps to max; negative clamps
 
     // Fire on_scroll with dy=50 (within range) -> offset.y == 50
     const h = ro.base.pointer.?;
-    h.on_scroll.?(h.ctx, 0, 50);
+    _ = h.on_scroll.?(h.ctx, 0, 50);
     try std.testing.expectEqual(@as(f32, 50), ro.offset.y);
 
     // Huge dy -> clamps to content.height - viewport.height
-    h.on_scroll.?(h.ctx, 0, 999999);
+    _ = h.on_scroll.?(h.ctx, 0, 999999);
     try std.testing.expectApproxEqAbs(max_y, ro.offset.y, 0.001);
 
     // Negative -> clamps to 0
-    h.on_scroll.?(h.ctx, 0, -999999);
+    _ = h.on_scroll.?(h.ctx, 0, -999999);
     try std.testing.expectEqual(@as(f32, 0), ro.offset.y);
 }
 
@@ -954,4 +955,37 @@ test "ScrollView vertical axis: Column child lays out to natural stacked height,
 
     // The Column stacks 5 text rows; total height must exceed the 30px viewport.
     try std.testing.expect(ro.content.height > viewport_height);
+}
+
+fn innerScrollView(el: *phantom.Element, root: *phantom.Element) ?*RenderScrollView {
+    if (el != root) if (el.render_object) |ro| if (ro.pointer) |h| if (h.on_scroll != null) {
+        return @fieldParentPtr("base", ro);
+    };
+    if (el.child) |c| if (innerScrollView(c, root)) |found| return found;
+    for (el.children.items) |c| if (innerScrollView(c, root)) |found| return found;
+    return null;
+}
+
+test "a wheel the inner view cannot use goes to the outer view" {
+    const gpa = std.testing.allocator;
+    const box = phantom.ColoredBox{ .color = geom.Color.rgb(1, 1, 1) };
+    const strip = phantom.SizedBox{ .width = 300, .height = 20, .child = box.widget() };
+    const inner = ScrollView{ .axis = .horizontal, .child = strip.widget() };
+    const filler = phantom.SizedBox{ .width = 100, .height = 1000, .child = box.widget() };
+    const col = phantom.Column(.{ .children = &.{ inner.widget(), filler.widget() } });
+    const outer = ScrollView{ .child = col.widget() };
+    var h = try testing.mount(gpa, outer.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+    const outer_ro: *RenderScrollView = @fieldParentPtr("base", h.root.render_object.?);
+    const inner_ro = innerScrollView(h.root, h.root) orelse return error.NoInnerScrollView;
+
+    try h.scrollAt(.{ .x = 10, .y = 10 }, 0, 30);
+    try std.testing.expectEqual(@as(f32, 30), outer_ro.offset.y);
+    try std.testing.expectEqual(@as(f32, 0), inner_ro.offset.y);
+
+    try h.scrollAt(.{ .x = 10, .y = 10 }, 30, 0);
+    try std.testing.expectEqual(@as(f32, 30), inner_ro.offset.x);
+    try std.testing.expectEqual(@as(f32, 0), outer_ro.offset.x);
 }

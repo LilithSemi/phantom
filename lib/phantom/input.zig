@@ -214,12 +214,29 @@ pub const Dispatcher = struct {
     }
 
     /// Deliver a scroll delta to the innermost scrollable container whose bounds
-    /// contain the given point. Does nothing if no scrollable is under the point.
+    /// contain the given point. When that view cannot move, the next one out gets
+    /// the delta. Does nothing if no scrollable is under the point.
     pub fn scroll(self: *Dispatcher, root: *Element, point: geom.PhysicalOffset, dx: f32, dy: f32) void {
         _ = self;
-        if (hitTestScroll(root, point)) |h| if (h.on_scroll) |f| f(h.ctx, dx, dy);
+        _ = deliverScroll(root, point, dx, dy);
     }
 };
+
+/// Visits children before the parent, and later siblings first, which is the
+/// order `hitTestScroll` ranks them in. Returns true once a view moves.
+fn deliverScroll(el: *Element, point: geom.PhysicalOffset, dx: f32, dy: f32) bool {
+    var i = el.children.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (deliverScroll(el.children.items[i], point, dx, dy)) return true;
+    }
+    if (el.child) |c| if (deliverScroll(c, point, dx, dy)) return true;
+    const ro = el.render_object orelse return false;
+    const h = ro.pointer orelse return false;
+    const f = h.on_scroll orelse return false;
+    if (!contains(ro.origin, ro.size, point)) return false;
+    return f(h.ctx, dx, dy);
+}
 
 const std = @import("std");
 const RenderObject = render_object.RenderObject;
@@ -426,10 +443,11 @@ test "hitTestScroll returns the deepest on_scroll handler; Dispatcher.scroll fir
     parent_ro.handlers = .{
         .ctx = &delta,
         .on_scroll = struct {
-            fn f(ctx: *anyopaque, dx: f32, dy: f32) void {
+            fn f(ctx: *anyopaque, dx: f32, dy: f32) bool {
                 const d: *[2]f32 = @ptrCast(@alignCast(ctx));
                 d[0] = dx;
                 d[1] = dy;
+                return true;
             }
         }.f,
     };
@@ -517,4 +535,44 @@ test "the bare modifier keysyms match keysymdef.h" {
     try std.testing.expectEqual(@as(u32, 0xFFEA), @intFromEnum(Keysym.alt_r));
     try std.testing.expectEqual(@as(u32, 0xFFEB), @intFromEnum(Keysym.super_l));
     try std.testing.expectEqual(@as(u32, 0xFFEC), @intFromEnum(Keysym.super_r));
+}
+
+test "Dispatcher.scroll passes the delta out when the inner view cannot move" {
+    const gpa = std.testing.allocator;
+    var sink = FaultSink{};
+    var owner = BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    const Counter = struct {
+        calls: u32 = 0,
+        moves: bool,
+        fn f(ctx: *anyopaque, _: f32, _: f32) bool {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.calls += 1;
+            return c.moves;
+        }
+    };
+    var outer_count = Counter{ .moves = true };
+    var inner_count = Counter{ .moves = false };
+    var outer_ro = HitBox.make(100, 100);
+    outer_ro.handlers = .{ .ctx = &outer_count, .on_scroll = Counter.f };
+    outer_ro.base.pointer = &outer_ro.handlers;
+    var inner_ro = HitBox.make(40, 40);
+    inner_ro.handlers = .{ .ctx = &inner_count, .on_scroll = Counter.f };
+    inner_ro.base.pointer = &inner_ro.handlers;
+    const vt = widget.Widget.VTable{ .mount = undefined, .update = undefined };
+    var inner_el = Element{ .owner = &owner, .vtable = &vt, .type_name = "inner", .render_object = &inner_ro.base };
+    var outer_el = Element{ .owner = &owner, .vtable = &vt, .type_name = "outer", .render_object = &outer_ro.base, .child = &inner_el };
+    _ = outer_ro.base.layout(layout.BoxConstraints.tight(.{ .width = 100, .height = 100 }));
+    _ = inner_ro.base.layout(layout.BoxConstraints.tight(.{ .width = 40, .height = 40 }));
+    inner_ro.base.origin = .{ .x = 30, .y = 30 };
+
+    var disp = Dispatcher{};
+    disp.scroll(&outer_el, .{ .x = 40, .y = 40 }, 0, 5);
+    try std.testing.expectEqual(@as(u32, 1), inner_count.calls);
+    try std.testing.expectEqual(@as(u32, 1), outer_count.calls);
+
+    inner_count.moves = true;
+    disp.scroll(&outer_el, .{ .x = 40, .y = 40 }, 0, 5);
+    try std.testing.expectEqual(@as(u32, 2), inner_count.calls);
+    try std.testing.expectEqual(@as(u32, 1), outer_count.calls);
 }

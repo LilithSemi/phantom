@@ -17,5 +17,7 @@ pub const PointerHandlers = struct {
     on_move: ?*const fn (ctx: *anyopaque, ev: PointerEvent) void = null,
     on_enter: ?*const fn (ctx: *anyopaque, ev: PointerEvent) void = null,
     on_leave: ?*const fn (ctx: *anyopaque, ev: PointerEvent) void = null,
-    on_scroll: ?*const fn (ctx: *anyopaque, dx: f32, dy: f32) void = null,
+    /// Returns true when the view moved. A false return passes the delta to the
+    /// next scrollable view out.
+    on_scroll: ?*const fn (ctx: *anyopaque, dx: f32, dy: f32) bool = null,
 };

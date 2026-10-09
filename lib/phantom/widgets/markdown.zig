@@ -1,4 +1,4 @@
-//! Draws Markdown text as a column of blocks. Each block is a `RichText`.
+//! Draws Markdown text as a column of blocks.
 //! Paragraph lines join until a blank line or another block starts.
 const std = @import("std");
 const phantom = @import("../../phantom.zig");
@@ -80,6 +80,8 @@ const Builder = struct {
     para: std.ArrayList(RichText.Span) = .empty,
     code: std.ArrayList(Widget) = .empty,
     in_code: bool = false,
+    /// A blank line came after the last block.
+    gap: bool = false,
 
     const RichOptions = struct { size: ?f32 = null, font: ?*Font = null };
 
@@ -89,7 +91,10 @@ const Builder = struct {
                 if (self.para.items.len > 0) try self.para.append(self.b.arena, .{ .text = " " });
                 try self.appendSpans(&self.para, l.spans);
             },
-            .blank => try self.flush(),
+            .blank => {
+                try self.flush();
+                self.gap = true;
+            },
             .heading => {
                 try self.flush();
                 const scale: f32 = switch (l.level) {
@@ -117,13 +122,15 @@ const Builder = struct {
                 const indent = gutter * @as(f32, @floatFromInt(l.level));
                 const mark_spans = try self.b.arena.alloc(RichText.Span, 1);
                 mark_spans[0] = .{ .text = marker };
+                // An empty item still needs a row for its marker.
+                if (spans.items.len == 0) try spans.append(self.b.arena, .{ .text = " " });
+                // The body sizes the item, so the marker sits over it. A Row in a
+                // bounded column takes the full height.
+                const body = self.b.new(phantom.Padding{ .insets = .{ .left = indent + gutter }, .child = self.rich(spans.items, .{}) });
                 const mark = self.b.new(phantom.SizedBox{ .width = gutter, .child = self.rich(mark_spans, .{}) });
-                const body = self.b.new(phantom.Expanded(.{ .child = self.rich(spans.items, .{}) }));
-                const row = self.b.new(phantom.Row(.{
-                    .main_size = .max,
-                    .children = self.b.newSlice(Widget, &.{ mark.widget(), body.widget() }),
-                }));
-                try self.push(self.b.new(phantom.Padding{ .insets = .{ .left = indent }, .child = row.widget() }).widget());
+                const at = self.b.new(phantom.Positioned{ .top = 0, .left = indent, .child = mark.widget() });
+                const item = self.b.new(phantom.Stack{ .children = self.b.newSlice(Widget, &.{ body.widget(), at.widget() }) });
+                try self.push(item.widget());
             },
             .rule => {
                 try self.flush();
@@ -140,13 +147,11 @@ const Builder = struct {
             },
             .code => {
                 const spans = try self.b.arena.alloc(RichText.Span, 1);
-                spans[0] = .{ .text = l.spans[0].text, .style = .{ .code = true } };
+                spans[0] = .{ .text = try expandTabs(self.b.arena, l.spans[0].text), .style = .{ .code = true } };
                 try self.code.append(self.b.arena, self.b.new(RichText{
                     .spans = spans,
                     .wrap = false,
                     .code_background = false,
-                    .on_link = self.on_link,
-                    .ctx = self.ctx,
                 }).widget());
             },
         }
@@ -171,9 +176,12 @@ const Builder = struct {
         }).widget();
     }
 
-    /// Adds a block, with a half line of space above every block but the first.
+    /// Adds a block. A half line of space goes above it when a blank line came
+    /// before it, but never above the first block.
     fn push(self: *Builder, block: Widget) !void {
-        if (self.blocks.items.len == 0) return self.blocks.append(self.b.arena, block);
+        const spaced = self.gap and self.blocks.items.len > 0;
+        self.gap = false;
+        if (!spaced) return self.blocks.append(self.b.arena, block);
         const gap = self.td.text_size * 0.5;
         try self.blocks.append(self.b.arena, self.b.new(phantom.Padding{ .insets = .{ .top = gap }, .child = block }).widget());
     }
@@ -198,6 +206,26 @@ const Builder = struct {
         if (self.in_code) try self.closeCode();
     }
 };
+
+/// Replaces each tab with spaces up to the next column that is a multiple of
+/// four. The layout gives a tab no width, and the web draws it wider.
+fn expandTabs(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, text, '\t') == null) return text;
+    var out: std.ArrayList(u8) = .empty;
+    var col: usize = 0;
+    for (text) |c| {
+        if (c == '\t') {
+            const n = 4 - col % 4;
+            try out.appendNTimes(arena, ' ', n);
+            col += n;
+            continue;
+        }
+        try out.append(arena, c);
+        // A UTF-8 continuation byte does not start a new column.
+        if (c & 0xC0 != 0x80) col += 1;
+    }
+    return out.toOwnedSlice(arena);
+}
 
 fn runs(h: *testing.Harness, out: *std.ArrayList(dl.TextRun)) !void {
     try h.pump();
@@ -271,6 +299,7 @@ test "a link with no on_link opens through the platform in a new tab" {
     };
     h.tapAt(at.?);
     try std.testing.expectEqual(phantom.OpenMode.new_tab, Spy.seen.?);
+    try h.expectNoFaults();
 }
 
 fn codeBoxHeight(h: *testing.Harness) !f32 {
@@ -316,5 +345,83 @@ test "a link calls on_link with its url when one is given" {
     };
     h.tapAt(at.?);
     try std.testing.expectEqualStrings("https://x.dev", spy.url[0..spy.len]);
+    try h.expectNoFaults();
+}
+
+fn runY(h: *testing.Harness, text: []const u8) !f32 {
+    for (h.canvas.list.primitives.items) |p| if (p == .text and std.mem.eql(u8, p.text.text, text)) return p.text.origin.y;
+    return error.NoRun;
+}
+
+fn rowGap(gpa: std.mem.Allocator, src: []const u8, first: []const u8, second: []const u8) !f32 {
+    const md = Markdown{ .text = src };
+    var h = try testing.mount(gpa, md.widget());
+    defer h.deinit();
+    try h.pump();
+    return try runY(&h, second) - try runY(&h, first);
+}
+
+test "a blank line puts half a line above the next block, and nothing else does" {
+    const gpa = std.testing.allocator;
+    var sink = phantom.FaultSink{};
+    var owner = phantom.BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    const half = phantom.theme.defaultTheme(&owner).text_size * 0.5;
+    const items_tight = try rowGap(gpa, "- a\n- b", "a", "b");
+    const items_spaced = try rowGap(gpa, "- a\n\n- b", "a", "b");
+    try std.testing.expectApproxEqAbs(half, items_spaced - items_tight, 0.01);
+    const para_tight = try rowGap(gpa, "p\n- a", "p", "a");
+    const para_spaced = try rowGap(gpa, "p\n\n- a", "p", "a");
+    try std.testing.expectApproxEqAbs(half, para_spaced - para_tight, 0.01);
+    try std.testing.expectApproxEqAbs(items_tight, para_tight, 0.01);
+}
+
+test "a tab in a code line becomes spaces to the next stop of four" {
+    const gpa = std.testing.allocator;
+    const md = Markdown{ .text = "```\n\tx\nab\ty\n```" };
+    var h = try testing.mount(gpa, md.widget());
+    defer h.deinit();
+    try h.pump();
+    _ = try runY(&h, "    x");
+    _ = try runY(&h, "ab  y");
+    try h.expectNoFaults();
+}
+
+test "a link with no on_link reports link_unsupported when the platform cannot open it" {
+    const gpa = std.testing.allocator;
+    const Refuse = struct {
+        fn open(_: *anyopaque, _: []const u8, _: phantom.OpenMode) bool {
+            return false;
+        }
+    };
+    var dummy: u8 = 0;
+    const md = Markdown{ .text = "[docs](https://x.dev)" };
+    var h = try testing.mountWithPlatform(gpa, md.widget(), .{ .ctx = &dummy, .open_url = Refuse.open });
+    defer h.deinit();
+    try h.pump();
+    var at: ?phantom.PhysicalOffset = null;
+    for (h.canvas.list.primitives.items) |p| if (p == .text and std.mem.eql(u8, p.text.text, "docs")) {
+        at = .{ .x = p.text.origin.x + 2, .y = p.text.origin.y + 2 };
+    };
+    h.tapAt(at.?);
+    try h.expectFault(.link_unsupported);
+}
+
+test "a fence with no closing line still draws its code lines" {
+    const gpa = std.testing.allocator;
+    const md = Markdown{ .text = "```\nopen code" };
+    var h = try testing.mount(gpa, md.widget());
+    defer h.deinit();
+    try h.pump();
+    _ = try runY(&h, "open code");
+    try h.expectNoFaults();
+}
+
+test "empty text builds and paints with no fault" {
+    const gpa = std.testing.allocator;
+    const md = Markdown{ .text = "" };
+    var h = try testing.mount(gpa, md.widget());
+    defer h.deinit();
+    try h.pump();
     try h.expectNoFaults();
 }
