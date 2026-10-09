@@ -521,8 +521,14 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             // a code block loses its indentation to exactly that.
             const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;white-space:pre;font-family:{s};font-size:{d}px;color:rgba({d},{d},{d},{s})", .{ run.origin.x - ox, run.origin.y - oy, family, run.size, dom.ch(run.color.r), dom.ch(run.color.g), dom.ch(run.color.b), dom.alpha(&tbuf, run.color.a) });
             defer gpa.free(style);
+            const decl = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{
+                style,
+                if (run.italic and !font_ptr.isItalic()) ";font-style:italic" else "",
+                if (run.underline) ";text-decoration:underline" else "",
+            });
+            defer gpa.free(decl);
             const node = ops.createElement("div");
-            ops.setStyle(node, style);
+            ops.setStyle(node, decl);
             ops.setTextContent(node, run.text);
             ops.appendChild(parent, node);
         },
@@ -940,6 +946,29 @@ test "dom_calls: a text primitive names its font the same way the font-face does
     var want: [family_len + 12]u8 = undefined;
     const asked = try std.fmt.bufPrint(&want, "font-family:{s}", .{family});
     try std.testing.expect(contains(rec.log.items, asked));
+}
+
+test "dom_calls: an italic underlined run asks the browser for both" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var font = try text.Font.load(gpa, text.builtin.mesmerize_rg_bytes);
+    defer font.deinit(gpa);
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .text = .{
+        .glyphs = &.{},
+        .text = "em",
+        .font = &font,
+        .size = 16,
+        .color = geometry.Color.rgb(1, 1, 1),
+        .origin = .{ .x = 0, .y = 0 },
+        .italic = true,
+        .underline = true,
+    } });
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try std.testing.expect(contains(rec.log.items, "font-style:italic"));
+    try std.testing.expect(contains(rec.log.items, "text-decoration:underline"));
 }
 
 test "dom_calls: stroke rrect records a border:...solid rgba style" {

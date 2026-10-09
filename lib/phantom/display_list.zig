@@ -39,6 +39,10 @@ pub const TextRun = struct {
     /// (the line ascent). Prism adds this to reach the baseline; the DOM backend
     /// ignores it and lets CSS position the text within the div at origin.
     ascent: f32 = 0,
+    /// Slant the run. A backend slants only when the font is not already
+    /// italic, so a real italic face is never slanted twice.
+    italic: bool = false,
+    underline: bool = false,
 };
 
 pub const ScrollRegion = struct {

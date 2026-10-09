@@ -17,6 +17,9 @@ const text_vs_src = @embedFile("../shaders/text.vert.glsl");
 const text_fs_src = @embedFile("../shaders/text.frag.glsl");
 const image_fs_src = @embedFile("../shaders/image.frag.glsl");
 
+/// tan(12 degrees): how far an italic glyph leans for each pixel above the baseline.
+const italic_slant: f32 = 0.2126;
+
 const Vtx = extern struct {
     x: f32,
     y: f32,
@@ -455,13 +458,17 @@ pub const PrismBackend = struct {
         y: f32,
         color: geom.Color,
         viewport: geom.PhysicalSize,
+        slant: f32,
+        baseline: f32,
     ) !void {
         const w: f32 = @floatFromInt(entry.w);
         const h: f32 = @floatFromInt(entry.h);
-        const tl = toClip(x, y, viewport, self.flip_y);
-        const tr = toClip(x + w, y, viewport, self.flip_y);
-        const br = toClip(x + w, y + h, viewport, self.flip_y);
-        const bl = toClip(x, y + h, viewport, self.flip_y);
+        const lean_top = slant * (baseline - y);
+        const lean_bottom = slant * (baseline - (y + h));
+        const tl = toClip(x + lean_top, y, viewport, self.flip_y);
+        const tr = toClip(x + w + lean_top, y, viewport, self.flip_y);
+        const br = toClip(x + w + lean_bottom, y + h, viewport, self.flip_y);
+        const bl = toClip(x + lean_bottom, y + h, viewport, self.flip_y);
         const cr = color.r;
         const cg = color.g;
         const cb = color.b;
@@ -562,6 +569,8 @@ pub const PrismBackend = struct {
                 try batch.begin(.text);
                 // Cast the type-erased font pointer back to the concrete type.
                 const font: *text.Font = @ptrCast(@alignCast(run.font));
+                const slant: f32 = if (run.italic and !font.isItalic()) italic_slant else 0;
+                const baseline = run.origin.y + run.ascent - cur_off.y;
                 for (run.glyphs) |g| {
                     // A face with no glyph for this codepoint draws `.notdef`,
                     // which is a replacement box. The bundled faces are display
@@ -584,7 +593,7 @@ pub const PrismBackend = struct {
                             const side = run.size;
                             const entry = try self.ensureIcon(id, .{ .width = side, .height = side });
                             if (entry.w == 0 or entry.h == 0) continue;
-                            const baseline = run.origin.y + run.ascent + g.y;
+                            const mark_baseline = run.origin.y + run.ascent + g.y;
                             // The icon arm below places a bitmap at
                             // `box_top + box_height + entry.top`. With the box
                             // bottom on the baseline that is
@@ -594,9 +603,11 @@ pub const PrismBackend = struct {
                                 &batch,
                                 entry,
                                 run.origin.x + g.x + @as(f32, @floatFromInt(entry.left)) - cur_off.x,
-                                baseline + @as(f32, @floatFromInt(entry.top)) - cur_off.y,
+                                mark_baseline + @as(f32, @floatFromInt(entry.top)) - cur_off.y,
                                 run.color,
                                 viewport,
+                                0,
+                                0,
                             );
                             continue;
                         }
@@ -614,7 +625,23 @@ pub const PrismBackend = struct {
                     // origin.y + ascent (origin is the run's top-left).
                     const gx: f32 = run.origin.x + g.x + @as(f32, @floatFromInt(entry.left)) - cur_off.x;
                     const gy: f32 = run.origin.y + run.ascent + g.y + @as(f32, @floatFromInt(entry.top)) - cur_off.y;
-                    try self.appendCoverageQuad(&batch, entry, gx, gy, run.color, viewport);
+                    try self.appendCoverageQuad(&batch, entry, gx, gy, run.color, viewport, slant, baseline);
+                }
+                if (run.underline and run.glyphs.len > 0) {
+                    const last = run.glyphs[run.glyphs.len - 1];
+                    const width = last.x + font.advance(last.cp, run.size);
+                    const thick = @max(1, @round(run.size / 16));
+                    try batch.begin(.rect);
+                    try appendQuad(&batch.verts, self.gpa, .{
+                        .rect = .{
+                            .x = run.origin.x,
+                            .y = run.origin.y + run.ascent + @max(1, @round(run.size / 12)),
+                            .width = width,
+                            .height = thick,
+                        },
+                        .radius = 0,
+                        .color = run.color,
+                    }, viewport, self.flip_y, cur_off);
                 }
             },
             .icon => |ic| {
@@ -632,7 +659,7 @@ pub const PrismBackend = struct {
                 // primitive's origin.
                 const ix: f32 = ic.origin.x + @as(f32, @floatFromInt(entry.left)) - cur_off.x;
                 const iy: f32 = ic.origin.y + ic.size.height + @as(f32, @floatFromInt(entry.top)) - cur_off.y;
-                try self.appendCoverageQuad(&batch, entry, ix, iy, ic.color, viewport);
+                try self.appendCoverageQuad(&batch, entry, ix, iy, ic.color, viewport, 0, 0);
             },
         };
         try batch.flush();
@@ -938,6 +965,61 @@ test "PrismBackend renders a TextRun; glyph pixels appear on the target" {
         if (px[i] > 40) lit += 1;
     }
     try std.testing.expect(lit > 10); // the glyph drew some lit pixels
+}
+
+fn litEdges(gpa: std.mem.Allocator, italic: bool, underline: bool) !struct { top_left: u32, bottom_left: u32, bottom_row_lit: u32 } {
+    try requireRaster(gpa);
+    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    defer sel.device.deinit();
+    const dev = sel.device;
+    var backend = try PrismBackend.init(dev, gpa);
+    defer backend.deinit();
+    var font = try text.Font.load(gpa, text.builtin.mesmerize_rg_bytes);
+    defer font.deinit(gpa);
+    const W: u32 = 96;
+    const H: u32 = 96;
+    const target = try dev.createResource(.{ .image = .{ .width = W, .height = H, .format = .rgba8_unorm, .usage = .{ .render_target = true } } });
+    defer dev.destroyResource(target);
+    const ctx = try dev.createContext();
+    defer ctx.deinit();
+    var list = dl.DisplayList{};
+    defer list.deinit(gpa);
+    const glyphs = [_]dl.PositionedGlyph{.{ .cp = 'l', .x = 0, .y = 0 }};
+    try list.append(gpa, .{ .text = .{ .glyphs = &glyphs, .text = "l", .font = &font, .size = 64, .color = geom.Color.rgb(1, 1, 1), .origin = .{ .x = 24, .y = 8 }, .ascent = 64, .italic = italic, .underline = underline } });
+    try backend.render(ctx, target, .{ .width = W, .height = H }, list, geom.Color.rgb(0, 0, 0));
+    const px = try dev.mapResource(target);
+    const leftmost = struct {
+        fn row(p: []const u8, w: u32, y: u32) u32 {
+            var x: u32 = 0;
+            while (x < w) : (x += 1) if (p[(y * w + x) * 4] > 100) return x;
+            return w;
+        }
+    }.row;
+    // The offscreen readback inverts rows top-to-bottom relative to device
+    // pixel space (see the ordering tests above), so the row that holds the
+    // glyph's cap and the row that holds its foot swap places here, and the
+    // underline (drawn below the baseline in device space) shows up near the
+    // top of the buffer instead of near its bottom.
+    var lit_bottom: u32 = 0;
+    var x: u32 = 0;
+    while (x < W) : (x += 1) if (px[(17 * W + x) * 4] > 100) {
+        lit_bottom += 1;
+    };
+    return .{ .top_left = leftmost(px, W, 8 + 60), .bottom_left = leftmost(px, W, 8 + 20), .bottom_row_lit = lit_bottom };
+}
+
+test "an italic run leans right: its top starts further right than its foot" {
+    const up = try litEdges(std.testing.allocator, false, false);
+    const it = try litEdges(std.testing.allocator, true, false);
+    try std.testing.expect(it.top_left > up.top_left + 3);
+    try std.testing.expect(@as(i64, it.bottom_left) - @as(i64, up.bottom_left) <= 2);
+}
+
+test "an underlined run inks a line under its baseline" {
+    const plain = try litEdges(std.testing.allocator, false, false);
+    const under = try litEdges(std.testing.allocator, false, true);
+    try std.testing.expectEqual(@as(u32, 0), plain.bottom_row_lit);
+    try std.testing.expect(under.bottom_row_lit > 4);
 }
 
 test "PrismBackend draws an icon primitive tinted, with the gap between its pillars left clear" {

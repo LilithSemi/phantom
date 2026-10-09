@@ -195,7 +195,9 @@ fn paintText(grid: *CellGrid, run: dl.TextRun, ctx: Ctx) void {
     if (row_f < 0 or row_f >= rows_f or col_f >= cols_f) return;
 
     const font: *text.Font = @ptrCast(@alignCast(run.font));
-    const attrs = attrsForFont(font);
+    var attrs = attrsForFont(font);
+    attrs.italic = attrs.italic or run.italic;
+    attrs.underline = run.underline;
     const color = Rgb.fromColor(run.color);
     const row: u16 = @intFromFloat(row_f);
 
@@ -814,6 +816,34 @@ test "a bold font sets the bold attribute on every cell of its run" {
 
     try render(&g, list, .{ .cell_w = 8, .cell_h = 16 });
     try std.testing.expect(g.cellAt(0, 0).?.attrs.bold);
+}
+
+test "an italic underlined run sets both attributes on its cells" {
+    const gpa = std.testing.allocator;
+    var g = try CellGrid.init(gpa, 8, 2);
+    defer g.deinit();
+    g.clear(.{ .r = 0, .g = 0, .b = 0 });
+
+    var font = try text.Font.load(gpa, text.builtin.mesmerize_rg_bytes);
+    defer font.deinit(gpa);
+
+    var list: DisplayList = .{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .text = .{
+        .glyphs = &.{},
+        .text = "ab",
+        .font = @ptrCast(&font),
+        .size = 14,
+        .color = geom.Color.rgb(1, 1, 1),
+        .origin = .{ .x = 0, .y = 0 },
+        .italic = true,
+        .underline = true,
+    } });
+
+    try render(&g, list, .{ .cell_w = 8, .cell_h = 16 });
+    const cell = g.cellAt(0, 0).?;
+    try std.testing.expect(cell.attrs.italic);
+    try std.testing.expect(cell.attrs.underline);
 }
 
 test "a scroll region clips its contents and offsets them" {
