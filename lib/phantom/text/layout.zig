@@ -198,6 +198,9 @@ fn nextBreak(
         // than the whole line still gets a line of its own, rather than looping
         // for ever on a break that cannot be taken.
         if (max_width > 0 and width + w > max_width and width > 0) {
+            // The space that does not fit is itself the break, so the word
+            // before it keeps its place on this line.
+            if (cp == ' ') return .{ .end = i, .next = i + len };
             if (last_space) |sp| {
                 const sp_len = std.unicode.utf8ByteSequenceLength(text[sp]) catch 1;
                 return .{ .end = sp, .next = sp + sp_len };
@@ -301,6 +304,29 @@ test "a wrap breaks at a space, and the space does not begin the next line" {
     try std.testing.expectEqual(@as(usize, 3), q.lines[0].glyphs.len);
     try std.testing.expectEqual(@as(usize, 3), q.lines[1].glyphs.len);
     try std.testing.expectEqual(@as(u21, 'd'), q.lines[1].glyphs[0].cp);
+}
+
+test "a space that does not fit ends the line and does not begin the next one" {
+    const gpa = std.testing.allocator;
+    var font = try Font.load(gpa, builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    const m = mono.TextMetrics{ .mono = mono.Mono.fromCell(10, 20) };
+
+    const a = "alpha beta";
+    var p = try layoutParagraph(gpa, &font, a, 14, m, 50);
+    defer p.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), p.lines.len);
+    try std.testing.expectEqualStrings("alpha", a[p.lines[0].start..p.lines[0].end]);
+    try std.testing.expectEqualStrings("beta", a[p.lines[1].start..p.lines[1].end]);
+
+    // A word that fits exactly stays on its line, rather than the break going
+    // back to an earlier space.
+    const b = "ab cdefghi jk";
+    var q = try layoutParagraph(gpa, &font, b, 14, m, 100);
+    defer q.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), q.lines.len);
+    try std.testing.expectEqualStrings("ab cdefghi", b[q.lines[0].start..q.lines[0].end]);
+    try std.testing.expectEqualStrings("jk", b[q.lines[1].start..q.lines[1].end]);
 }
 
 test "a word wider than the line breaks between characters instead of overflowing" {
