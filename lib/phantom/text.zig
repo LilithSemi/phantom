@@ -11,6 +11,7 @@ pub const mono = @import("text/mono.zig");
 pub const layout = @import("text/layout.zig");
 pub const grapheme = @import("text/grapheme.zig");
 pub const fit = @import("text/fit.zig");
+pub const markdown = @import("text/markdown.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

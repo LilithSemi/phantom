@@ -252,6 +252,7 @@ test {
     _ = @import("phantom/text/layout.zig");
     _ = @import("phantom/text/grapheme.zig");
     _ = @import("phantom/text/fit.zig");
+    _ = @import("phantom/text/markdown.zig");
     _ = @import("phantom/widgets/text.zig");
     _ = @import("phantom/theme.zig");
     _ = @import("phantom/view.zig");
