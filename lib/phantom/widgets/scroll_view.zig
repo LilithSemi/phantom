@@ -195,8 +195,7 @@ const RenderScrollView = struct {
 
     fn layoutFn(base: *RenderObject, c: layout.BoxConstraints) geom.PhysicalSize {
         const self: *RenderScrollView = @fieldParentPtr("base", base);
-        const vp = c.biggest();
-        self.viewport = vp;
+        var vp = c.biggest();
         if (self.child) |ch| {
             const child_constraints: layout.BoxConstraints = switch (self.axis) {
                 .vertical => .{
@@ -206,11 +205,13 @@ const RenderScrollView = struct {
                     .max_height = std.math.inf(f32),
                     .scale = c.scale,
                 },
+                // The height comes from the content, so a strip of code in a
+                // column is as tall as its lines and not as tall as the column.
                 .horizontal => .{
                     .min_width = 0,
                     .max_width = std.math.inf(f32),
                     .min_height = 0,
-                    .max_height = vp.height,
+                    .max_height = c.max_height,
                     .scale = c.scale,
                 },
                 .both => .{
@@ -226,6 +227,8 @@ const RenderScrollView = struct {
         } else {
             self.content = geom.PhysicalSize.zero;
         }
+        if (self.axis == .horizontal) vp.height = std.math.clamp(self.content.height, c.min_height, c.max_height);
+        self.viewport = vp;
         self.offset = clampOffset(self.offset, self.content, vp);
         return vp;
     }
@@ -417,6 +420,33 @@ test "ScrollView layout: viewport == tight constraints, content == child natural
 
     // content is the child's natural height (Text at size 200 > 100px)
     try std.testing.expect(ro.content.height > 100);
+}
+
+test "a horizontal ScrollView takes the height of its content, inside the constraints" {
+    const gpa = std.testing.allocator;
+    var sink = phantom.FaultSink{};
+    var owner = phantom.BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var bctx = phantom.BuildContext{ .arena = arena.allocator(), .owner = &owner };
+
+    const box = phantom.ColoredBox{ .color = phantom.Color.rgb(1, 1, 1) };
+    const strip = phantom.SizedBox{ .width = 300, .height = 20, .child = box.widget() };
+    var sv = ScrollView{ .axis = .horizontal, .child = strip.widget() };
+    const el = try sv.widget().mount(&bctx, null);
+    defer el.deinit(gpa);
+    const ro: *RenderScrollView = @fieldParentPtr("base", el.render_object.?);
+
+    const loose = layout.BoxConstraints{ .max_width = 100, .max_height = 500 };
+    try std.testing.expectEqual(geom.PhysicalSize{ .width = 100, .height = 20 }, el.render_object.?.layout(loose));
+    try std.testing.expectEqual(@as(f32, 300), ro.content.width);
+
+    const unbounded = layout.BoxConstraints{ .max_width = 100, .max_height = std.math.inf(f32) };
+    try std.testing.expectEqual(@as(f32, 20), el.render_object.?.layout(unbounded).height);
+
+    const tight = layout.BoxConstraints.tight(.{ .width = 100, .height = 50 });
+    try std.testing.expectEqual(@as(f32, 50), el.render_object.?.layout(tight).height);
 }
 
 test "ScrollView paint: display list starts push_scroll (viewport==bounds, offset==zero) and ends pop_scroll" {
