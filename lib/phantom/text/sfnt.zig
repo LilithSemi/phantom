@@ -14,6 +14,9 @@ pub fn i16be(b: []const u8, off: usize) i16 {
 pub fn u32be(b: []const u8, off: usize) u32 {
     return (@as(u32, b[off]) << 24) | (@as(u32, b[off + 1]) << 16) | (@as(u32, b[off + 2]) << 8) | b[off + 3];
 }
+pub fn i32be(b: []const u8, off: usize) i32 {
+    return @bitCast(u32be(b, off));
+}
 
 pub fn parse(bytes: []const u8) !Sfnt {
     if (bytes.len < 12) return error.InvalidFont;

@@ -10,14 +10,21 @@ available (embedded via `@embedFile`) and so the build needs no font download.
 | `Neuropol.otf` | Neuropol | Raymond Larabie (Typodermic Fonts) |
 | `Mesmerize Rg.otf` | Mesmerize (Regular) | Raymond Larabie (Typodermic Fonts) |
 | `Mesmerize Sb.otf` | Mesmerize (Semibold) | Raymond Larabie (Typodermic Fonts) |
+| `NK57 Monospace No Rg.otf` | NK57 Monospace (Normal Regular) | Raymond Larabie (Typodermic Fonts) |
+| `NK57 Monospace No Bd.otf` | NK57 Monospace (Normal Bold) | Raymond Larabie (Typodermic Fonts) |
+| `NK57 Monospace No Rg It.otf` | NK57 Monospace (Normal Italic) | Raymond Larabie (Typodermic Fonts) |
 
-All three are CFF-outline OpenType (`.otf`, sfnt tag `OTTO`).
+All are CFF-outline OpenType (`.otf`, sfnt tag `OTTO`).
 
 ## Source
 
-Extracted from the Typodermic Fonts public-domain release
+Neuropol and Mesmerize are extracted from the Typodermic Fonts public-domain release
 `typodermic-public-domain-2024-12.zip` (the `OpenType Fonts/` directory), from
 https://typodermicfonts.com/public-domain/ .
+
+NK57 Monospace comes from the separate CC0 package `nk57-monospace.zip` at
+https://typodermicfonts.com/assets/downloads/cc0-fonts/nk57-monospace.zip. Its
+read-this.html states CC0 1.0 Universal.
 
 ## License
 

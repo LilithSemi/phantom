@@ -58,6 +58,16 @@ pub fn parse(sfnt: Sfnt) !Metrics {
         }
     }
 
+    // A font's OS/2 flags can disagree with its own outlines. post.italicAngle
+    // at offset 4 is the foundry's own slant value, so a non-zero angle also
+    // marks the face italic.
+    if (sfnt.table("post")) |post| {
+        if (post.len >= 8) {
+            const angle = Sfnt.i32be(post, 4);
+            italic = italic or angle != 0;
+        }
+    }
+
     // hhea
     const hhea = sfnt.table("hhea") orelse return error.MissingHhea;
     if (hhea.len < 36) return error.InvalidHhea;
@@ -274,4 +284,14 @@ test "a font with no OS/2 table and an italic macStyle reports slant" {
     const m = try Metrics.parse(s);
     try std.testing.expectEqual(@as(u16, 400), m.weight_class);
     try std.testing.expect(m.italic);
+}
+
+test "NK57 italic's post.italicAngle marks it italic although its OS/2 says regular" {
+    const s = try Sfnt.parse(builtin.nk57_it_bytes);
+    const m = try Metrics.parse(s);
+    try std.testing.expect(m.italic);
+
+    const rg = try Sfnt.parse(builtin.nk57_rg_bytes);
+    const rm = try Metrics.parse(rg);
+    try std.testing.expect(!rm.italic);
 }

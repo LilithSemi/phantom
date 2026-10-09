@@ -34,6 +34,12 @@ default_heading_font: ?Font = null,
 default_body_font: ?Font = null,
 /// Lazily loaded built-in body bold font (Mesmerize Sb). Freed on deinit.
 default_body_bold_font: ?Font = null,
+/// Lazily loaded built-in code font (NK57 Monospace Rg). Freed on deinit.
+default_code_font: ?Font = null,
+/// Lazily loaded built-in code bold font (NK57 Monospace Bd). Freed on deinit.
+default_code_bold_font: ?Font = null,
+/// Lazily loaded built-in code italic font (NK57 Monospace Rg It). Freed on deinit.
+default_code_italic_font: ?Font = null,
 /// All open views for this owner, keyed by view id. Each value is a boxed
 /// *View allocated via gpa so &view.metrics is stable across map resizes.
 views: std.AutoHashMapUnmanaged(u32, *View) = .empty,
@@ -79,6 +85,9 @@ pub fn deinit(self: *BuildOwner) void {
     if (self.default_heading_font) |*f| f.deinit(self.gpa);
     if (self.default_body_font) |*f| f.deinit(self.gpa);
     if (self.default_body_bold_font) |*f| f.deinit(self.gpa);
+    if (self.default_code_font) |*f| f.deinit(self.gpa);
+    if (self.default_code_bold_font) |*f| f.deinit(self.gpa);
+    if (self.default_code_italic_font) |*f| f.deinit(self.gpa);
     var it = self.views.valueIterator();
     while (it.next()) |v| self.gpa.destroy(v.*);
     self.views.deinit(self.gpa);

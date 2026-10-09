@@ -83,11 +83,18 @@ pub const ThemeData = struct {
     heading_font: *Font,
     body_font: *Font,
     body_bold_font: *Font,
+    /// Monospace faces for code. NK57 Monospace by default.
+    code_font: *Font,
+    code_bold_font: *Font,
+    code_italic_font: *Font,
     text_size: f32,
     text_color: Color,
     /// The color that marks the focused or active element. A theme variant
     /// changes this without touching the rest of the scheme.
     accent: Color,
+    code_color: Color,
+    /// Drawn behind inline code and code blocks.
+    code_background: Color,
     /// Corner radius in logical units for panels and surfaces.
     radius: f32,
     /// Opacity of a panel drawn over the wallpaper. 0 is invisible, 1 is opaque.
@@ -116,15 +123,32 @@ pub fn defaultTheme(owner: *BuildOwner) *const ThemeData {
         owner.default_body_bold_font = builtin_fonts.mesmerize_sb(owner.gpa) catch
             panic("default theme: Mesmerize Sb failed to load (corrupt embed)", .{});
     }
+    if (owner.default_code_font == null) {
+        owner.default_code_font = builtin_fonts.nk57_rg(owner.gpa) catch
+            panic("default theme: NK57 failed to load (corrupt embed)", .{});
+    }
+    if (owner.default_code_bold_font == null) {
+        owner.default_code_bold_font = builtin_fonts.nk57_bd(owner.gpa) catch
+            panic("default theme: NK57 Bd failed to load (corrupt embed)", .{});
+    }
+    if (owner.default_code_italic_font == null) {
+        owner.default_code_italic_font = builtin_fonts.nk57_it(owner.gpa) catch
+            panic("default theme: NK57 It failed to load (corrupt embed)", .{});
+    }
     const colors = ColorScheme.tokyoNight();
     owner.default_theme = .{
         .colors = colors,
         .heading_font = &owner.default_heading_font.?,
         .body_font = &owner.default_body_font.?,
         .body_bold_font = &owner.default_body_bold_font.?,
+        .code_font = &owner.default_code_font.?,
+        .code_bold_font = &owner.default_code_bold_font.?,
+        .code_italic_font = &owner.default_code_italic_font.?,
         .text_size = 24,
         .text_color = colors.fg,
         .accent = colors.blue_light,
+        .code_color = colors.teal,
+        .code_background = colors.bg_dark,
         .radius = 18,
         .surface_alpha = 0.72,
     };
@@ -223,6 +247,17 @@ test "defaultTheme body_bold_font is loaded and distinct from body_font" {
     // exercise a glyph load to confirm the font is functional
     const g = try t.body_bold_font.glyph(owner.gpa, 'A', 24);
     try std.testing.expect(g.w > 0);
+}
+
+test "defaultTheme loads the three code faces, distinct from the body faces" {
+    const gpa = std.testing.allocator;
+    var sink = FaultSink{};
+    var owner = BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    const t = defaultTheme(&owner);
+    try std.testing.expect(t.code_font != t.body_font);
+    try std.testing.expect(t.code_italic_font.isItalic());
+    try std.testing.expect(t.code_bold_font.weight() >= 600);
 }
 
 test "defaultTheme body_bold_font is instance-scoped (two owners get independent caches)" {

@@ -280,7 +280,14 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
     // because which fonts a tree uses is decided when it builds and this is
     // decided now. An unreferenced file is never fetched: only a `@font-face`
     // that some text actually matches costs a request.
-    for ([_][]const u8{ "Neuropol.otf", "Mesmerize Rg.otf", "Mesmerize Sb.otf" }) |font_file| {
+    for ([_][]const u8{
+        "Neuropol.otf",
+        "Mesmerize Rg.otf",
+        "Mesmerize Sb.otf",
+        "NK57 Monospace No Rg.otf",
+        "NK57 Monospace No Bd.otf",
+        "NK57 Monospace No Rg It.otf",
+    }) |font_file| {
         const rel = b.fmt("{s}{s}", .{ phantom_font_dir, font_file });
         _ = dist.addCopyFile(phantom_dep.builder.path(b.fmt("lib/phantom/text/fonts/{s}", .{font_file})), rel);
         addDistFile(b, &files, rel);
