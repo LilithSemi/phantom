@@ -75,7 +75,11 @@ const openSource = (id, urlPtr, urlLen, typesPtr, typesLen) => {
   es.onopen = () => push(0);
   es.onmessage = (e) => push(1, e);
   const types = str(typesPtr, typesLen);
-  if (types) for (const t of types.split("\n")) es.addEventListener(t, (e) => push(1, e));
+  // `onmessage` already receives "message", so listing it again would deliver
+  // each default event twice.
+  if (types) for (const t of types.split("\n")) {
+    if (t !== "message") es.addEventListener(t, (e) => push(1, e));
+  }
   es.onerror = () => push(es.readyState === EventSource.CLOSED ? 3 : 2);
   sources.set(id, es);
   return 1;
