@@ -86,6 +86,8 @@ pub const widgets = struct {
     pub const ClipRRect = clip_rrect.ClipRRect;
     pub const grid_view = @import("phantom/widgets/grid_view.zig");
     pub const GridView = grid_view.GridView;
+    pub const rich_text = @import("phantom/widgets/rich_text.zig");
+    pub const RichText = rich_text.RichText;
 };
 pub const ColoredBox = widgets.ColoredBox;
 pub const Padding = widgets.Padding;
@@ -120,6 +122,7 @@ pub const TextField = widgets.TextField;
 pub const TextFieldController = widgets.TextFieldController;
 pub const ClipRRect = widgets.ClipRRect;
 pub const GridView = widgets.GridView;
+pub const RichText = widgets.RichText;
 
 pub const backend = struct {
     pub const dom = @import("phantom/backend/dom.zig");
@@ -294,4 +297,5 @@ test {
     _ = @import("phantom/platform.zig");
     _ = @import("phantom/widgets/link.zig");
     _ = @import("phantom/web_net.zig");
+    _ = @import("phantom/widgets/rich_text.zig");
 }
