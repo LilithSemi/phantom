@@ -8,7 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fit = @import("fit.zig");
-const grapheme = @import("grapheme.zig");
+const layout = @import("layout.zig");
 
 pub const Style = packed struct {
     strong: bool = false,
@@ -369,8 +369,6 @@ pub const Wrap = struct {
     width_of: *const fn (ctx: ?*anyopaque, row: usize) f32,
 };
 
-const Pos = struct { span: usize, at: usize };
-
 /// Wrap the spans of one logical line into rows, by the rules
 /// `layout.layoutParagraph` uses for plain text: a row breaks at its last space
 /// and the space is dropped, a word longer than the row breaks at a cluster
@@ -378,64 +376,22 @@ const Pos = struct { span: usize, at: usize };
 ///
 /// Rows borrow the text of `spans`. Only the row slices are allocated.
 pub fn wrapSpans(arena: Allocator, spans: []const Span, wrap: Wrap) Allocator.Error![]const []const Span {
-    var rows: std.ArrayList([]const Span) = .empty;
-    var start: Pos = .{ .span = 0, .at = 0 };
-    var row: usize = 0;
-    while (true) {
-        const room = wrap.width_of(wrap.ctx, row);
-        var used: f32 = 0;
-        var last_space: ?Pos = null;
-        var p = start;
-        const cut: struct { end: Pos, next: Pos } = while (p.span < spans.len) {
-            const s = spans[p.span];
-            if (p.at >= s.text.len) {
-                p = .{ .span = p.span + 1, .at = 0 };
-                continue;
-            }
-            const e = grapheme.nextBoundary(s.text, p.at);
-            const cluster = s.text[p.at..e];
-            if (cluster[0] == '\n') break .{ .end = p, .next = .{ .span = p.span, .at = e } };
-            const w = wrap.measure_for(wrap.ctx, s.style).width(cluster);
-            if (room > 0 and used + w > room and used > 0) {
-                if (std.mem.eql(u8, cluster, " ")) break .{ .end = p, .next = .{ .span = p.span, .at = e } };
-                if (last_space) |sp| break .{ .end = sp, .next = .{ .span = sp.span, .at = sp.at + 1 } };
-                break .{ .end = p, .next = p };
-            }
-            used += w;
-            if (std.mem.eql(u8, cluster, " ")) last_space = p;
-            p = .{ .span = p.span, .at = e };
-        } else .{ .end = p, .next = p };
-
-        try rows.append(arena, try slice(arena, spans, start, cut.end));
-        if (cut.next.span >= spans.len or atEnd(spans, cut.next)) break;
-        start = cut.next;
-        row += 1;
+    const laid = try arena.alloc(layout.Span, spans.len);
+    for (spans, laid) |s, *l| {
+        const m = wrap.measure_for(wrap.ctx, s.style);
+        l.* = .{ .text = s.text, .font = @constCast(m.font), .size = m.size, .metrics = m.metrics };
     }
-    return rows.toOwnedSlice(arena);
-}
-
-fn atEnd(spans: []const Span, p: Pos) bool {
-    var i = p.span;
-    var at = p.at;
-    while (i < spans.len) : ({
-        i += 1;
-        at = 0;
-    }) {
-        if (at < spans[i].text.len) return false;
+    const result = try layout.layoutSpans(arena, laid, .{ .ctx = wrap.ctx, .width_of = wrap.width_of });
+    const rows = try arena.alloc([]const Span, result.rows.len);
+    for (result.rows, rows) |r, *out| {
+        const row = try arena.alloc(Span, r.pieces.len);
+        for (r.pieces, row) |pc, *o| {
+            const s = spans[pc.span];
+            o.* = .{ .text = s.text[pc.start..pc.end], .style = s.style, .url = s.url };
+        }
+        out.* = row;
     }
-    return true;
-}
-
-fn slice(arena: Allocator, spans: []const Span, from: Pos, to: Pos) Allocator.Error![]const Span {
-    var out: std.ArrayList(Span) = .empty;
-    var i = from.span;
-    while (i < spans.len and i <= to.span) : (i += 1) {
-        const s = spans[i];
-        const a = if (i == from.span) from.at else 0;
-        const b = if (i == to.span) to.at else s.text.len;
-        if (b > a) try out.append(arena, .{ .text = s.text[a..b], .style = s.style, .url = s.url });
-    }
-    return out.toOwnedSlice(arena);
+    return rows;
 }
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ const dl = @import("../display_list.zig");
 const Font = @import("Font.zig");
 const builtin = @import("builtin.zig");
 const mono = @import("mono.zig");
+const grapheme = @import("grapheme.zig");
 
 pub const Line = struct {
     glyphs: []dl.PositionedGlyph,
@@ -273,6 +274,212 @@ pub fn layoutParagraph(
     };
 }
 
+// ---------------------------------------------------------------------------
+// Spans: runs in different fonts and sizes, wrapped into rows that share a
+// baseline.
+// ---------------------------------------------------------------------------
+
+/// One run of text in one font at one size. Several spans wrap together into
+/// rows, each row sharing a baseline, which is what a mixed-style line such as
+/// bold text next to plain text needs.
+pub const Span = struct {
+    /// Borrowed. Must outlive the `SpanLayout` built from this span.
+    text: []const u8,
+    font: *Font,
+    size: f32,
+    metrics: mono.TextMetrics,
+};
+
+/// One span's contribution to a row: the glyphs of its byte range, placed from
+/// `x` on the row's baseline.
+pub const Piece = struct {
+    /// Index into the spans passed to `layoutSpans`.
+    span: usize,
+    /// Byte range inside that span's text.
+    start: usize,
+    end: usize,
+    x: f32,
+    width: f32,
+    ascent: f32,
+    glyphs: []dl.PositionedGlyph,
+};
+
+/// One row of a span layout: the pieces that share its baseline, and the box
+/// they occupy together.
+pub const Row = struct { pieces: []Piece, width: f32, height: f32, ascent: f32 };
+
+/// Spans wrapped into rows.
+pub const SpanLayout = struct {
+    rows: []Row,
+    width: f32,
+    height: f32,
+
+    pub fn deinit(self: *SpanLayout, gpa: std.mem.Allocator) void {
+        for (self.rows) |*r| freeRow(gpa, r);
+        gpa.free(self.rows);
+        self.* = undefined;
+    }
+};
+
+/// The width of one row of a span layout, counted from zero. Zero or less
+/// does not wrap.
+pub const RowWidth = struct {
+    ctx: ?*anyopaque = null,
+    width_of: *const fn (ctx: ?*anyopaque, row: usize) f32,
+};
+
+const Pos = struct { span: usize, at: usize };
+
+/// Wrap `spans` into rows that fit `row_width`, by the same rules
+/// `layoutParagraph` uses for plain text: a row breaks at its last space and
+/// the space is dropped, a word longer than the row breaks at a cluster edge,
+/// and a line feed always breaks.
+pub fn layoutSpans(gpa: std.mem.Allocator, spans: []const Span, row_width: RowWidth) !SpanLayout {
+    var rows: std.ArrayList(Row) = .empty;
+    errdefer {
+        for (rows.items) |*r| freeRow(gpa, r);
+        rows.deinit(gpa);
+    }
+    var start: Pos = .{ .span = 0, .at = 0 };
+    var index: usize = 0;
+    while (true) {
+        const cut = nextSpanBreak(spans, start, row_width.width_of(row_width.ctx, index));
+        var row = try buildRow(gpa, spans, start, cut.end);
+        errdefer freeRow(gpa, &row);
+        try rows.append(gpa, row);
+        if (atEnd(spans, cut.next)) break;
+        start = cut.next;
+        index += 1;
+    }
+    var width: f32 = 0;
+    var height: f32 = 0;
+    for (rows.items) |r| {
+        width = @max(width, r.width);
+        height += r.height;
+    }
+    return .{ .rows = try rows.toOwnedSlice(gpa), .width = width, .height = height };
+}
+
+const SpanBreak = struct { end: Pos, next: Pos };
+
+fn spanCluster(spans: []const Span, p: Pos) []const u8 {
+    const s = spans[p.span].text;
+    return s[p.at..grapheme.nextBoundary(s, p.at)];
+}
+
+fn clusterWidth(span: Span, cluster: []const u8) f32 {
+    var w: f32 = 0;
+    var i: usize = 0;
+    while (i < cluster.len) {
+        const d = grapheme.decodeAt(cluster, i);
+        w += advanceOf(span.font, d.cp, span.size, span.metrics);
+        i += d.len;
+    }
+    return w;
+}
+
+fn nextSpanBreak(spans: []const Span, from: Pos, room: f32) SpanBreak {
+    var used: f32 = 0;
+    var last_space: ?Pos = null;
+    var p = from;
+    while (p.span < spans.len) {
+        if (p.at >= spans[p.span].text.len) {
+            p = .{ .span = p.span + 1, .at = 0 };
+            continue;
+        }
+        const cluster = spanCluster(spans, p);
+        const after: Pos = .{ .span = p.span, .at = p.at + cluster.len };
+        if (cluster[0] == '\n') return .{ .end = p, .next = after };
+        const w = clusterWidth(spans[p.span], cluster);
+        if (room > 0 and used + w > room and used > 0) {
+            if (std.mem.eql(u8, cluster, " ")) return .{ .end = p, .next = after };
+            if (last_space) |sp| return .{ .end = sp, .next = .{ .span = sp.span, .at = sp.at + 1 } };
+            return .{ .end = p, .next = p };
+        }
+        used += w;
+        if (std.mem.eql(u8, cluster, " ")) last_space = p;
+        p = after;
+    }
+    return .{ .end = p, .next = p };
+}
+
+fn atEnd(spans: []const Span, p: Pos) bool {
+    var i = p.span;
+    var at = p.at;
+    while (i < spans.len) : ({
+        i += 1;
+        at = 0;
+    }) {
+        if (at < spans[i].text.len) return false;
+    }
+    return true;
+}
+
+fn buildRow(gpa: std.mem.Allocator, spans: []const Span, from: Pos, to: Pos) !Row {
+    var pieces: std.ArrayList(Piece) = .empty;
+    errdefer {
+        for (pieces.items) |pc| gpa.free(pc.glyphs);
+        pieces.deinit(gpa);
+    }
+    var x: f32 = 0;
+    var ascent: f32 = 0;
+    var descent: f32 = 0;
+    var i = from.span;
+    while (i < spans.len and i <= to.span) : (i += 1) {
+        const s = spans[i];
+        const a = if (i == from.span) from.at else 0;
+        const b = if (i == to.span) to.at else s.text.len;
+        if (b <= a) continue;
+        const placed = try placeGlyphs(gpa, s, s.text[a..b]);
+        errdefer gpa.free(placed.glyphs);
+        const m = spanMetrics(s);
+        try pieces.append(gpa, .{ .span = i, .start = a, .end = b, .x = x, .width = placed.width, .ascent = m.ascent, .glyphs = placed.glyphs });
+        x += placed.width;
+        ascent = @max(ascent, m.ascent);
+        descent = @max(descent, m.height - m.ascent);
+    }
+    if (pieces.items.len == 0 and from.span < spans.len) {
+        // An empty row still has the height of the span it sits in.
+        const m = spanMetrics(spans[from.span]);
+        ascent = m.ascent;
+        descent = m.height - m.ascent;
+    }
+    return .{ .pieces = try pieces.toOwnedSlice(gpa), .width = x, .height = ascent + descent, .ascent = ascent };
+}
+
+/// The same line box `layoutLine` gives, without reading the font under
+/// `.mono`, so a span in terminal cells needs no real font.
+fn spanMetrics(s: Span) struct { ascent: f32, height: f32 } {
+    return switch (s.metrics) {
+        .mono => |m| .{ .ascent = m.ascent, .height = m.line },
+        .proportional => .{
+            .ascent = @as(f32, @floatFromInt(s.font.ascent())) * s.size / @as(f32, @floatFromInt(s.font.unitsPerEm())),
+            .height = s.font.lineHeight(s.size),
+        },
+    };
+}
+
+/// Glyphs on the baseline by cumulative advance, like `layoutLine`, but an
+/// invalid byte becomes U+FFFD instead of failing the whole layout.
+fn placeGlyphs(gpa: std.mem.Allocator, s: Span, text: []const u8) !struct { glyphs: []dl.PositionedGlyph, width: f32 } {
+    var glyphs: std.ArrayList(dl.PositionedGlyph) = .empty;
+    errdefer glyphs.deinit(gpa);
+    var pen: f32 = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const d = grapheme.decodeAt(text, i);
+        try glyphs.append(gpa, .{ .cp = d.cp, .x = pen, .y = 0 });
+        pen += advanceOf(s.font, d.cp, s.size, s.metrics);
+        i += d.len;
+    }
+    return .{ .glyphs = try glyphs.toOwnedSlice(gpa), .width = pen };
+}
+
+fn freeRow(gpa: std.mem.Allocator, r: *Row) void {
+    for (r.pieces) |pc| gpa.free(pc.glyphs);
+    gpa.free(r.pieces);
+}
+
 test "text that fits stays on one line" {
     const gpa = std.testing.allocator;
     var font = try Font.load(gpa, builtin.neuropol_bytes);
@@ -497,4 +704,101 @@ test "proportional wrapping measures with the font, not with a fixed column" {
     defer p.deinit(gpa);
     try std.testing.expect(p.lines.len > 1);
     for (p.lines) |l| try std.testing.expect(l.width <= width);
+}
+
+fn fixedWidth(ctx: ?*anyopaque, _: usize) f32 {
+    return @as(*const f32, @ptrCast(@alignCast(ctx.?))).*;
+}
+
+test "one span breaks exactly where layoutParagraph breaks" {
+    const gpa = std.testing.allocator;
+    var font = try Font.load(gpa, builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    const m = mono.TextMetrics{ .mono = mono.Mono.fromCell(10, 20) };
+    const t = "alpha beta gamma delta epsilon ab cdefghi jk";
+    var width: f32 = 100;
+    var para = try layoutParagraph(gpa, &font, t, 14, m, width);
+    defer para.deinit(gpa);
+    var spans = try layoutSpans(gpa, &.{.{ .text = t, .font = &font, .size = 14, .metrics = m }}, .{ .ctx = &width, .width_of = fixedWidth });
+    defer spans.deinit(gpa);
+    try std.testing.expectEqual(para.lines.len, spans.rows.len);
+    for (para.lines, spans.rows) |l, r| {
+        try std.testing.expectEqual(l.start, r.pieces[0].start);
+        try std.testing.expectEqual(l.end, r.pieces[r.pieces.len - 1].end);
+    }
+}
+
+fn firstNarrow(_: ?*anyopaque, row: usize) f32 {
+    return if (row == 0) 50 else 110;
+}
+
+test "a span splits across rows, and each row takes its own width" {
+    const gpa = std.testing.allocator;
+    var font = try Font.load(gpa, builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    const m = mono.TextMetrics{ .mono = mono.Mono.fromCell(10, 20) };
+    const a = "alpha ";
+    const b = "beta gamma delta";
+    var l = try layoutSpans(gpa, &.{
+        .{ .text = a, .font = &font, .size = 14, .metrics = m },
+        .{ .text = b, .font = &font, .size = 14, .metrics = m },
+    }, .{ .width_of = firstNarrow });
+    defer l.deinit(gpa);
+    // "beta gamma delta" is 160px wide; a row of 110px holds "beta gamma " (110px)
+    // at most, so "delta" takes a third row rather than joining the second.
+    try std.testing.expectEqual(@as(usize, 3), l.rows.len);
+    try std.testing.expectEqualStrings("alpha", a[l.rows[0].pieces[0].start..l.rows[0].pieces[0].end]);
+    try std.testing.expectEqual(@as(usize, 1), l.rows[1].pieces[0].span);
+    try std.testing.expectEqualStrings("beta gamma", b[l.rows[1].pieces[0].start..l.rows[1].pieces[0].end]);
+    try std.testing.expectEqualStrings("delta", b[l.rows[2].pieces[0].start..l.rows[2].pieces[0].end]);
+}
+
+test "a taller span sets the row, and every piece shares one baseline" {
+    const gpa = std.testing.allocator;
+    var font = try Font.load(gpa, builtin.mesmerize_rg_bytes);
+    defer font.deinit(gpa);
+    var l = try layoutSpans(gpa, &.{
+        .{ .text = "small ", .font = &font, .size = 12, .metrics = .proportional },
+        .{ .text = "BIG", .font = &font, .size = 36, .metrics = .proportional },
+    }, .{ .width_of = struct {
+        fn f(_: ?*anyopaque, _: usize) f32 {
+            return 0;
+        }
+    }.f });
+    defer l.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), l.rows.len);
+    const r = l.rows[0];
+    try std.testing.expectEqual(r.pieces[1].ascent, r.ascent);
+    try std.testing.expect(r.pieces[0].ascent < r.ascent);
+    try std.testing.expect(r.height >= font.lineHeight(36));
+}
+
+test "a line feed in a span always breaks" {
+    const gpa = std.testing.allocator;
+    var font = try Font.load(gpa, builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    const m = mono.TextMetrics{ .mono = mono.Mono.fromCell(10, 20) };
+    var l = try layoutSpans(gpa, &.{.{ .text = "a\nb", .font = &font, .size = 14, .metrics = m }}, .{ .width_of = struct {
+        fn f(_: ?*anyopaque, _: usize) f32 {
+            return 0;
+        }
+    }.f });
+    defer l.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), l.rows.len);
+}
+
+fn layoutSpansUnderFailingAllocator(gpa: std.mem.Allocator, font: *Font) !void {
+    const m = mono.TextMetrics{ .mono = mono.Mono.fromCell(10, 20) };
+    var l = try layoutSpans(gpa, &.{
+        .{ .text = "alpha ", .font = font, .size = 14, .metrics = m },
+        .{ .text = "beta gamma delta", .font = font, .size = 14, .metrics = m },
+    }, .{ .width_of = firstNarrow });
+    l.deinit(gpa);
+}
+
+test "layoutSpans frees a built row when appending it fails, and frees placed glyphs when adding a piece fails" {
+    const gpa = std.testing.allocator;
+    var font = try Font.load(gpa, builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    try std.testing.checkAllAllocationFailures(gpa, layoutSpansUnderFailingAllocator, .{&font});
 }
