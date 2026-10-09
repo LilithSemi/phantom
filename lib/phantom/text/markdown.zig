@@ -7,6 +7,8 @@
 //! paragraph, so nothing is lost, it only draws plain.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const fit = @import("fit.zig");
+const grapheme = @import("grapheme.zig");
 
 pub const Style = packed struct {
     strong: bool = false,
@@ -353,6 +355,90 @@ fn link(text: []const u8, i: usize) ?Link {
 }
 
 // ---------------------------------------------------------------------------
+// Wrapping
+// ---------------------------------------------------------------------------
+
+/// How `wrapSpans` measures and how wide each row is.
+pub const Wrap = struct {
+    ctx: ?*anyopaque = null,
+    /// The measure a span of `style` draws with. A terminal can answer
+    /// `fit.Measure.cells` for every style. A window answers the font it draws
+    /// that style in, because a bold face is wider.
+    measure_for: *const fn (ctx: ?*anyopaque, style: Style) fit.Measure,
+    /// The width of row `row`, counted from zero. Zero or less does not wrap.
+    width_of: *const fn (ctx: ?*anyopaque, row: usize) f32,
+};
+
+const Pos = struct { span: usize, at: usize };
+
+/// Wrap the spans of one logical line into rows, by the rules
+/// `layout.layoutParagraph` uses for plain text: a row breaks at its last space
+/// and the space is dropped, a word longer than the row breaks at a cluster
+/// edge, and a line feed always breaks. A line with no spans is one empty row.
+///
+/// Rows borrow the text of `spans`. Only the row slices are allocated.
+pub fn wrapSpans(arena: Allocator, spans: []const Span, wrap: Wrap) Allocator.Error![]const []const Span {
+    var rows: std.ArrayList([]const Span) = .empty;
+    var start: Pos = .{ .span = 0, .at = 0 };
+    var row: usize = 0;
+    while (true) {
+        const room = wrap.width_of(wrap.ctx, row);
+        var used: f32 = 0;
+        var last_space: ?Pos = null;
+        var p = start;
+        const cut: struct { end: Pos, next: Pos } = while (p.span < spans.len) {
+            const s = spans[p.span];
+            if (p.at >= s.text.len) {
+                p = .{ .span = p.span + 1, .at = 0 };
+                continue;
+            }
+            const e = grapheme.nextBoundary(s.text, p.at);
+            const cluster = s.text[p.at..e];
+            if (cluster[0] == '\n') break .{ .end = p, .next = .{ .span = p.span, .at = e } };
+            const w = wrap.measure_for(wrap.ctx, s.style).width(cluster);
+            if (room > 0 and used + w > room and used > 0) {
+                if (std.mem.eql(u8, cluster, " ")) break .{ .end = p, .next = .{ .span = p.span, .at = e } };
+                if (last_space) |sp| break .{ .end = sp, .next = .{ .span = sp.span, .at = sp.at + 1 } };
+                break .{ .end = p, .next = p };
+            }
+            used += w;
+            if (std.mem.eql(u8, cluster, " ")) last_space = p;
+            p = .{ .span = p.span, .at = e };
+        } else .{ .end = p, .next = p };
+
+        try rows.append(arena, try slice(arena, spans, start, cut.end));
+        if (cut.next.span >= spans.len or atEnd(spans, cut.next)) break;
+        start = cut.next;
+        row += 1;
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+fn atEnd(spans: []const Span, p: Pos) bool {
+    var i = p.span;
+    var at = p.at;
+    while (i < spans.len) : ({
+        i += 1;
+        at = 0;
+    }) {
+        if (at < spans[i].text.len) return false;
+    }
+    return true;
+}
+
+fn slice(arena: Allocator, spans: []const Span, from: Pos, to: Pos) Allocator.Error![]const Span {
+    var out: std.ArrayList(Span) = .empty;
+    var i = from.span;
+    while (i < spans.len and i <= to.span) : (i += 1) {
+        const s = spans[i];
+        const a = if (i == from.span) from.at else 0;
+        const b = if (i == to.span) to.at else s.text.len;
+        if (b > a) try out.append(arena, .{ .text = s.text[a..b], .style = s.style, .url = s.url });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -505,4 +591,73 @@ test "malformed fragments parse without reading out of range" {
             try testing.expect(start >= @intFromPtr(s.ptr) and start + span.text.len <= @intFromPtr(s.ptr) + s.len);
         }
     }
+}
+
+const TestWrap = struct {
+    widths: []const f32,
+    strong_cells: f32 = 1,
+
+    fn measureFor(ctx: ?*anyopaque, style: Style) fit.Measure {
+        const self: *const TestWrap = @ptrCast(@alignCast(ctx.?));
+        var m = fit.Measure.cells;
+        if (style.strong) m.metrics.mono.advance = self.strong_cells;
+        return m;
+    }
+
+    fn widthOf(ctx: ?*anyopaque, row: usize) f32 {
+        const self: *const TestWrap = @ptrCast(@alignCast(ctx.?));
+        return self.widths[@min(row, self.widths.len - 1)];
+    }
+
+    fn wrap(self: *TestWrap) Wrap {
+        return .{ .ctx = self, .measure_for = measureFor, .width_of = widthOf };
+    }
+};
+
+fn expectRows(text: []const u8, tw: *TestWrap, want: []const []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rows = try wrapSpans(a, try spansOf(a, text), tw.wrap());
+    try testing.expectEqual(want.len, rows.len);
+    for (want, rows) |w, row| {
+        var joined: std.ArrayList(u8) = .empty;
+        for (row) |s| try joined.appendSlice(a, s.text);
+        try testing.expectEqualStrings(w, joined.items);
+    }
+}
+
+test "spans wrap at spaces, keep their styles, and drop the space at the break" {
+    var tw = TestWrap{ .widths = &.{14} };
+    try expectRows("**What changed** in `src/app.zig` today", &tw, &.{ "What changed", "in src/app.zig", "today" });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rows = try wrapSpans(a, try spansOf(a, "**What changed** in `src/app.zig`"), tw.wrap());
+    try testing.expectEqual(strong, rows[0][0].style);
+    try testing.expectEqual(code, rows[1][1].style);
+}
+
+test "each row has its own width, so a pinned first row wraps narrower" {
+    var tw = TestWrap{ .widths = &.{ 5, 11 } };
+    try expectRows("alpha beta gamma delta", &tw, &.{ "alpha", "beta gamma", "delta" });
+}
+
+test "a word longer than the row breaks at a cluster edge, and a wide character is never split" {
+    var tw = TestWrap{ .widths = &.{4} };
+    try expectRows("abcdefghij", &tw, &.{ "abcd", "efgh", "ij" });
+    try expectRows("あいうえお", &tw, &.{ "あい", "うえ", "お" });
+}
+
+test "a wider bold measure moves the break" {
+    var tw = TestWrap{ .widths = &.{8}, .strong_cells = 2 };
+    try expectRows("**bold** text", &tw, &.{ "bold", "text" });
+}
+
+test "no width means one row, and no spans mean one empty row" {
+    var tw = TestWrap{ .widths = &.{0} };
+    try expectRows("one long line that never wraps", &tw, &.{"one long line that never wraps"});
+    var narrow = TestWrap{ .widths = &.{3} };
+    try expectRows("", &narrow, &.{""});
 }
