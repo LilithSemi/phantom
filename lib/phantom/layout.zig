@@ -79,6 +79,36 @@ pub const BoxConstraints = struct {
     }
 };
 
+/// The rows of a full-screen layout: fixed bands at the top and the bottom, a
+/// panel that asks for rows, and a body that takes what is left.
+pub const Bands = struct {
+    top: u16,
+    body: u16,
+    panel: u16,
+    bottom: u16,
+};
+
+/// Split `total` rows. The bottom band is served first, because it is usually the
+/// input and a screen with no input is unusable. The top band is next, then the
+/// panel up to what it asks for, and the body gets the rest.
+pub fn bands(total: u16, top: u16, bottom: u16, panel: u16) Bands {
+    const b = @min(bottom, total);
+    const t = @min(top, total - b);
+    const p = @min(panel, total - b - t);
+    return .{ .top = t, .body = total - b - t - p, .panel = p, .bottom = b };
+}
+
+test "bands give the body what the fixed bands and the panel leave" {
+    try std.testing.expectEqual(Bands{ .top = 1, .body = 20, .panel = 3, .bottom = 1 }, bands(25, 1, 1, 3));
+    try std.testing.expectEqual(Bands{ .top = 1, .body = 0, .panel = 3, .bottom = 1 }, bands(5, 1, 1, 9));
+}
+
+test "bands on a tiny screen keep the bottom band, then the top band" {
+    try std.testing.expectEqual(Bands{ .top = 0, .body = 0, .panel = 0, .bottom = 0 }, bands(0, 1, 1, 3));
+    try std.testing.expectEqual(Bands{ .top = 0, .body = 0, .panel = 0, .bottom = 1 }, bands(1, 1, 1, 3));
+    try std.testing.expectEqual(Bands{ .top = 1, .body = 0, .panel = 0, .bottom = 1 }, bands(2, 1, 1, 3));
+}
+
 test "tight then deflate then constrain flows padding" {
     const c = BoxConstraints.tight(.{ .width = 800, .height = 600 });
     const inner = c.deflate(geom.PhysicalEdgeInsets.all(40));

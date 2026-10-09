@@ -9,6 +9,8 @@ pub const mono = @import("text/mono.zig");
 /// caller that needs to break text itself, or to measure a run before drawing
 /// it, otherwise cannot reach the function phantom uses for its own text.
 pub const layout = @import("text/layout.zig");
+pub const grapheme = @import("text/grapheme.zig");
+pub const fit = @import("text/fit.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

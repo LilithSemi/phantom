@@ -81,6 +81,7 @@ pub const widgets = struct {
     pub const Icon = icon_widget.Icon;
     pub const text_field = @import("phantom/widgets/text_field.zig");
     pub const TextField = text_field.TextField;
+    pub const TextFieldController = text_field.TextFieldController;
     pub const clip_rrect = @import("phantom/widgets/clip_rrect.zig");
     pub const ClipRRect = clip_rrect.ClipRRect;
     pub const grid_view = @import("phantom/widgets/grid_view.zig");
@@ -116,6 +117,7 @@ pub const ScrollController = widgets.ScrollController;
 pub const Image = widgets.Image;
 pub const Icon = widgets.Icon;
 pub const TextField = widgets.TextField;
+pub const TextFieldController = widgets.TextFieldController;
 pub const ClipRRect = widgets.ClipRRect;
 pub const GridView = widgets.GridView;
 
@@ -248,6 +250,8 @@ test {
     _ = @import("phantom/text/Font.zig");
     _ = @import("phantom/text/GlyphCache.zig");
     _ = @import("phantom/text/layout.zig");
+    _ = @import("phantom/text/grapheme.zig");
+    _ = @import("phantom/text/fit.zig");
     _ = @import("phantom/widgets/text.zig");
     _ = @import("phantom/theme.zig");
     _ = @import("phantom/view.zig");

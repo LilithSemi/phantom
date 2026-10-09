@@ -30,6 +30,7 @@ const input = phantom.input;
 const text_layout = @import("../text/layout.zig");
 const Font = @import("../text/Font.zig");
 const mono = @import("../text/mono.zig");
+const grapheme = @import("../text/grapheme.zig");
 const theme_mod = @import("../theme.zig");
 const testing = @import("../testing.zig");
 
@@ -38,26 +39,8 @@ const testing = @import("../testing.zig");
 pub const default_blink_period: Ticker.Nanos = 500_000_000;
 
 // ---------------------------------------------------------------------------
-// UTF-8 caret motion
+// Character counting
 // ---------------------------------------------------------------------------
-
-/// The byte index of the character boundary before `i`. Malformed bytes are a
-/// runtime fault in the input, not a programmer error, so a run of continuation
-/// bytes with no lead byte still yields progress instead of stalling the caret.
-pub fn previousBoundary(s: []const u8, i: usize) usize {
-    if (i == 0 or i > s.len) return 0;
-    var j = i - 1;
-    while (j > 0 and s[j] & 0xC0 == 0x80) j -= 1;
-    return j;
-}
-
-/// The byte index of the character boundary after `i`. A byte that starts no
-/// valid sequence advances by one, so the caret can always leave it.
-pub fn nextBoundary(s: []const u8, i: usize) usize {
-    if (i >= s.len) return s.len;
-    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-    return @min(s.len, i + len);
-}
 
 /// How many characters `s` holds. Every byte that is not a continuation byte
 /// starts one, which also counts malformed input without rejecting it.
@@ -267,6 +250,47 @@ const CaretText = struct {
 // The widget
 // ---------------------------------------------------------------------------
 
+/// Reads and sets a mounted field's text and caret, for history, completion and
+/// anything else that edits the field from outside. Owned by the application
+/// and handed to one field through `TextField.controller`. Before the field
+/// mounts and after it unmounts, reads are empty and writes do nothing.
+pub const TextFieldController = struct {
+    state: ?*TextField.State = null,
+
+    /// The text. Borrowed and valid until the next edit.
+    pub fn text(self: *const TextFieldController) []const u8 {
+        const s = self.state orelse return "";
+        return s.buf.items;
+    }
+
+    /// The caret position in bytes, always on a cluster boundary.
+    pub fn caret(self: *const TextFieldController) usize {
+        const s = self.state orelse return 0;
+        return s.caret;
+    }
+
+    /// Replaces the text and puts the caret at its end. `on_change` does not
+    /// fire, because the caller already knows what it set.
+    pub fn setText(self: *TextFieldController, new_text: []const u8) error{OutOfMemory}!void {
+        const s = self.state orelse return;
+        s.buf.clearRetainingCapacity();
+        try s.buf.appendSlice(s.base.gpa(), new_text);
+        s.caret = s.buf.items.len;
+        s.afterMove();
+    }
+
+    /// Moves the caret to `at`, or to the cluster boundary before it when `at`
+    /// is inside a cluster. Past the end is the end.
+    pub fn setCaret(self: *TextFieldController, at: usize) void {
+        const s = self.state orelse return;
+        const items = s.buf.items;
+        const end = @min(at, items.len);
+        const before = grapheme.previousBoundary(items, end);
+        s.caret = if (grapheme.nextBoundary(items, before) == end) end else before;
+        s.afterMove();
+    }
+};
+
 pub const TextField = struct {
     /// The text the field starts with. It is copied on mount and the field owns
     /// its text from then on, so a later rebuild does not overwrite what the user
@@ -294,6 +318,12 @@ pub const TextField = struct {
     /// object and the focus is held by name. Null leaves the field reachable
     /// through Tab only.
     id: ?[]const u8 = null,
+    /// Sees every key before the field does, with `ctx`. Return true to use the
+    /// key, and the field then ignores it. This is where completion, history and
+    /// keys with a meaning of their own go, Tab included.
+    on_key: ?*const fn (ctx: *anyopaque, ev: input.KeyEvent) bool = null,
+    /// Reads and sets the text and the caret from outside the field.
+    controller: ?*TextFieldController = null,
 
     pub fn widget(self: *const TextField) Widget {
         return phantom.StatefulWidget(TextField, self);
@@ -322,6 +352,8 @@ pub const TextField = struct {
         /// Borrowed from the config. The `Focus` widget below copies it, so the
         /// slice only has to survive until the next build.
         id: ?[]const u8 = null,
+        on_key: ?*const fn (ctx: *anyopaque, ev: input.KeyEvent) bool = null,
+        controller: ?*TextFieldController = null,
         // The built configs live here so their addresses stay stable across the
         // build, which is what a Widget borrows.
         view: CaretText = undefined,
@@ -336,18 +368,35 @@ pub const TextField = struct {
                 .ctx = s,
                 .on_tick = State.onFrame,
             };
+            s.attach(config.controller);
         }
 
         pub fn didUpdateWidget(s: *State, config: *const TextField) anyerror!void {
             // The text is deliberately not taken again: the field owns it after
             // mount, and a parent rebuild must not undo what the user typed.
             s.takeStyle(config);
+            if (config.controller != s.controller) {
+                s.detach();
+                s.attach(config.controller);
+            }
         }
 
         pub fn dispose(s: *State) void {
             // Without this the scheduler keeps calling a freed State every frame.
             s.ticker.deinit();
+            s.detach();
             s.buf.deinit(s.base.gpa());
+        }
+
+        fn attach(s: *State, controller: ?*TextFieldController) void {
+            s.controller = controller;
+            if (controller) |c| c.state = s;
+        }
+
+        fn detach(s: *State) void {
+            const c = s.controller orelse return;
+            if (c.state == s) c.state = null;
+            s.controller = null;
         }
 
         fn takeStyle(s: *State, config: *const TextField) void {
@@ -360,6 +409,7 @@ pub const TextField = struct {
             s.caret_width = config.caret_width;
             s.blink_period = config.blink_period;
             s.id = config.id;
+            s.on_key = config.on_key;
         }
 
         /// The text as it stands. Borrowed and valid until the next edit.
@@ -402,7 +452,7 @@ pub const TextField = struct {
 
         fn backspace(s: *State) bool {
             if (s.caret == 0) return false; // no edit, and no unsigned underflow
-            const start = previousBoundary(s.buf.items, s.caret);
+            const start = grapheme.previousBoundary(s.buf.items, s.caret);
             s.buf.replaceRangeAssumeCapacity(start, s.caret - start, &.{});
             s.caret = start;
             return true;
@@ -410,7 +460,7 @@ pub const TextField = struct {
 
         fn deleteForward(s: *State) bool {
             if (s.caret >= s.buf.items.len) return false;
-            const end = nextBoundary(s.buf.items, s.caret);
+            const end = grapheme.nextBoundary(s.buf.items, s.caret);
             s.buf.replaceRangeAssumeCapacity(s.caret, end - s.caret, &.{});
             return true;
         }
@@ -437,6 +487,9 @@ pub const TextField = struct {
 
         fn onKey(ctx: *anyopaque, ev: input.KeyEvent) bool {
             const s: *State = @ptrCast(@alignCast(ctx));
+            if (s.on_key) |f| {
+                if (f(s.user_ctx, ev)) return true;
+            }
             if (ev.action == .release) return false;
             // Keysym is not exhaustive, because a printable key carries a unicode
             // keysym, so the default prong is the printable path.
@@ -450,12 +503,12 @@ pub const TextField = struct {
                     return true;
                 },
                 .left => {
-                    s.caret = previousBoundary(s.buf.items, s.caret);
+                    s.caret = grapheme.previousBoundary(s.buf.items, s.caret);
                     s.afterMove();
                     return true;
                 },
                 .right => {
-                    s.caret = nextBoundary(s.buf.items, s.caret);
+                    s.caret = grapheme.nextBoundary(s.buf.items, s.caret);
                     s.afterMove();
                     return true;
                 },
@@ -691,6 +744,85 @@ test "the left arrow steps over a whole multi byte character" {
     try std.testing.expectEqual(@as(usize, 1), s.caret);
     f.press(.right);
     try std.testing.expectEqual(@as(usize, 4), s.caret);
+}
+
+test "the caret and backspace move over a whole grapheme cluster" {
+    const gpa = std.testing.allocator;
+    var field = TextField{ .text = "e\u{301}\u{1F44D}\u{1F3FD}" }; // 3 + 8 bytes
+    var f = try Fixture.init(gpa, &field);
+    defer f.deinit();
+    try f.focus();
+
+    const s = try f.state();
+    f.press(.left); // over the thumb and its skin tone together
+    try std.testing.expectEqual(@as(usize, 3), s.caret);
+    f.press(.backspace); // the accent goes with its letter
+    try std.testing.expectEqualStrings("\u{1F44D}\u{1F3FD}", s.value());
+    try std.testing.expectEqual(@as(usize, 0), s.caret);
+}
+
+test "on_key sees a key first, and a key it uses never reaches the field" {
+    const gpa = std.testing.allocator;
+    const Completer = struct {
+        tabs: u32 = 0,
+        fn onKey(ctx: *anyopaque, ev: input.KeyEvent) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (ev.keysym != .tab) return false;
+            self.tabs += 1;
+            return true;
+        }
+    };
+    var completer = Completer{};
+    var field = TextField{ .text = "ab", .on_key = Completer.onKey, .ctx = &completer, .id = "a" };
+    var f = try Fixture.init(gpa, &field);
+    defer f.deinit();
+    try f.focus();
+
+    const s = try f.state();
+    f.press(.tab);
+    try std.testing.expectEqual(@as(u32, 1), completer.tabs);
+    // Tab did not move the focus away, because the hook used it.
+    try std.testing.expect(s.focused);
+    f.typeText("c");
+    try std.testing.expectEqualStrings("abc", s.value());
+}
+
+test "a controller sets the text and the caret, and reads them back" {
+    const gpa = std.testing.allocator;
+    var controller = TextFieldController{};
+    try std.testing.expectEqualStrings("", controller.text());
+
+    var field = TextField{ .text = "draft", .controller = &controller };
+    var f = try Fixture.init(gpa, &field);
+    defer f.deinit();
+    try f.focus();
+
+    try std.testing.expectEqualStrings("draft", controller.text());
+    try controller.setText("git status");
+    try std.testing.expectEqual(@as(usize, 10), controller.caret());
+    controller.setCaret(3);
+    f.typeText("!");
+    try std.testing.expectEqualStrings("git! status", controller.text());
+
+    try controller.setText("a\u{20AC}");
+    controller.setCaret(2); // inside the euro sign
+    try std.testing.expectEqual(@as(usize, 1), controller.caret());
+    controller.setCaret(99);
+    try std.testing.expectEqual(@as(usize, 4), controller.caret());
+}
+
+test "a controller forgets its field when the field unmounts" {
+    const gpa = std.testing.allocator;
+    var controller = TextFieldController{};
+    var field = TextField{ .text = "x", .controller = &controller };
+    {
+        var f = try Fixture.init(gpa, &field);
+        defer f.deinit();
+        try std.testing.expect(controller.state != null);
+    }
+    try std.testing.expect(controller.state == null);
+    try controller.setText("ignored");
+    try std.testing.expectEqualStrings("", controller.text());
 }
 
 test "backspace over a multi byte character removes the whole character" {
@@ -952,37 +1084,6 @@ test "unmounting a focused field cancels its blink registration" {
     gpa.destroy(f.harness.sink);
     gpa.destroy(f.harness.focus);
     f.manager.deinit(gpa);
-}
-
-test "previousBoundary and nextBoundary step whole UTF-8 sequences" {
-    // One, two, three and four byte sequences in one string.
-    const s = "a\u{00E9}\u{20AC}\u{1F600}b";
-    try std.testing.expectEqual(@as(usize, 11), s.len);
-    // Forward.
-    try std.testing.expectEqual(@as(usize, 1), nextBoundary(s, 0));
-    try std.testing.expectEqual(@as(usize, 3), nextBoundary(s, 1));
-    try std.testing.expectEqual(@as(usize, 6), nextBoundary(s, 3));
-    try std.testing.expectEqual(@as(usize, 10), nextBoundary(s, 6));
-    try std.testing.expectEqual(@as(usize, 11), nextBoundary(s, 10));
-    try std.testing.expectEqual(@as(usize, 11), nextBoundary(s, 11)); // clamped at the end
-    // Backward.
-    try std.testing.expectEqual(@as(usize, 10), previousBoundary(s, 11));
-    try std.testing.expectEqual(@as(usize, 6), previousBoundary(s, 10));
-    try std.testing.expectEqual(@as(usize, 3), previousBoundary(s, 6));
-    try std.testing.expectEqual(@as(usize, 1), previousBoundary(s, 3));
-    try std.testing.expectEqual(@as(usize, 0), previousBoundary(s, 1));
-    try std.testing.expectEqual(@as(usize, 0), previousBoundary(s, 0)); // clamped at the start
-}
-
-test "a malformed byte still lets the caret move, one byte at a time" {
-    // Input is never trusted. A lone continuation byte must not stall the caret
-    // in a loop, and a lone lead byte must not step past the end of the string.
-    const stray = [_]u8{ 0x80, 0x80, 'a' };
-    try std.testing.expectEqual(@as(usize, 1), nextBoundary(&stray, 0));
-    try std.testing.expectEqual(@as(usize, 0), previousBoundary(&stray, 2));
-
-    const truncated = [_]u8{ 0xF0, 'a' };
-    try std.testing.expectEqual(@as(usize, 2), nextBoundary(&truncated, 0)); // clamped to the length
 }
 
 test "characterCount counts characters and not bytes" {
