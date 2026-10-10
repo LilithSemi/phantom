@@ -16,6 +16,7 @@ const geom_mod = @import("geometry.zig");
 const input_mod = @import("input.zig");
 const Scheduler = @import("scheduler.zig").Scheduler;
 const mono = @import("text/mono.zig");
+const http_mod = @import("http.zig");
 const BuildOwner = @This();
 
 gpa: std.mem.Allocator,
@@ -79,8 +80,33 @@ text_metrics: mono.TextMetrics = .proportional,
 /// reads this once per render and clears it, so only the render right after
 /// a navigation drops the carried offsets.
 route_changed: bool = false,
+/// Made on the first `http` call on a backend with no client of its own.
+std_http: if (http_mod.std_available) ?StdHttp else void = if (http_mod.std_available) null else {},
+
+const StdHttp = struct {
+    inner: std.http.Client,
+    wrap: http_mod.Std,
+};
+
+/// The HTTP client for this tree: the backend's own when it has one, and a
+/// `std.http.Client` on `gpa` and `io` otherwise. Every fetch fails with
+/// `error.NetworkDown` where neither exists.
+pub fn http(self: *BuildOwner) http_mod.Client {
+    if (self.platform.http) |c| return c;
+    if (comptime !http_mod.std_available) return http_mod.unavailable;
+    if (self.std_http == null) {
+        self.std_http = .{ .inner = .{ .allocator = self.gpa, .io = self.io }, .wrap = undefined };
+    }
+    const h = &self.std_http.?;
+    // Set on every call, because the owner can move between calls.
+    h.wrap = .{ .inner = &h.inner };
+    return h.wrap.client();
+}
 
 pub fn deinit(self: *BuildOwner) void {
+    if (http_mod.std_available) {
+        if (self.std_http) |*h| h.inner.deinit();
+    }
     self.scheduler.deinit(self.gpa);
     if (self.default_heading_font) |*f| f.deinit(self.gpa);
     if (self.default_body_font) |*f| f.deinit(self.gpa);

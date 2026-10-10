@@ -132,15 +132,15 @@ pub const Keysym = enum(u32) {
 
     pub fn fromCodepoint(cp: u21) Keysym {
         if ((cp >= 0x20 and cp <= 0x7E) or (cp >= 0xA0 and cp <= 0xFF)) {
-            return @enumFromInt(@as(u32, cp));
+            return @fromBackingInt(@intCast(@as(u32, cp)));
         }
-        if (cp >= 0x100 and cp <= 0x10FFFF) return @enumFromInt(@as(u32, cp) + 0x01000000);
+        if (cp >= 0x100 and cp <= 0x10FFFF) return @fromBackingInt(@intCast(@as(u32, cp) + 0x01000000));
         return .no_symbol;
     }
 
     /// The codepoint a printable keysym produces, or null for a named key.
     pub fn toCodepoint(self: Keysym) ?u21 {
-        const v = @intFromEnum(self);
+        const v = @backingInt(self);
         if ((v >= 0x20 and v <= 0x7E) or (v >= 0xA0 and v <= 0xFF)) return @intCast(v);
         if (v >= 0x01000100 and v <= 0x0110FFFF) return @intCast(v - 0x01000000);
         return null;
@@ -493,13 +493,13 @@ test "hitTestScroll returns the deepest on_scroll handler; Dispatcher.scroll fir
 }
 
 test "a printable codepoint becomes its own keysym" {
-    try std.testing.expectEqual(@as(u32, 'a'), @intFromEnum(Keysym.fromCodepoint('a')));
-    try std.testing.expectEqual(@as(u32, ' '), @intFromEnum(Keysym.fromCodepoint(' ')));
+    try std.testing.expectEqual(@as(u32, 'a'), @backingInt(Keysym.fromCodepoint('a')));
+    try std.testing.expectEqual(@as(u32, ' '), @backingInt(Keysym.fromCodepoint(' ')));
 }
 
 test "a codepoint above Latin-1 gets the unicode keysym offset" {
     // The X11 rule: a codepoint of 0x100 or more is the codepoint plus 0x01000000.
-    try std.testing.expectEqual(@as(u32, 0x01004E00), @intFromEnum(Keysym.fromCodepoint(0x4E00)));
+    try std.testing.expectEqual(@as(u32, 0x01004E00), @backingInt(Keysym.fromCodepoint(0x4E00)));
 }
 
 test "toCodepoint is the inverse of fromCodepoint for printable keys" {
@@ -517,24 +517,24 @@ test "a named key has no codepoint" {
 test "the named keysym values match the X11 numbers the Wayland path will send" {
     // These are keysymdef.h values. If one is wrong, the terminal and the
     // compositor disagree about what key was pressed and nothing catches it.
-    try std.testing.expectEqual(@as(u32, 0xFF0D), @intFromEnum(Keysym.enter));
-    try std.testing.expectEqual(@as(u32, 0xFF1B), @intFromEnum(Keysym.escape));
-    try std.testing.expectEqual(@as(u32, 0xFF09), @intFromEnum(Keysym.tab));
-    try std.testing.expectEqual(@as(u32, 0xFF52), @intFromEnum(Keysym.up));
-    try std.testing.expectEqual(@as(u32, 0xFFC9), @intFromEnum(Keysym.f12));
+    try std.testing.expectEqual(@as(u32, 0xFF0D), @backingInt(Keysym.enter));
+    try std.testing.expectEqual(@as(u32, 0xFF1B), @backingInt(Keysym.escape));
+    try std.testing.expectEqual(@as(u32, 0xFF09), @backingInt(Keysym.tab));
+    try std.testing.expectEqual(@as(u32, 0xFF52), @backingInt(Keysym.up));
+    try std.testing.expectEqual(@as(u32, 0xFFC9), @backingInt(Keysym.f12));
 }
 
 test "the bare modifier keysyms match keysymdef.h" {
     // Verified against a real keysymdef.h on this machine
     // (Midstall's vendored X11 headers), the same way the block above was checked.
-    try std.testing.expectEqual(@as(u32, 0xFFE1), @intFromEnum(Keysym.shift_l));
-    try std.testing.expectEqual(@as(u32, 0xFFE2), @intFromEnum(Keysym.shift_r));
-    try std.testing.expectEqual(@as(u32, 0xFFE3), @intFromEnum(Keysym.control_l));
-    try std.testing.expectEqual(@as(u32, 0xFFE4), @intFromEnum(Keysym.control_r));
-    try std.testing.expectEqual(@as(u32, 0xFFE9), @intFromEnum(Keysym.alt_l));
-    try std.testing.expectEqual(@as(u32, 0xFFEA), @intFromEnum(Keysym.alt_r));
-    try std.testing.expectEqual(@as(u32, 0xFFEB), @intFromEnum(Keysym.super_l));
-    try std.testing.expectEqual(@as(u32, 0xFFEC), @intFromEnum(Keysym.super_r));
+    try std.testing.expectEqual(@as(u32, 0xFFE1), @backingInt(Keysym.shift_l));
+    try std.testing.expectEqual(@as(u32, 0xFFE2), @backingInt(Keysym.shift_r));
+    try std.testing.expectEqual(@as(u32, 0xFFE3), @backingInt(Keysym.control_l));
+    try std.testing.expectEqual(@as(u32, 0xFFE4), @backingInt(Keysym.control_r));
+    try std.testing.expectEqual(@as(u32, 0xFFE9), @backingInt(Keysym.alt_l));
+    try std.testing.expectEqual(@as(u32, 0xFFEA), @backingInt(Keysym.alt_r));
+    try std.testing.expectEqual(@as(u32, 0xFFEB), @backingInt(Keysym.super_l));
+    try std.testing.expectEqual(@as(u32, 0xFFEC), @backingInt(Keysym.super_r));
 }
 
 test "Dispatcher.scroll passes the delta out when the inner view cannot move" {

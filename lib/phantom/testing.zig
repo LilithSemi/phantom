@@ -244,8 +244,8 @@ pub const Harness = struct {
     /// none to inspect, and saying it here means no individual golden has to
     /// remember to ask.
     pub fn rasterize(self: *Harness) !Raster {
-        try prism_backend.requireRaster(self.gpa);
-        const sel = prism.drivers.createBestDevice(self.gpa) orelse return error.NoPrismDevice;
+        try prism_backend.requireRaster(self.gpa, std.testing.io);
+        const sel = prism.drivers.createBestDevice(self.gpa, std.testing.io) orelse return error.NoPrismDevice;
         const dev = sel.device;
         // Ownership transfers to the returned Raster on success; on any error below,
         // free the device (and target once created) here so tests do not leak.
@@ -710,7 +710,7 @@ const TapCounter = struct {
             phantom.setState(s, TapCounter.State.inc);
         }
         pub fn build(s: *@This(), b: *phantom.BuildContext) anyerror!phantom.Widget {
-            const label_text = try std.fmt.allocPrint(b.arena, "{d}", .{s.count});
+            const label_text = try b.arena.print("{d}", .{s.count});
             const label = b.new(phantom.Text{ .text = label_text, .size = 24 });
             const btn_label = b.new(phantom.Text{ .text = "+", .size = 24 });
             const btn = b.new(phantom.Button{ .on_tap = TapCounter.State.incTap, .ctx = s, .child = btn_label.widget() });

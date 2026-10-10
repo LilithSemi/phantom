@@ -630,7 +630,7 @@ fn kittyKeysym(cp: u32) ?input.Keysym {
 /// them unmapped, so carrying them in the switch causes no wrong mapping.
 fn functionKey(n: u32) ?input.Keysym {
     if (n < 1 or n > 12) return null;
-    return @enumFromInt(@intFromEnum(input.Keysym.f1) + (n - 1));
+    return @fromBackingInt(@intCast(@backingInt(input.Keysym.f1) + (n - 1)));
 }
 
 test "an SGR press reports a zero based cell position" {

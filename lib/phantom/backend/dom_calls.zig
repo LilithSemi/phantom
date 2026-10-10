@@ -208,13 +208,13 @@ pub const family_len = 2 + @sizeOf(usize) * 2;
 /// do with it and which `font-src 'self'` refuses: see `text.Font.url`.
 pub fn fontSrc(gpa: std.mem.Allocator, font_ptr: *const text.Font) ![]u8 {
     if (font_ptr.url) |url| {
-        return std.fmt.allocPrint(gpa, "url(\"{s}\") format(\"opentype\")", .{url});
+        return gpa.print("url(\"{s}\") format(\"opentype\")", .{url});
     }
     const enc = std.base64.standard.Encoder;
     const b64 = try gpa.alloc(u8, enc.calcSize(font_ptr.bytes.len));
     defer gpa.free(b64);
     _ = enc.encode(b64, font_ptr.bytes);
-    return std.fmt.allocPrint(gpa, "url(data:font/otf;base64,{s}) format(\"opentype\")", .{b64});
+    return gpa.print("url(data:font/otf;base64,{s}) format(\"opentype\")", .{b64});
 }
 
 /// Build the `@font-face` block for a list of fonts. Caller owns the slice.
@@ -230,7 +230,7 @@ pub fn fontFaceCss(gpa: std.mem.Allocator, fonts: []const *text.Font) ![]u8 {
         var fam: [family_len]u8 = undefined;
         const family = fontFamily(&fam, font_ptr);
         if (font_ptr.url) |url| {
-            const face = try std.fmt.allocPrint(gpa, "@font-face{{font-family:{s};src:url(\"{s}\") format(\"opentype\")}}", .{ family, url });
+            const face = try gpa.print("@font-face{{font-family:{s};src:url(\"{s}\") format(\"opentype\")}}", .{ family, url });
             defer gpa.free(face);
             try buf.appendSlice(gpa, face);
             continue;
@@ -239,7 +239,7 @@ pub fn fontFaceCss(gpa: std.mem.Allocator, fonts: []const *text.Font) ![]u8 {
         const b64 = try gpa.alloc(u8, enc.calcSize(font_ptr.bytes.len));
         defer gpa.free(b64);
         _ = enc.encode(b64, font_ptr.bytes);
-        const face = try std.fmt.allocPrint(gpa, "@font-face{{font-family:{s};src:url(data:font/otf;base64,{s}) format(\"opentype\")}}", .{ family, b64 });
+        const face = try gpa.print("@font-face{{font-family:{s};src:url(data:font/otf;base64,{s}) format(\"opentype\")}}", .{ family, b64 });
         defer gpa.free(face);
         try buf.appendSlice(gpa, face);
     }
@@ -322,7 +322,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
     // Layout container: position:relative, viewport-sized, branded bg.
     const container = ops.createElement("div");
     {
-        const style = try std.fmt.allocPrint(gpa, "position:relative;width:{d}px;height:{d}px;background:rgb({d},{d},{d})", .{ viewport.width, viewport.height, dom.ch(bg.r), dom.ch(bg.g), dom.ch(bg.b) });
+        const style = try gpa.print("position:relative;width:{d}px;height:{d}px;background:rgb({d},{d},{d})", .{ viewport.width, viewport.height, dom.ch(bg.r), dom.ch(bg.g), dom.ch(bg.b) });
         defer gpa.free(style);
         ops.setStyle(container, style);
     }
@@ -355,14 +355,14 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 // Non-interactive: plain fill or stroke.
                 if (r.stroke_width > 0) {
                     // Stroke rrect: border ring, no fill.
-                    const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
+                    const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
                     const node = ops.createElement("div");
                     ops.setStyle(node, style);
                     ops.appendChild(parent, node);
                 } else {
                     // Plain fill rrect (kept identical to Task 1).
-                    const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;background:rgba({d},{d},{d},{s})", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
+                    const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;background:rgba({d},{d},{d},{s})", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
                     const node = ops.createElement("div");
                     ops.setStyle(node, style);
@@ -373,47 +373,47 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 const c = cls;
                 cls += 1;
                 const node = ops.createElement("div");
-                const cls_val = try std.fmt.allocPrint(gpa, "pb{d}", .{c});
+                const cls_val = try gpa.print("pb{d}", .{c});
                 defer gpa.free(cls_val);
                 ops.setAttribute(node, "class", cls_val);
                 if (r.stroke_width > 0) {
-                    const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
+                    const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
                     ops.setStyle(node, style);
                     ops.appendChild(parent, node);
                     if (r.hover_color) |h| {
                         var hbuf: [8]u8 = undefined;
-                        const rule = try std.fmt.allocPrint(gpa, ".pb{d}:hover{{border-color:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(h.r), dom.ch(h.g), dom.ch(h.b), dom.alpha(&hbuf, h.a) });
+                        const rule = try gpa.print(".pb{d}:hover{{border-color:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(h.r), dom.ch(h.g), dom.ch(h.b), dom.alpha(&hbuf, h.a) });
                         defer gpa.free(rule);
                         try rules.appendSlice(gpa, rule);
                     }
                     if (r.active_color) |ac| {
                         var pbuf: [8]u8 = undefined;
-                        const rule = try std.fmt.allocPrint(gpa, ".pb{d}:active{{border-color:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(ac.r), dom.ch(ac.g), dom.ch(ac.b), dom.alpha(&pbuf, ac.a) });
+                        const rule = try gpa.print(".pb{d}:active{{border-color:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(ac.r), dom.ch(ac.g), dom.ch(ac.b), dom.alpha(&pbuf, ac.a) });
                         defer gpa.free(rule);
                         try rules.appendSlice(gpa, rule);
                     }
                 } else {
-                    const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;background:rgba({d},{d},{d},{s})", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
+                    const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;background:rgba({d},{d},{d},{s})", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
                     ops.setStyle(node, style);
                     ops.appendChild(parent, node);
                     if (r.hover_color) |h| {
                         var hbuf: [8]u8 = undefined;
-                        const rule = try std.fmt.allocPrint(gpa, ".pb{d}:hover{{background:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(h.r), dom.ch(h.g), dom.ch(h.b), dom.alpha(&hbuf, h.a) });
+                        const rule = try gpa.print(".pb{d}:hover{{background:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(h.r), dom.ch(h.g), dom.ch(h.b), dom.alpha(&hbuf, h.a) });
                         defer gpa.free(rule);
                         try rules.appendSlice(gpa, rule);
                     }
                     if (r.active_color) |ac| {
                         var pbuf: [8]u8 = undefined;
-                        const rule = try std.fmt.allocPrint(gpa, ".pb{d}:active{{background:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(ac.r), dom.ch(ac.g), dom.ch(ac.b), dom.alpha(&pbuf, ac.a) });
+                        const rule = try gpa.print(".pb{d}:active{{background:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(ac.r), dom.ch(ac.g), dom.ch(ac.b), dom.alpha(&pbuf, ac.a) });
                         defer gpa.free(rule);
                         try rules.appendSlice(gpa, rule);
                     }
                 }
                 // A pointer cursor is the browser's own affordance for "this
                 // responds to a tap", so every interactive rectangle gets one.
-                const cursor_rule = try std.fmt.allocPrint(gpa, ".pb{d}{{cursor:pointer}}", .{c});
+                const cursor_rule = try gpa.print(".pb{d}{{cursor:pointer}}", .{c});
                 defer gpa.free(cursor_rule);
                 try rules.appendSlice(gpa, cursor_rule);
             }
@@ -423,13 +423,13 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             if (im.bytes.len == 0) continue; // no encoded bytes -> nothing to <img> (v1: fromRgba images skipped on web)
             const ox: f32 = if (region_origin) |o| o.x else 0;
             const oy: f32 = if (region_origin) |o| o.y else 0;
-            const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px", .{ img.rect.x - ox, img.rect.y - oy, img.rect.width, img.rect.height });
+            const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px", .{ img.rect.x - ox, img.rect.y - oy, img.rect.width, img.rect.height });
             defer gpa.free(style);
             const enc = std.base64.standard.Encoder;
             const b64 = try gpa.alloc(u8, enc.calcSize(im.bytes.len));
             defer gpa.free(b64);
             _ = enc.encode(b64, im.bytes);
-            const src = try std.fmt.allocPrint(gpa, "data:{s};base64,{s}", .{ image_mod.Image.mime(im.format), b64 });
+            const src = try gpa.print("data:{s};base64,{s}", .{ image_mod.Image.mime(im.format), b64 });
             defer gpa.free(src);
             const node = ops.createElement("img");
             ops.setStyle(node, style);
@@ -447,13 +447,13 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             // GRID units: scaling it here as well would square the factor.
             var gbuf: [svg_path.coord_len]u8 = undefined;
             const grid_s = svg_path.coord(&gbuf, icon_builtin.grid);
-            const view_box = try std.fmt.allocPrint(gpa, "0 0 {s} {s}", .{ grid_s, grid_s });
+            const view_box = try gpa.print("0 0 {s} {s}", .{ grid_s, grid_s });
             defer gpa.free(view_box);
-            const w_s = try std.fmt.allocPrint(gpa, "{d}", .{ic.size.width});
+            const w_s = try gpa.print("{d}", .{ic.size.width});
             defer gpa.free(w_s);
-            const h_s = try std.fmt.allocPrint(gpa, "{d}", .{ic.size.height});
+            const h_s = try gpa.print("{d}", .{ic.size.height});
             defer gpa.free(h_s);
-            const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px", .{ ic.origin.x - ox, ic.origin.y - oy });
+            const style = try gpa.print("position:absolute;left:{d}px;top:{d}px", .{ ic.origin.x - ox, ic.origin.y - oy });
             defer gpa.free(style);
 
             const svg = ops.createElementNs(svg_ns, "svg");
@@ -479,7 +479,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             const d = try svg_path.data(gpa, icon_path, icon_builtin.grid);
             defer gpa.free(d);
             var abuf: [8]u8 = undefined;
-            const stroke = try std.fmt.allocPrint(gpa, "rgba({d},{d},{d},{s})", .{
+            const stroke = try gpa.print("rgba({d},{d},{d},{s})", .{
                 dom.ch(ic.color.r), dom.ch(ic.color.g), dom.ch(ic.color.b), dom.alpha(&abuf, ic.color.a),
             });
             defer gpa.free(stroke);
@@ -519,9 +519,9 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             // spaces to one, drops the leading spaces of a line, and may break
             // the run again at a width of its own choosing. Indented source in
             // a code block loses its indentation to exactly that.
-            const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;white-space:pre;font-family:{s};font-size:{d}px;color:rgba({d},{d},{d},{s})", .{ run.origin.x - ox, run.origin.y - oy, family, run.size, dom.ch(run.color.r), dom.ch(run.color.g), dom.ch(run.color.b), dom.alpha(&tbuf, run.color.a) });
+            const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;white-space:pre;font-family:{s};font-size:{d}px;color:rgba({d},{d},{d},{s})", .{ run.origin.x - ox, run.origin.y - oy, family, run.size, dom.ch(run.color.r), dom.ch(run.color.g), dom.ch(run.color.b), dom.alpha(&tbuf, run.color.a) });
             defer gpa.free(style);
-            const decl = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{
+            const decl = try gpa.print("{s}{s}{s}", .{
                 style,
                 if (run.italic and !font_ptr.isItalic()) ";font-style:italic" else "",
                 if (run.underline) ";text-decoration:underline" else "",
@@ -541,13 +541,13 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 const oy: f32 = if (region_origin) |o| o.y else 0;
                 // Outer div: clipping/scrolling window at the viewport position and
                 // size, relative to whatever region this one is nested inside.
-                const outer_style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll", .{ sr.viewport.x - ox, sr.viewport.y - oy, sr.viewport.width, sr.viewport.height });
+                const outer_style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll", .{ sr.viewport.x - ox, sr.viewport.y - oy, sr.viewport.width, sr.viewport.height });
                 defer gpa.free(outer_style);
                 const outer = ops.createElement("div");
                 ops.setStyle(outer, outer_style);
                 ops.appendChild(parent, outer);
                 // Inner div: the full content area that scrolls inside the outer.
-                const inner_style = try std.fmt.allocPrint(gpa, "position:relative;width:{d}px;height:{d}px", .{ sr.content.width, sr.content.height });
+                const inner_style = try gpa.print("position:relative;width:{d}px;height:{d}px", .{ sr.content.width, sr.content.height });
                 defer gpa.free(inner_style);
                 const inner = ops.createElement("div");
                 ops.setStyle(inner, inner_style);
@@ -605,7 +605,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 // the one that honours the radius exactly. Positioned relative to
                 // whatever region this clip is nested inside, like every other
                 // primitive here.
-                const style = try std.fmt.allocPrint(gpa, "position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;overflow:hidden", .{ cr.rect.x - ox, cr.rect.y - oy, cr.rect.width, cr.rect.height, cr.radius });
+                const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;overflow:hidden", .{ cr.rect.x - ox, cr.rect.y - oy, cr.rect.width, cr.rect.height, cr.radius });
                 defer gpa.free(style);
                 const node = ops.createElement("div");
                 ops.setStyle(node, style);
@@ -786,7 +786,7 @@ pub const Recorder = struct {
     }
 
     fn rec(self: *Recorder, comptime fmt: []const u8, args: anytype) void {
-        const line = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
+        const line = self.gpa.print(fmt, args) catch return;
         self.log.append(self.gpa, line) catch {};
     }
 
@@ -1401,7 +1401,7 @@ test "dom_calls: image fromRgba (no encoded bytes) emits no img element" {
     const gpa = std.testing.allocator;
     var rec = Recorder{ .gpa = gpa };
     defer rec.deinit();
-    const rgba_pixels = [_]u8{255} ** (4 * 4 * 4); // 4x4 RGBA
+    const rgba_pixels: [4 * 4 * 4]u8 = @splat(255); // 4x4 RGBA
     var img = image_mod.Image.fromRgba(&rgba_pixels, 4, 4);
     var list = display_list.DisplayList{};
     defer list.deinit(gpa);

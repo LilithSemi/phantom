@@ -487,15 +487,15 @@ fn boundsOf(p: path.Path) Bounds {
 test "every built-in id has a path, and none of them is empty" {
     // Exhaustive over the enum, so adding a member without a centreline fails
     // here rather than drawing nothing at a call site.
-    inline for (@typeInfo(Id).@"enum".fields) |f| {
-        const id: Id = @enumFromInt(f.value);
+    inline for (@typeInfo(Id).@"enum".field_values) |value| {
+        const id: Id = @fromBackingInt(@intCast(value));
         try std.testing.expect(pathFor(id).verbs.len > 0);
     }
 }
 
 test "every built-in mark stays inside its own grid" {
-    inline for (@typeInfo(Id).@"enum".fields) |f| {
-        const b = boundsOf(pathFor(@enumFromInt(f.value)));
+    inline for (@typeInfo(Id).@"enum".field_values) |value| {
+        const b = boundsOf(pathFor(@fromBackingInt(@intCast(value))));
         try std.testing.expect(b.min_x >= 0 and b.min_y >= 0);
         try std.testing.expect(b.max_x <= grid and b.max_y <= grid);
     }
@@ -504,8 +504,8 @@ test "every built-in mark stays inside its own grid" {
 test "the interface marks keep their margin, so a round cap never touches the edge" {
     // The rules are excluded on purpose: they are full bleed so that stacking
     // them draws a continuous rail, which is the whole reason they exist.
-    inline for (@typeInfo(Id).@"enum".fields) |f| {
-        const id: Id = @enumFromInt(f.value);
+    inline for (@typeInfo(Id).@"enum".field_values) |value| {
+        const id: Id = @fromBackingInt(@intCast(value));
         if (id == .rule_vertical or id == .rule_horizontal or id == .torii) continue;
         const b = boundsOf(pathFor(id));
         try std.testing.expect(b.min_x >= margin and b.min_y >= margin);
@@ -531,8 +531,8 @@ test "a rule runs the full length and stops square, so stacked rules meet with n
 
 test "every built-in mark rasterises to real ink, which is what a missing glyph did not" {
     const gpa = std.testing.allocator;
-    inline for (@typeInfo(Id).@"enum".fields) |f| {
-        const id: Id = @enumFromInt(f.value);
+    inline for (@typeInfo(Id).@"enum".field_values) |value| {
+        const id: Id = @fromBackingInt(@intCast(value));
         var out = try stroke.expand(gpa, pathFor(id));
         defer out.deinit(gpa);
         // The same call the GPU backend makes in `ensureIcon`.
@@ -563,8 +563,8 @@ test "the check mark is a tick and not a V: its vertex sits left of centre" {
 test "every mark a terminal font can draw is one column wide" {
     // A mark two columns wide would push the text beside it out of place, and
     // the cell backend has no way to know that happened.
-    inline for (@typeInfo(Id).@"enum".fields) |f| {
-        const id: Id = @enumFromInt(f.value);
+    inline for (@typeInfo(Id).@"enum".field_values) |value| {
+        const id: Id = @fromBackingInt(@intCast(value));
         if (cellMarkFor(id)) |mark| {
             try std.testing.expectEqual(@as(u2, 1), mono.wcwidth(mark.cp));
         }
@@ -572,8 +572,8 @@ test "every mark a terminal font can draw is one column wide" {
 }
 
 test "only the rules tile, and every interface mark has a character" {
-    inline for (@typeInfo(Id).@"enum".fields) |f| {
-        const id: Id = @enumFromInt(f.value);
+    inline for (@typeInfo(Id).@"enum".field_values) |value| {
+        const id: Id = @fromBackingInt(@intCast(value));
         const mark = cellMarkFor(id);
         if (id == .torii) {
             // The logomark is a drawing, and no character means it.

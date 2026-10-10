@@ -211,8 +211,8 @@ pub const Ctx = struct {
     frame: Frame,
     quant: [4][64]u16,
     restart_interval: u16 = 0,
-    dc: [4]?HuffTable = [_]?HuffTable{null} ** 4,
-    ac: [4]?HuffTable = [_]?HuffTable{null} ** 4,
+    dc: [4]?HuffTable = @splat(null),
+    ac: [4]?HuffTable = @splat(null),
     // Offset into the original bytes[] at which entropy-coded data begins
     // (immediately after the SOS segment payload).  0 when no SOS was parsed yet.
     scan_start: usize = 0,
@@ -430,7 +430,7 @@ fn parseScanHeader(ctx: *Ctx, payload: []const u8) DecodeError!ScanHeader {
 
     var sh: ScanHeader = .{
         .num_comps = ns,
-        .comp_idx = [_]u8{0} ** 4,
+        .comp_idx = @splat(0),
         .ss = 0,
         .se = 0,
         .ah = 0,
@@ -1002,7 +1002,7 @@ fn dcFirst(
 
     var br = BitReader.init(entropy);
     // Per scan-component DC predictors indexed by scan slot [0..num_comps).
-    var pred = [_]i32{0} ** 4;
+    var pred: [4]i32 = @splat(0);
     var mcu_count: u32 = 0;
     const ri = ctx.restart_interval;
 
@@ -1210,10 +1210,10 @@ pub fn parseHeaders(bytes: []const u8) DecodeError!Ctx {
             .precision = 0,
             .width = 0,
             .height = 0,
-            .components = [_]Component{.{ .id = 0, .h = 0, .v = 0, .tq = 0 }} ** 4,
+            .components = @splat(.{ .id = 0, .h = 0, .v = 0, .tq = 0 }),
             .num_components = 0,
         },
-        .quant = [_][64]u16{[_]u16{0} ** 64} ** 4,
+        .quant = @splat(@splat(0)),
         .restart_interval = 0,
     };
 
@@ -1400,7 +1400,7 @@ pub fn decodeScan(
     }
 
     // Per-component DC predictors.
-    var dc_pred: [4]i32 = [_]i32{0} ** 4;
+    var dc_pred: [4]i32 = @splat(0);
 
     var br = BitReader.init(entropy_bytes);
     var mcu_count: u32 = 0;
@@ -1648,7 +1648,7 @@ test "buildHuff + huffDecode: two length-2 codes" {
     // BITS = {0,2,0,...}: two codes of length 2, no other lengths.
     // VALS = {0x05, 0x06}.
     // Canonical assignment: code 00 -> 0x05, code 01 -> 0x06.
-    var bits = [_]u8{0} ** 16;
+    var bits: [16]u8 = @splat(0);
     bits[1] = 2; // 2 codes of length 2
     const vals = [_]u8{ 0x05, 0x06 };
 
@@ -1884,7 +1884,7 @@ test "dequantIdct single AC coeff F(1,0)=D varies in x, uniform in y" {
 // Build a minimal HuffTable for testing: one or two length-2 codes.
 // DC table: codes `00`->val0, `01`->val1.
 fn testDcTable(val0: u8, val1: u8) !HuffTable {
-    var bits = [_]u8{0} ** 16;
+    var bits: [16]u8 = @splat(0);
     bits[1] = 2; // two codes of length 2
     const vals = [_]u8{ val0, val1 };
     return buildHuff(&bits, &vals);
@@ -1892,7 +1892,7 @@ fn testDcTable(val0: u8, val1: u8) !HuffTable {
 
 // AC table: `00`->0x00 (EOB).
 fn testAcTableEobOnly() !HuffTable {
-    var bits = [_]u8{0} ** 16;
+    var bits: [16]u8 = @splat(0);
     bits[1] = 1;
     const vals = [_]u8{0x00};
     return buildHuff(&bits, &vals);
@@ -1900,7 +1900,7 @@ fn testAcTableEobOnly() !HuffTable {
 
 // AC table: `00`->0x00 (EOB), `010`->0xF0 (ZRL), `011`->0x11 (r=1 s=1).
 fn testAcTableWithRun() !HuffTable {
-    var bits = [_]u8{0} ** 16;
+    var bits: [16]u8 = @splat(0);
     bits[1] = 1; // one length-2 code: 0x00 (EOB)
     bits[2] = 2; // two length-3 codes: 0xF0 (ZRL), 0x11 (r=1,s=1)
     const vals = [_]u8{ 0x00, 0xF0, 0x11 };
@@ -1955,7 +1955,7 @@ test "decodeBlock: DC prediction carries across two blocks" {
 test "decodeBlock: AC run places coeff at k=2, zeros at k=1" {
     // DC table: `00`->0x00 (cat 0 = diff 0).
     // AC table: `00`->EOB, `010`->ZRL, `011`->0x11 (r=1,s=1).
-    var dc_bits = [_]u8{0} ** 16;
+    var dc_bits: [16]u8 = @splat(0);
     dc_bits[1] = 1;
     const dc_vals = [_]u8{0x00};
     const dc_ht = try buildHuff(&dc_bits, &dc_vals);
@@ -1981,7 +1981,7 @@ test "decodeScan: single 8x8 grayscale MCU produces correct plane" {
     const gpa = std.testing.allocator;
 
     // DC table: one length-2 code `00`->0x03 (cat 3).
-    var dc_bits = [_]u8{0} ** 16;
+    var dc_bits: [16]u8 = @splat(0);
     dc_bits[1] = 1;
     const dc_vals = [_]u8{0x03};
     const dc_ht = try buildHuff(&dc_bits, &dc_vals);
@@ -2003,7 +2003,7 @@ test "decodeScan: single 8x8 grayscale MCU produces correct plane" {
             },
             .num_components = 1,
         },
-        .quant = [_][64]u16{[_]u16{1} ** 64} ** 4,
+        .quant = @splat(@splat(1)),
         .restart_interval = 0,
         .dc = [_]?HuffTable{ dc_ht, null, null, null },
         .ac = [_]?HuffTable{ ac_ht, null, null, null },
@@ -2131,7 +2131,7 @@ fn buildEncodeTable(
     bits: *const [16]u8,
     vals: *const [N]u8,
 ) [256]EncEntry {
-    var table = [_]EncEntry{.{ .code = 0, .len = 0 }} ** 256;
+    var table: [256]EncEntry = @splat(.{ .code = 0, .len = 0 });
     // Use u32 for intermediate code to avoid overflow at long code lengths.
     var code: u32 = 0;
     var vi: usize = 0;
@@ -2564,7 +2564,7 @@ test "allocCoeffs: 16x16 3-component 2x2/1x1/1x1 frame has correct sizes" {
             },
             .num_components = 3,
         },
-        .quant = [_][64]u16{[_]u16{1} ** 64} ** 4,
+        .quant = @splat(@splat(1)),
         .restart_interval = 0,
         .progressive = true,
     };
@@ -2594,7 +2594,7 @@ test "allocCoeffs: 16x16 3-component 2x2/1x1/1x1 frame has correct sizes" {
 
 // Build a minimal single-symbol DC HuffTable: one length-2 code `00` -> val.
 fn testProgDcTable(val: u8) !HuffTable {
-    var bits = [_]u8{0} ** 16;
+    var bits: [16]u8 = @splat(0);
     bits[1] = 1; // one code of length 2
     const vals = [_]u8{val};
     return buildHuff(&bits, &vals);
@@ -2623,10 +2623,10 @@ test "decodeProgressiveScan: DC first al=1 1-block produces coeff = diff << al" 
             },
             .num_components = 1,
         },
-        .quant = [_][64]u16{[_]u16{1} ** 64} ** 4,
+        .quant = @splat(@splat(1)),
         .restart_interval = 0,
         .dc = [_]?HuffTable{ dc_ht, null, null, null },
-        .ac = [_]?HuffTable{null} ** 4,
+        .ac = @splat(null),
         .progressive = true,
     };
 
@@ -2678,10 +2678,10 @@ test "decodeProgressiveScan: DC refine ORs in low bit on 1-block frame" {
             },
             .num_components = 1,
         },
-        .quant = [_][64]u16{[_]u16{1} ** 64} ** 4,
+        .quant = @splat(@splat(1)),
         .restart_interval = 0,
         .dc = [_]?HuffTable{ dc_ht, null, null, null },
-        .ac = [_]?HuffTable{null} ** 4,
+        .ac = @splat(null),
         .progressive = true,
     };
 
@@ -2731,7 +2731,7 @@ test "decodeProgressiveScan: DC first pred carries across 2-MCU-wide frame" {
     const gpa = std.testing.allocator;
 
     // DC HuffTable: `00`->cat2 (2 bits magnitude), `01`->cat1 (1 bit magnitude).
-    var bits = [_]u8{0} ** 16;
+    var bits: [16]u8 = @splat(0);
     bits[1] = 2; // two codes of length 2
     const vals = [_]u8{ 0x02, 0x01 };
     const dc_ht = try buildHuff(&bits, &vals);
@@ -2749,10 +2749,10 @@ test "decodeProgressiveScan: DC first pred carries across 2-MCU-wide frame" {
             },
             .num_components = 1,
         },
-        .quant = [_][64]u16{[_]u16{1} ** 64} ** 4,
+        .quant = @splat(@splat(1)),
         .restart_interval = 0,
         .dc = [_]?HuffTable{ dc_ht, null, null, null },
-        .ac = [_]?HuffTable{null} ** 4,
+        .ac = @splat(null),
         .progressive = true,
     };
 
@@ -2876,7 +2876,7 @@ test "acFirst: single-block places coeff at k=2 with exact value" {
     // VALS: {0x11, 0x00}.
     // Canonical assignment: 2-bit codes start at `00`: 0x11 gets code `00`.
     // 3-bit codes start at `010`: 0x00 gets code `010`.
-    var ac_bits = [_]u8{0} ** 16;
+    var ac_bits: [16]u8 = @splat(0);
     ac_bits[1] = 1; // one 2-bit code
     ac_bits[2] = 1; // one 3-bit code
     const ac_vals = [_]u8{ 0x11, 0x00 };
@@ -2896,9 +2896,9 @@ test "acFirst: single-block places coeff at k=2 with exact value" {
             },
             .num_components = 1,
         },
-        .quant = [_][64]u16{[_]u16{1} ** 64} ** 4,
+        .quant = @splat(@splat(1)),
         .restart_interval = 0,
-        .dc = [_]?HuffTable{null} ** 4,
+        .dc = @splat(null),
         .ac = [_]?HuffTable{ ac_ht, null, null, null },
         .progressive = true,
     };
@@ -2949,7 +2949,7 @@ test "acFirst: EOB-run skips second block leaving its AC coeffs zero" {
     // AC HuffTable for this test:
     // Symbol 0x10 (r=1, s=0) = EOB1: encoded as `00` (2-bit code).
     // We need only one code.
-    var ac_bits = [_]u8{0} ** 16;
+    var ac_bits: [16]u8 = @splat(0);
     ac_bits[1] = 1; // one 2-bit code
     const ac_vals = [_]u8{0x10}; // 0x10 = r=1, s=0
     const ac_ht = try buildHuff(&ac_bits, &ac_vals);
@@ -2971,9 +2971,9 @@ test "acFirst: EOB-run skips second block leaving its AC coeffs zero" {
             },
             .num_components = 1,
         },
-        .quant = [_][64]u16{[_]u16{1} ** 64} ** 4,
+        .quant = @splat(@splat(1)),
         .restart_interval = 0,
-        .dc = [_]?HuffTable{null} ** 4,
+        .dc = @splat(null),
         .ac = [_]?HuffTable{ ac_ht, null, null, null },
         .progressive = true,
     };
@@ -3023,7 +3023,7 @@ test "acFirst: EOB-run skips second block leaving its AC coeffs zero" {
 // In acFirst: k starts at ss=1, r=0 -> k+=0=1 -> coeff[blk*64+1] = receiveExtend(1,`1`)<<1 = 2. k=2.
 fn setupAcRefineCtx(gpa: std.mem.Allocator) !struct { ctx: Ctx, coeffs: []CoeffPlane, ac_first_ht: HuffTable } {
     // AC-first HuffTable: `00` -> 0x01 (r=0, s=1); `010` -> 0x00 (EOB).
-    var ac_bits = [_]u8{0} ** 16;
+    var ac_bits: [16]u8 = @splat(0);
     ac_bits[1] = 1; // one 2-bit code
     ac_bits[2] = 1; // one 3-bit code
     const ac_vals_first = [_]u8{ 0x01, 0x00 };
@@ -3042,9 +3042,9 @@ fn setupAcRefineCtx(gpa: std.mem.Allocator) !struct { ctx: Ctx, coeffs: []CoeffP
             },
             .num_components = 1,
         },
-        .quant = [_][64]u16{[_]u16{1} ** 64} ** 4,
+        .quant = @splat(@splat(1)),
         .restart_interval = 0,
-        .dc = [_]?HuffTable{null} ** 4,
+        .dc = @splat(null),
         .ac = [_]?HuffTable{ ac_first_ht, null, null, null },
         .progressive = true,
     };
@@ -3086,7 +3086,7 @@ test "acRefine: correction bit 1 bumps nonzero coeff from 2 to 3" {
     try std.testing.expectEqual(@as(i32, 2), coeffs[0].data[1]);
 
     // AC-refine HuffTable: `00` -> 0x00 (EOB, r=0 s=0).
-    var ref_bits = [_]u8{0} ** 16;
+    var ref_bits: [16]u8 = @splat(0);
     ref_bits[1] = 1; // one 2-bit code
     const ref_vals = [_]u8{0x00};
     const ac_ref_ht = try buildHuff(&ref_bits, &ref_vals);
@@ -3129,7 +3129,7 @@ test "acRefine: correction bit 0 leaves nonzero coeff unchanged" {
     defer freeCoeffs(gpa, coeffs);
 
     // AC-refine HuffTable: `00` -> 0x00 (EOB).
-    var ref_bits = [_]u8{0} ** 16;
+    var ref_bits: [16]u8 = @splat(0);
     ref_bits[1] = 1;
     const ref_vals = [_]u8{0x00};
     const ac_ref_ht = try buildHuff(&ref_bits, &ref_vals);
@@ -3172,7 +3172,7 @@ test "acRefine: new coefficient inserted at k=3 after one zero gap" {
     defer freeCoeffs(gpa, coeffs);
 
     // AC-refine HuffTable: `00` -> 0x11 (r=1, s=1).
-    var ref_bits = [_]u8{0} ** 16;
+    var ref_bits: [16]u8 = @splat(0);
     ref_bits[1] = 1;
     const ref_vals = [_]u8{0x11};
     const ac_ref_ht = try buildHuff(&ref_bits, &ref_vals);
@@ -3229,7 +3229,7 @@ test "acRefine: cross-block EOB-run trailing path corrects block1 exactly once" 
     const gpa = std.testing.allocator;
 
     // AC-first HuffTable for 2-block setup: `00` -> 0x01 (r=0, s=1), `010` -> 0x00 (EOB).
-    var ac_first_bits = [_]u8{0} ** 16;
+    var ac_first_bits: [16]u8 = @splat(0);
     ac_first_bits[1] = 1; // one 2-bit code
     ac_first_bits[2] = 1; // one 3-bit code
     const ac_first_vals = [_]u8{ 0x01, 0x00 };
@@ -3250,9 +3250,9 @@ test "acRefine: cross-block EOB-run trailing path corrects block1 exactly once" 
             },
             .num_components = 1,
         },
-        .quant = [_][64]u16{[_]u16{1} ** 64} ** 4,
+        .quant = @splat(@splat(1)),
         .restart_interval = 0,
-        .dc = [_]?HuffTable{null} ** 4,
+        .dc = @splat(null),
         .ac = [_]?HuffTable{ ac_first_ht, null, null, null },
         .progressive = true,
     };
@@ -3279,7 +3279,7 @@ test "acRefine: cross-block EOB-run trailing path corrects block1 exactly once" 
     try std.testing.expectEqual(@as(i32, 2), coeffs[0].data[1 * 64 + 1]);
 
     // AC-refine HuffTable: `00` -> 0x10 (EOB1, r=1, s=0).
-    var ref_bits = [_]u8{0} ** 16;
+    var ref_bits: [16]u8 = @splat(0);
     ref_bits[1] = 1; // one 2-bit code
     const ref_vals = [_]u8{0x10};
     const ac_ref_ht = try buildHuff(&ref_bits, &ref_vals);

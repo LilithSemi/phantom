@@ -225,7 +225,7 @@ pub fn ensureCoverage(
 
 test "GlyphAtlas.ensure packs a glyph and uploads non-zero coverage" {
     const gpa = std.testing.allocator;
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     var atlas = try GlyphAtlas.init(sel.device, gpa);
     defer atlas.deinit(gpa);
@@ -256,7 +256,7 @@ test "an icon key and a glyph key with the same numbers do not collide" {
 
 test "ensureCoverage returns the cached entry on the second call" {
     const gpa = std.testing.allocator;
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     var atlas = try GlyphAtlas.init(sel.device, gpa);
     defer atlas.deinit(gpa);
@@ -308,7 +308,7 @@ test "ensureCoverage returns the cached entry on the second call" {
 
 test "ensureCoverage on a zero-size coverage records a degenerate entry" {
     const gpa = std.testing.allocator;
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     var atlas = try GlyphAtlas.init(sel.device, gpa);
     defer atlas.deinit(gpa);

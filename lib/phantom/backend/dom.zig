@@ -67,7 +67,7 @@ pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: ge
     // the default body margin, so the branded bg reaches the window edges even though
     // the layout container below is a fixed size (the real viewport size is threaded
     // in a later slice). bg is emitted numerically (ch), so there is no injection path.
-    const base_style = try std.fmt.allocPrint(gpa, "<style>html,body{{margin:0;background:rgb({d},{d},{d})}}</style>", .{ ch(bg.r), ch(bg.g), ch(bg.b) });
+    const base_style = try gpa.print("<style>html,body{{margin:0;background:rgb({d},{d},{d})}}</style>", .{ ch(bg.r), ch(bg.g), ch(bg.b) });
     defer gpa.free(base_style);
     try buf.appendSlice(gpa, base_style);
 
@@ -84,14 +84,14 @@ pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: ge
             const b64_buf = try gpa.alloc(u8, b64_len);
             defer gpa.free(b64_buf);
             _ = enc.encode(b64_buf, font_ptr.bytes);
-            const face = try std.fmt.allocPrint(gpa, "@font-face{{font-family:pf{d};src:url(data:font/otf;base64,{s}) format(\"opentype\")}}", .{ i, b64_buf });
+            const face = try gpa.print("@font-face{{font-family:pf{d};src:url(data:font/otf;base64,{s}) format(\"opentype\")}}", .{ i, b64_buf });
             defer gpa.free(face);
             try buf.appendSlice(gpa, face);
         }
         try buf.appendSlice(gpa, "</style>");
     }
 
-    const open = try std.fmt.allocPrint(gpa, "<div style=\"position:relative;width:{d}px;height:{d}px;background:rgb({d},{d},{d})\">", .{ viewport.width, viewport.height, ch(bg.r), ch(bg.g), ch(bg.b) });
+    const open = try gpa.print("<div style=\"position:relative;width:{d}px;height:{d}px;background:rgb({d},{d},{d})\">", .{ viewport.width, viewport.height, ch(bg.r), ch(bg.g), ch(bg.b) });
     defer gpa.free(open);
     try buf.appendSlice(gpa, open);
 
@@ -108,10 +108,10 @@ pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: ge
             if (r.hover_color == null and r.active_color == null) {
                 // Plain rrect: byte-identical output for opaque colors (regression path).
                 const div = if (r.stroke_width > 0)
-                    try std.fmt.allocPrint(gpa, "<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
+                    try gpa.print("<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
                         "border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent\"></div>", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, ch(r.color.r), ch(r.color.g), ch(r.color.b), alpha(&abuf, r.color.a) })
                 else
-                    try std.fmt.allocPrint(gpa, "<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
+                    try gpa.print("<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
                         "border-radius:{d}px;background:rgba({d},{d},{d},{s})\"></div>", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, ch(r.color.r), ch(r.color.g), ch(r.color.b), alpha(&abuf, r.color.a) });
                 defer gpa.free(div);
                 try buf.appendSlice(gpa, div);
@@ -120,36 +120,36 @@ pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: ge
                 const c = cls;
                 cls += 1;
                 if (r.stroke_width > 0) {
-                    const div = try std.fmt.allocPrint(gpa, "<div class=\"pb{d}\" style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
+                    const div = try gpa.print("<div class=\"pb{d}\" style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
                         "border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent\"></div>", .{ c, r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, ch(r.color.r), ch(r.color.g), ch(r.color.b), alpha(&abuf, r.color.a) });
                     defer gpa.free(div);
                     try buf.appendSlice(gpa, div);
                     if (r.hover_color) |h| {
                         var hbuf: [8]u8 = undefined;
-                        const rule = try std.fmt.allocPrint(gpa, ".pb{d}:hover{{border-color:rgba({d},{d},{d},{s})}}", .{ c, ch(h.r), ch(h.g), ch(h.b), alpha(&hbuf, h.a) });
+                        const rule = try gpa.print(".pb{d}:hover{{border-color:rgba({d},{d},{d},{s})}}", .{ c, ch(h.r), ch(h.g), ch(h.b), alpha(&hbuf, h.a) });
                         defer gpa.free(rule);
                         try rules.appendSlice(gpa, rule);
                     }
                     if (r.active_color) |a| {
                         var pbuf: [8]u8 = undefined;
-                        const rule = try std.fmt.allocPrint(gpa, ".pb{d}:active{{border-color:rgba({d},{d},{d},{s})}}", .{ c, ch(a.r), ch(a.g), ch(a.b), alpha(&pbuf, a.a) });
+                        const rule = try gpa.print(".pb{d}:active{{border-color:rgba({d},{d},{d},{s})}}", .{ c, ch(a.r), ch(a.g), ch(a.b), alpha(&pbuf, a.a) });
                         defer gpa.free(rule);
                         try rules.appendSlice(gpa, rule);
                     }
                 } else {
-                    const div = try std.fmt.allocPrint(gpa, "<div class=\"pb{d}\" style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
+                    const div = try gpa.print("<div class=\"pb{d}\" style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
                         "border-radius:{d}px;background:rgba({d},{d},{d},{s})\"></div>", .{ c, r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, ch(r.color.r), ch(r.color.g), ch(r.color.b), alpha(&abuf, r.color.a) });
                     defer gpa.free(div);
                     try buf.appendSlice(gpa, div);
                     if (r.hover_color) |h| {
                         var hbuf: [8]u8 = undefined;
-                        const rule = try std.fmt.allocPrint(gpa, ".pb{d}:hover{{background:rgba({d},{d},{d},{s})}}", .{ c, ch(h.r), ch(h.g), ch(h.b), alpha(&hbuf, h.a) });
+                        const rule = try gpa.print(".pb{d}:hover{{background:rgba({d},{d},{d},{s})}}", .{ c, ch(h.r), ch(h.g), ch(h.b), alpha(&hbuf, h.a) });
                         defer gpa.free(rule);
                         try rules.appendSlice(gpa, rule);
                     }
                     if (r.active_color) |a| {
                         var pbuf: [8]u8 = undefined;
-                        const rule = try std.fmt.allocPrint(gpa, ".pb{d}:active{{background:rgba({d},{d},{d},{s})}}", .{ c, ch(a.r), ch(a.g), ch(a.b), alpha(&pbuf, a.a) });
+                        const rule = try gpa.print(".pb{d}:active{{background:rgba({d},{d},{d},{s})}}", .{ c, ch(a.r), ch(a.g), ch(a.b), alpha(&pbuf, a.a) });
                         defer gpa.free(rule);
                         try rules.appendSlice(gpa, rule);
                     }
@@ -157,7 +157,7 @@ pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: ge
             }
         },
         .push_scroll => |sr| {
-            const div = try std.fmt.allocPrint(gpa, "<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll\">" ++
+            const div = try gpa.print("<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll\">" ++
                 "<div style=\"position:relative;width:{d}px;height:{d}px\">", .{ sr.viewport.x, sr.viewport.y, sr.viewport.width, sr.viewport.height, sr.content.width, sr.content.height });
             defer gpa.free(div);
             try buf.appendSlice(gpa, div);
@@ -170,7 +170,7 @@ pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: ge
         .push_clip => |cr| {
             // A browser clips to the full rounded shape, so this backend is the
             // one that honours the radius exactly.
-            const div = try std.fmt.allocPrint(gpa, "<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
+            const div = try gpa.print("<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
                 "border-radius:{d}px;overflow:hidden\">", .{ cr.rect.x, cr.rect.y, cr.rect.width, cr.rect.height, cr.radius });
             defer gpa.free(div);
             try buf.appendSlice(gpa, div);
@@ -189,7 +189,7 @@ pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: ge
             const b64_buf = try gpa.alloc(u8, enc.calcSize(im.bytes.len));
             defer gpa.free(b64_buf);
             _ = enc.encode(b64_buf, im.bytes);
-            const tag = try std.fmt.allocPrint(gpa, "<img style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px\" src=\"data:{s};base64,{s}\">", .{ img.rect.x - ox, img.rect.y - oy, img.rect.width, img.rect.height, image_mod.Image.mime(im.format), b64_buf });
+            const tag = try gpa.print("<img style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px\" src=\"data:{s};base64,{s}\">", .{ img.rect.x - ox, img.rect.y - oy, img.rect.width, img.rect.height, image_mod.Image.mime(im.format), b64_buf });
             defer gpa.free(tag);
             try buf.appendSlice(gpa, tag);
         },
@@ -212,7 +212,7 @@ pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: ge
             const grid_s = svg_path.coord(&gbuf, icon_builtin.grid);
             var sbuf: [svg_path.coord_len]u8 = undefined;
             var abuf: [8]u8 = undefined;
-            const svg_open = try std.fmt.allocPrint(gpa, "<svg viewBox=\"0 0 {s} {s}\" preserveAspectRatio=\"none\" width=\"{d}\" height=\"{d}\" style=\"position:absolute;left:{d}px;top:{d}px\">", .{ grid_s, grid_s, ic.size.width, ic.size.height, ic.origin.x - ox, ic.origin.y - oy });
+            const svg_open = try gpa.print("<svg viewBox=\"0 0 {s} {s}\" preserveAspectRatio=\"none\" width=\"{d}\" height=\"{d}\" style=\"position:absolute;left:{d}px;top:{d}px\">", .{ grid_s, grid_s, ic.size.width, ic.size.height, ic.origin.x - ox, ic.origin.y - oy });
             defer gpa.free(svg_open);
             try buf.appendSlice(gpa, svg_open);
             // `<title>` is the accessible name of an inline SVG, and the first
@@ -225,7 +225,7 @@ pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: ge
                 try appendEscaped(&buf, gpa, name);
                 try buf.appendSlice(gpa, "</title>");
             }
-            const tag = try std.fmt.allocPrint(gpa, "<path d=\"{s}\" fill=\"none\" stroke=\"rgba({d},{d},{d},{s})\" stroke-width=\"{s}\" stroke-linecap=\"{s}\" stroke-linejoin=\"{s}\"/></svg>", .{ d, ch(ic.color.r), ch(ic.color.g), ch(ic.color.b), alpha(&abuf, ic.color.a), svg_path.coord(&sbuf, icon_path.stroke.width), svg_path.lineCap(icon_path.stroke.cap), svg_path.lineJoin(icon_path.stroke.join) });
+            const tag = try gpa.print("<path d=\"{s}\" fill=\"none\" stroke=\"rgba({d},{d},{d},{s})\" stroke-width=\"{s}\" stroke-linecap=\"{s}\" stroke-linejoin=\"{s}\"/></svg>", .{ d, ch(ic.color.r), ch(ic.color.g), ch(ic.color.b), alpha(&abuf, ic.color.a), svg_path.coord(&sbuf, icon_path.stroke.width), svg_path.lineCap(icon_path.stroke.cap), svg_path.lineJoin(icon_path.stroke.join) });
             defer gpa.free(tag);
             try buf.appendSlice(gpa, tag);
         },
@@ -244,7 +244,7 @@ pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: ge
                 }
             } else unreachable;
             var tbuf: [8]u8 = undefined;
-            const header = try std.fmt.allocPrint(gpa, "<div style=\"position:absolute;left:{d}px;top:{d}px;font-family:pf{d};font-size:{d}px;color:rgba({d},{d},{d},{s})\">", .{
+            const header = try gpa.print("<div style=\"position:absolute;left:{d}px;top:{d}px;font-family:pf{d};font-size:{d}px;color:rgba({d},{d},{d},{s})\">", .{
                 run.origin.x - ox, run.origin.y - oy,
                 font_idx,          run.size,
                 ch(run.color.r),   ch(run.color.g),
@@ -482,7 +482,7 @@ test "renderToString: image with encoded bytes emits <img> tag with data URL" {
 
 test "renderToString: image fromRgba (no encoded bytes) emits no img tag" {
     const gpa = std.testing.allocator;
-    const rgba_pixels = [_]u8{255} ** (4 * 4 * 4);
+    const rgba_pixels: [4 * 4 * 4]u8 = @splat(255);
     var img = image_mod.Image.fromRgba(&rgba_pixels, 4, 4);
     var list = dl.DisplayList{};
     defer list.deinit(gpa);

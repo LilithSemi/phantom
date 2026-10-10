@@ -242,7 +242,7 @@ fn isQuit(k: phantom.input.KeyEvent) bool {
 /// whether libc is linked (see `std.posix.use_libc`), and that decl refuses to
 /// compile without one, so Windows reaches `GetCurrentProcessId` directly instead.
 fn currentPid() i64 {
-    if (builtin.os.tag == .windows) return @intCast(std.os.windows.GetCurrentProcessId());
+    if (builtin.target.os.tag == .windows) return @intCast(std.os.windows.GetCurrentProcessId());
     return @intCast(std.posix.system.getpid());
 }
 
@@ -617,7 +617,7 @@ pub const Session = struct {
         // the cells that would have worked. Only asked when the answer can
         // change anything, since it costs a device bring-up.
         if (rasterizer_builds) {
-            if (self.mode == .pixels and !prism_backend.canRasterize(gpa)) self.mode = .cells;
+            if (self.mode == .pixels and !prism_backend.canRasterize(gpa, io)) self.mode = .cells;
         }
 
         errdefer self.leaveModes();
@@ -703,6 +703,7 @@ pub const Session = struct {
         self.surface = if (rasterizer_builds and self.mode == .pixels)
             try tui_pixels.PixelSurface.init(
                 gpa,
+                io,
                 @intFromFloat(self.viewport.width),
                 @intFromFloat(self.viewport.height),
             )
@@ -1425,9 +1426,9 @@ const Headless = struct {
         h.env = std.process.Environ.Map.init(gpa);
         errdefer h.env.deinit();
 
-        h.in_path = try std.fmt.allocPrint(gpa, "/tmp/phantom-tui-headless-{s}.in", .{name});
+        h.in_path = try gpa.print("/tmp/phantom-tui-headless-{s}.in", .{name});
         errdefer gpa.free(h.in_path);
-        h.out_path = try std.fmt.allocPrint(gpa, "/tmp/phantom-tui-headless-{s}.out", .{name});
+        h.out_path = try gpa.print("/tmp/phantom-tui-headless-{s}.out", .{name});
         errdefer gpa.free(h.out_path);
 
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = h.in_path, .data = input });
@@ -1676,7 +1677,7 @@ fn sigHandlerAddr(act: std.posix.Sigaction) usize {
 }
 
 test "a session told to keep its hands off the signals leaves SIGINT and SIGTERM exactly as it found them" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
 
     var before_int: std.posix.Sigaction = undefined;
@@ -1775,7 +1776,7 @@ test "two sessions in one process draw from two separate states, which a process
 }
 
 test "a session does not read a stream it was not told to read, so a pipe with nothing on it cannot stop the loop" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
 
     // A pipe with nothing written to it and no writer closed, which is exactly
@@ -1947,7 +1948,7 @@ test "a session writes its diagnostics wherever the caller points them, never at
 }
 
 test "a session leaves stderr alone under the leave policy" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var label = Label{ .text = "phantom" };
     const h = try Headless.open(

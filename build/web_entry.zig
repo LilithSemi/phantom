@@ -467,7 +467,7 @@ export fn dispatchKey(app: usize, keysym: u32, mods: u32, action: u32) u32 {
     if (app == 0) return 0;
     const a: *phantom.web.WebApp = @ptrFromInt(app);
     return @intFromBool(a.dispatchKey(.{
-        .keysym = @enumFromInt(keysym),
+        .keysym = @fromBackingInt(@intCast(keysym)),
         .mods = modsFrom(mods),
         .action = actionFrom(action),
     }));

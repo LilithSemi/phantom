@@ -206,7 +206,7 @@ test "Neuropol metrics: unitsPerEm, cmap A, advance of digit 0" {
 // This builder makes a minimal sfnt with head, hhea, maxp, hmtx and cmap, and
 // no OS/2 table, so the fallback path itself gets real coverage.
 fn buildFontWithoutOs2(mac_style: u16) [228]u8 {
-    var buf = [_]u8{0} ** 228;
+    var buf: [228]u8 = @splat(0);
 
     std.mem.writeInt(u32, buf[0..4], 0x00010000, .big); // sfntVersion
     std.mem.writeInt(u16, buf[4..6], 5, .big); // numTables

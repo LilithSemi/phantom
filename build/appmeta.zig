@@ -72,7 +72,7 @@ pub const AppOptions = struct {
     developer: []const u8 = "",
     license: []const u8 = "",
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     web_runtime: WebRuntime = .auto,
     url_strategy: UrlStrategy = .hash,
     /// Paths that get their own copy of the page, so a refresh works on a static
@@ -218,7 +218,7 @@ pub fn desktopFile(gpa: std.mem.Allocator, opts: AppOptions, exec: []const u8) !
 fn appendKV(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), key: []const u8, val: []const u8) !void {
     const esc = try desktopEscape(gpa, val);
     defer gpa.free(esc);
-    const line = try std.fmt.allocPrint(gpa, "{s}={s}\n", .{ key, esc });
+    const line = try gpa.print("{s}={s}\n", .{ key, esc });
     defer gpa.free(line);
     try buf.appendSlice(gpa, line);
 }
@@ -228,7 +228,7 @@ fn appendLocalized(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), key: []const
     for (t.locales) |loc| {
         const esc = try desktopEscape(gpa, loc.text);
         defer gpa.free(esc);
-        const line = try std.fmt.allocPrint(gpa, "{s}[{s}]={s}\n", .{ key, loc.lang, esc });
+        const line = try gpa.print("{s}[{s}]={s}\n", .{ key, loc.lang, esc });
         defer gpa.free(line);
         try buf.appendSlice(gpa, line);
     }
@@ -251,21 +251,21 @@ pub fn metainfoXml(gpa: std.mem.Allocator, opts: AppOptions) ![]u8 {
         defer gpa.free(vesc);
         const nesc = try xmlEscape(gpa, opts.developer);
         defer gpa.free(nesc);
-        const d = try std.fmt.allocPrint(gpa, "  <developer id=\"{s}\"><name>{s}</name></developer>\n", .{ vesc, nesc });
+        const d = try gpa.print("  <developer id=\"{s}\"><name>{s}</name></developer>\n", .{ vesc, nesc });
         defer gpa.free(d);
         try buf.appendSlice(gpa, d);
     }
     if (opts.description.default.len > 0) {
         const desc = try xmlEscape(gpa, opts.description.default);
         defer gpa.free(desc);
-        const d = try std.fmt.allocPrint(gpa, "  <description><p>{s}</p></description>\n", .{desc});
+        const d = try gpa.print("  <description><p>{s}</p></description>\n", .{desc});
         defer gpa.free(d);
         try buf.appendSlice(gpa, d);
     }
     if (opts.categories.len > 0) {
         try buf.appendSlice(gpa, "  <categories>\n");
         for (opts.categories) |c| {
-            const line = try std.fmt.allocPrint(gpa, "    <category>{s}</category>\n", .{c.appstreamName()});
+            const line = try gpa.print("    <category>{s}</category>\n", .{c.appstreamName()});
             defer gpa.free(line);
             try buf.appendSlice(gpa, line);
         }
@@ -273,7 +273,7 @@ pub fn metainfoXml(gpa: std.mem.Allocator, opts: AppOptions) ![]u8 {
     }
     const idesc = try xmlEscape(gpa, opts.id);
     defer gpa.free(idesc);
-    const launch = try std.fmt.allocPrint(gpa, "  <launchable type=\"desktop-id\">{s}.desktop</launchable>\n", .{idesc});
+    const launch = try gpa.print("  <launchable type=\"desktop-id\">{s}.desktop</launchable>\n", .{idesc});
     defer gpa.free(launch);
     try buf.appendSlice(gpa, launch);
     try buf.appendSlice(gpa, "</component>\n");
@@ -283,7 +283,7 @@ pub fn metainfoXml(gpa: std.mem.Allocator, opts: AppOptions) ![]u8 {
 fn xmlTag(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), tag: []const u8, val: []const u8) !void {
     const esc = try xmlEscape(gpa, val);
     defer gpa.free(esc);
-    const line = try std.fmt.allocPrint(gpa, "  <{s}>{s}</{s}>\n", .{ tag, esc, tag });
+    const line = try gpa.print("  <{s}>{s}</{s}>\n", .{ tag, esc, tag });
     defer gpa.free(line);
     try buf.appendSlice(gpa, line);
 }
@@ -293,7 +293,7 @@ fn xmlLocalized(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), tag: []const u8
     for (t.locales) |loc| {
         const esc = try xmlEscape(gpa, loc.text);
         defer gpa.free(esc);
-        const line = try std.fmt.allocPrint(gpa, "  <{s} xml:lang=\"{s}\">{s}</{s}>\n", .{ tag, loc.lang, esc, tag });
+        const line = try gpa.print("  <{s} xml:lang=\"{s}\">{s}</{s}>\n", .{ tag, loc.lang, esc, tag });
         defer gpa.free(line);
         try buf.appendSlice(gpa, line);
     }
@@ -313,7 +313,7 @@ test "desktopFile emits Name, i18n, Exec, Icon, Categories" {
         .categories = &.{ .utility, .graphics },
         .root = undefined,
         .target = undefined,
-        .optimize = .Debug,
+        .optimize = .debug,
     };
     const text = try desktopFile(gpa, opts, "example-app");
     defer gpa.free(text);
@@ -336,7 +336,7 @@ test "metainfoXml emits id, name, launchable, categories" {
         .developer = "Example Inc",
         .root = undefined,
         .target = undefined,
-        .optimize = .Debug,
+        .optimize = .debug,
     };
     const xml = try metainfoXml(gpa, opts);
     defer gpa.free(xml);
@@ -354,7 +354,7 @@ test "metainfoXml always emits metadata_license, escapes XML, skips empty summar
         .summary = .{ .default = "" }, // empty -> skipped
         .root = undefined,
         .target = undefined,
-        .optimize = .Debug,
+        .optimize = .debug,
     };
     const xml = try metainfoXml(gpa, opts);
     defer gpa.free(xml);
@@ -371,7 +371,7 @@ test "metainfoXml developer id is the vendor domain, not the app id" {
         .developer = "Example",
         .root = undefined,
         .target = undefined,
-        .optimize = .Debug,
+        .optimize = .debug,
     };
     const xml = try metainfoXml(gpa, opts);
     defer gpa.free(xml);

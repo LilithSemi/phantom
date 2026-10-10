@@ -81,7 +81,7 @@ pub fn readHeader(bytes: []const u8) DecodeError!Header {
     const width = std.mem.readInt(u32, chunk.data[0..4], .big);
     const height = std.mem.readInt(u32, chunk.data[4..8], .big);
     const bit_depth = chunk.data[8];
-    const color_type: ColorType = @enumFromInt(chunk.data[9]);
+    const color_type: ColorType = @fromBackingInt(@intCast(chunk.data[9]));
     const compression = chunk.data[10];
     const filter_method = chunk.data[11];
     const interlace = chunk.data[12];
@@ -126,7 +126,7 @@ test "readHeader parses a 4x4 8-bit RGBA IHDR" {
 }
 
 test "readHeader rejects a bad signature" {
-    try std.testing.expectError(DecodeError.InvalidSignature, readHeader(&[_]u8{0} ** 16));
+    try std.testing.expectError(DecodeError.InvalidSignature, readHeader(&@as([16]u8, @splat(0))));
 }
 
 // Concatenates all IDAT chunk payloads in order, stopping at IEND.
@@ -173,7 +173,8 @@ fn deflateZlibForTest(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 test "inflateZlib round-trips a deflated buffer" {
     const gpa = std.testing.allocator;
-    const raw = "hello png world, the quick brown fox" ** 4;
+    const piece = "hello png world, the quick brown fox";
+    const raw = piece ++ piece ++ piece ++ piece;
     const z = try deflateZlibForTest(gpa, raw);
     defer gpa.free(z);
     const out = try inflateZlib(gpa, z, raw.len);

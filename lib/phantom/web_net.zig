@@ -341,9 +341,9 @@ pub fn requestUrl(gpa: Allocator, page_host: []const u8, req: Request) ![]u8 {
     const scheme = if (req.port == 443) "https" else "http";
     const default_port: u16 = if (req.port == 443) 443 else 80;
     if (req.port == default_port) {
-        return std.fmt.allocPrint(gpa, "{s}://{s}{s}", .{ scheme, req.host, req.target });
+        return gpa.print("{s}://{s}{s}", .{ scheme, req.host, req.target });
     }
-    return std.fmt.allocPrint(gpa, "{s}://{s}:{d}{s}", .{ scheme, req.host, req.port, req.target });
+    return gpa.print("{s}://{s}:{d}{s}", .{ scheme, req.host, req.port, req.target });
 }
 
 /// Rebuild the HTTP/1.1 response a socket serves, out of the three things a
@@ -610,7 +610,7 @@ test "an over long host name is refused rather than truncated to a different mac
     const gpa = std.testing.allocator;
     var net = Net{ .gpa = gpa };
     defer net.deinit();
-    const long = "a" ** (max_host + 1);
+    const long = &@as([max_host + 1]u8, @splat('a'));
     try std.testing.expect(net.open(long, 443) == null);
 }
 

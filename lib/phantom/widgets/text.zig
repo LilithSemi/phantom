@@ -203,8 +203,8 @@ test "Text owns its string: survives an arena reset that clobbers the source" {
     var font = try phantom.text.Font.load(gpa, phantom.text.builtin.neuropol_bytes);
     defer font.deinit(gpa);
 
-    // A per-frame arena string, like the demo's `allocPrint(b.arena, "Item {d}", ...)`.
-    const s = try std.fmt.allocPrint(arena.allocator(), "Item {d}", .{42});
+    // A per-frame arena string, like the demo's `b.arena.print("Item {d}", ...)`.
+    const s = try arena.allocator().print("Item {d}", .{42});
     var t = Text{ .text = s, .font = &font, .size = 16, .color = geom.Color.rgb(1, 1, 1) };
     const el = try t.widget().mount(&bctx, null);
     defer el.deinit(gpa);

@@ -132,7 +132,7 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     // Dev-serve: `zig build serve-<name>` serves dist/{id}/ over http via the first
     // available runtime, using an inline zero-dependency static server that sets
     // application/wasm for .wasm (required for WebAssembly.instantiateStreaming).
-    addServeStep(b, dist_dir, execName(b, opts.id, opts.exec_name), step);
+    addServeStep(b, web.dir, dist_dir, execName(b, opts.id, opts.exec_name), step);
 
     return step;
 }
@@ -348,25 +348,27 @@ const node_serve_js = @embedFile("build/serve/node.js");
 const bun_serve_js = @embedFile("build/serve/bun.js");
 const deno_serve_js = @embedFile("build/serve/deno.js");
 
-fn addServeStep(b: *std.Build, dist_dir: []const u8, name: []const u8, app_step: *std.Build.Step) void {
+fn addServeStep(b: *std.Build, dir: std.Build.LazyPath, dist_dir: []const u8, name: []const u8, app_step: *std.Build.Step) void {
     const serve = b.step(b.fmt("serve-{s}", .{name}), b.fmt("Serve {s} over http (dev)", .{dist_dir}));
-    const out = b.getInstallPath(.prefix, dist_dir);
-    // All three scripts read the serve dir from PHANTOM_SERVE_DIR (set below), not a
-    // positional arg: node/bun `-e` eval mode does not put the dir at a stable argv
-    // index (there is no script-path slot), which broke a positional approach.
+    // The server runs inside the dist directory and serves ".". The scripts read
+    // the directory from PHANTOM_SERVE_DIR, because node and bun `-e` put no
+    // positional argument at a stable argv index.
     var run: ?*std.Build.Step.Run = null;
-    if (b.findProgram(&.{"node"}, &.{}) catch null) |node_bin| {
+    if (b.findProgram(.{ .names = &.{"node"} })) |node_bin| {
         run = b.addSystemCommand(&.{ node_bin, "-e", node_serve_js });
-    } else if (b.findProgram(&.{"bun"}, &.{}) catch null) |bun_bin| {
+    } else if (b.findProgram(.{ .names = &.{"bun"} })) |bun_bin| {
         run = b.addSystemCommand(&.{ bun_bin, "-e", bun_serve_js });
-    } else if (b.findProgram(&.{"deno"}, &.{}) catch null) |deno_bin| {
+    } else if (b.findProgram(.{ .names = &.{"deno"} })) |deno_bin| {
         // --allow-env is required: the deno script reads PHANTOM_SERVE_DIR via
         // Deno.env.get, which throws PermissionDenied without it.
         const r = b.addSystemCommand(&.{ deno_bin, "run", "--allow-net", "--allow-read", "--allow-env=PHANTOM_SERVE_DIR,PHANTOM_SERVE_HOST", "-" });
         r.setStdIn(.{ .bytes = deno_serve_js });
         run = r;
     }
-    if (run) |r| r.setEnvironmentVariable("PHANTOM_SERVE_DIR", out);
+    if (run) |r| {
+        r.setCwd(dir);
+        r.setEnvironmentVariable("PHANTOM_SERVE_DIR", ".");
+    }
     if (run) |r| {
         // Depend on the app step (which carries all the dist install actions) so the
         // bundle is built regardless of how the consumer wires the app into install.
@@ -394,16 +396,17 @@ fn addRuntime(
     // dist/, so most checkouts of the dep have none. Check the real filesystem
     // rather than assume, because a later version of the dep may commit it, and
     // then the copy is both faster and offline.
-    const dist_index = webidl_dep.builder.pathFromRoot("npm/webidl-runtime/dist/index.js");
+    // A package is addressed by its hash, so its files never change and the
+    // configure cache needs no dependency on this one.
     const has_prebuilt = blk: {
-        std.Io.Dir.accessAbsolute(b.graph.io, dist_index, .{}) catch break :blk false;
+        webidl_dep.builder.root.access(b.graph.io, "npm/webidl-runtime/dist/index.js", .{}) catch break :blk false;
         break :blk true;
     };
     const have = appmeta.Avail{
-        .bun = (b.findProgram(&.{"bun"}, &.{}) catch null) != null,
-        .deno = (b.findProgram(&.{"deno"}, &.{}) catch null) != null,
-        .node = (b.findProgram(&.{"node"}, &.{}) catch null) != null,
-        .tsc = (b.findProgram(&.{"tsc"}, &.{}) catch null) != null,
+        .bun = b.findProgram(.{ .names = &.{"bun"} }) != null,
+        .deno = b.findProgram(.{ .names = &.{"deno"} }) != null,
+        .node = b.findProgram(.{ .names = &.{"node"} }) != null,
+        .tsc = b.findProgram(.{ .names = &.{"tsc"} }) != null,
         .prebuilt = has_prebuilt,
     };
     const strategy = appmeta.resolveStrategy(runtime, have) catch {
@@ -424,7 +427,7 @@ fn addRuntime(
     const bundle_entry = webidl_dep.builder.path("npm/webidl-runtime/dist/index.js");
     switch (strategy) {
         .bun => {
-            const run = b.addSystemCommand(&.{ (b.findProgram(&.{"bun"}, &.{}) catch unreachable), "build", "--format", "esm", "--entrypoints" });
+            const run = b.addSystemCommand(&.{ b.findProgram(.{ .names = &.{"bun"} }).?, "build", "--format", "esm", "--entrypoints" });
             run.addFileArg(bundle_entry);
             run.addArg("--outfile");
             _ = dist.addCopyFile(run.addOutputFileArg("webidl-runtime.js"), "webidl-runtime.js");
@@ -432,7 +435,7 @@ fn addRuntime(
         },
         .deno => {
             // deno bundle (Deno 2.8.3, native/offline). This is the browser single-file form.
-            const run = b.addSystemCommand(&.{ (b.findProgram(&.{"deno"}, &.{}) catch unreachable), "bundle", "--platform", "browser" });
+            const run = b.addSystemCommand(&.{ b.findProgram(.{ .names = &.{"deno"} }).?, "bundle", "--platform", "browser" });
             run.addFileArg(bundle_entry);
             run.addArg("--output");
             _ = dist.addCopyFile(run.addOutputFileArg("webidl-runtime.js"), "webidl-runtime.js");
@@ -448,7 +451,7 @@ fn addRuntime(
             // (loader.ts's non-browser file-read path); it emits no JS but is
             // required for the type check to pass.
             const run = b.addSystemCommand(&.{
-                (b.findProgram(&.{"tsc"}, &.{}) catch unreachable),
+                b.findProgram(.{ .names = &.{"tsc"} }).?,
                 "--target",
                 "ES2022",
                 "--module",

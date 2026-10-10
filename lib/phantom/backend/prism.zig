@@ -427,7 +427,7 @@ pub const PrismBackend = struct {
             .owner = 0,
             .size_bits = @bitCast(size.width),
             .height_bits = @bitCast(size.height),
-            .id = @intFromEnum(id),
+            .id = @backingInt(id),
         };
         // Check before stroking: a cache hit must not pay for the expansion.
         if (self.atlas.map.get(key)) |cached| return cached;
@@ -789,7 +789,7 @@ pub const PrismBackend = struct {
 ///
 /// The way out is in code phantom does not own: a Windows platform in vulcan's
 /// JIT. That retires this constant, and nothing in phantom has to change for it.
-pub const builds_here = builtin.os.tag != .windows;
+pub const builds_here = builtin.target.os.tag != .windows;
 
 /// Whether this machine can draw PHANTOM'S primitives, not merely draw.
 ///
@@ -815,15 +815,15 @@ pub const builds_here = builtin.os.tag != .windows;
 /// about the same machine must get the same answer.
 var raster_probe: ?bool = null;
 
-pub fn canRasterize(gpa: std.mem.Allocator) bool {
+pub fn canRasterize(gpa: std.mem.Allocator, io: std.Io) bool {
     if (raster_probe) |known| return known;
-    const answer = probeRaster(gpa) catch false;
+    const answer = probeRaster(gpa, io) catch false;
     raster_probe = answer;
     return answer;
 }
 
-fn probeRaster(gpa: std.mem.Allocator) !bool {
-    const sel = prism.drivers.createBestDevice(gpa) orelse return false;
+fn probeRaster(gpa: std.mem.Allocator, io: std.Io) !bool {
+    const sel = prism.drivers.createBestDevice(gpa, io) orelse return false;
     defer sel.device.deinit();
     const dev = sel.device;
 
@@ -872,14 +872,14 @@ fn probeRaster(gpa: std.mem.Allocator) !bool {
 /// there is no answer to give. Reporting that as a phantom defect would be
 /// false, and it would train a reader to ignore these tests everywhere they
 /// cannot run.
-pub fn requireRaster(gpa: std.mem.Allocator) !void {
-    if (!canRasterize(gpa)) return error.SkipZigTest;
+pub fn requireRaster(gpa: std.mem.Allocator, io: std.Io) !void {
+    if (!canRasterize(gpa, io)) return error.SkipZigTest;
 }
 
 test "rounded rect leaves its corner as background" {
     const gpa = std.testing.allocator;
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     const dev = sel.device;
 
@@ -909,8 +909,8 @@ test "rounded rect leaves its corner as background" {
 
 test "PrismBackend draws a solid rect; center pixel reads blue" {
     const gpa = std.testing.allocator;
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     const dev = sel.device;
 
@@ -938,8 +938,8 @@ test "PrismBackend draws a solid rect; center pixel reads blue" {
 
 test "PrismBackend renders a TextRun; glyph pixels appear on the target" {
     const gpa = std.testing.allocator;
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     const dev = sel.device;
     var backend = try PrismBackend.init(dev, gpa);
@@ -968,8 +968,8 @@ test "PrismBackend renders a TextRun; glyph pixels appear on the target" {
 }
 
 fn litEdges(gpa: std.mem.Allocator, italic: bool, underline: bool) !struct { top_left: u32, bottom_left: u32, bottom_row_lit: u32 } {
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     const dev = sel.device;
     var backend = try PrismBackend.init(dev, gpa);
@@ -1024,8 +1024,8 @@ test "an underlined run inks a line under its baseline" {
 
 test "PrismBackend draws an icon primitive tinted, with the gap between its pillars left clear" {
     const gpa = std.testing.allocator;
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     const dev = sel.device;
     var backend = try PrismBackend.init(dev, gpa);
@@ -1081,13 +1081,13 @@ test "PrismBackend draws an icon primitive tinted, with the gap between its pill
 
 /// A 2x2 solid opaque texture in the layout Image.fromRgba borrows.
 fn solidRgba(r: u8, g: u8, b: u8) [16]u8 {
-    return [_]u8{ r, g, b, 0xFF } ** 4;
+    return .{ r, g, b, 0xFF, r, g, b, 0xFF, r, g, b, 0xFF, r, g, b, 0xFF };
 }
 
 test "an image listed before a rect draws behind it: the rect's pixels win" {
     const gpa = std.testing.allocator;
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     const dev = sel.device;
 
@@ -1126,8 +1126,8 @@ test "an image listed before a rect draws behind it: the rect's pixels win" {
 
 test "an image listed after a rect draws in front of it: the image's pixels win" {
     const gpa = std.testing.allocator;
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     const dev = sel.device;
 
@@ -1166,8 +1166,8 @@ test "an image listed after a rect draws in front of it: the image's pixels win"
 
 test "two images and two rects interleaved stack in list order: the last one covers" {
     const gpa = std.testing.allocator;
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     const dev = sel.device;
 
@@ -1216,8 +1216,8 @@ test "a rule stretched to its box inks the full height, where a square one leave
     // its row. A square mark in a box one column wide is only as tall as it is
     // wide, so consecutive rows draw a dashed line with blank between them.
     const gpa = std.testing.allocator;
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     const dev = sel.device;
 
@@ -1290,8 +1290,8 @@ test "the atlas keeps one mark at two heights apart" {
     // shared a slot, and whichever rasterised first was drawn for both, which
     // is a rail that changes length when a row above it resizes.
     const gpa = std.testing.allocator;
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     var backend = try PrismBackend.init(sel.device, gpa);
     defer backend.deinit();
@@ -1340,8 +1340,8 @@ test "a codepoint the face cannot draw becomes its built-in mark" {
     // box glyph 0 draws, while a terminal showed the real character from its own
     // font. The two backends have to agree.
     const gpa = std.testing.allocator;
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     var font = try text.Font.load(gpa, text.builtin.neuropol_bytes);
     defer font.deinit(gpa);
@@ -1377,8 +1377,8 @@ test "the two spellings of one mark draw the same thing" {
     // caller writes whichever it prefers and means the same mark, so both reach
     // the same built-in and draw identically.
     const gpa = std.testing.allocator;
-    try requireRaster(gpa);
-    const sel = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    try requireRaster(gpa, std.testing.io);
+    const sel = prism.drivers.createBestDevice(gpa, std.testing.io) orelse return error.NoPrismDevice;
     defer sel.device.deinit();
     var font = try text.Font.load(gpa, text.builtin.neuropol_bytes);
     defer font.deinit(gpa);

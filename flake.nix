@@ -59,7 +59,7 @@
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              zig
+              zig_0_17
               bun
               nodejs
               typescript
@@ -79,13 +79,13 @@
 
             src = lib.cleanSource ./.;
 
-            zigDeps = pkgs.zig.fetchDeps {
+            zigDeps = pkgs.zig_0_17.fetchDeps {
               inherit (finalAttrs) src pname version;
-              hash = "sha256-TSKat00g31EzuYeKJqUxyNRPSCiqix4nB3aN9oDksgY=";
+              hash = "sha256-rN2fHlzBQXo1y5pZYfwTN3hYwv9XSOad0bb21ev0yzo=";
             };
 
             nativeBuildInputs = with pkgs; [
-              zig
+              zig_0_17
             ];
 
             postConfigure = ''

@@ -502,7 +502,7 @@ const net = std.Io.net;
 ///
 /// `net.Socket.Handle` is `std.posix.fd_t`, and wasm32-freestanding has no OS to
 /// hand out descriptors, so there it is `void`: a socket on the real web target
-/// carries NO identity, and `netRead` cannot be told which connection it is for.
+/// carries NO identity, and a read cannot be told which connection it is for.
 ///
 /// So the connection has to be implicit there, and it is safe to make it so
 /// because nothing here runs concurrently. A request is written and then read in
@@ -579,8 +579,8 @@ fn webNetConnectIp(
 fn webNetRead(
     userdata: ?*anyopaque,
     src: net.Socket.Handle,
-    data: [][]u8,
-) net.Stream.Reader.Error!usize {
+    data: []const []u8,
+) std.Io.Operation.NetRead.Error!usize {
     const app: *WebApp = @ptrCast(@alignCast(userdata.?));
     // Fill the first buffer with room in it and return. A short read is always
     // allowed, and one `fetch` is one answer, so there is nothing to gain by
@@ -600,7 +600,7 @@ fn webNetWrite(
     header: []const u8,
     data: []const []const u8,
     splat: usize,
-) net.Stream.Writer.Error!usize {
+) std.Io.Operation.NetWrite.Error!usize {
     const app: *WebApp = @ptrCast(@alignCast(userdata.?));
     var written: usize = 0;
     written += webWriteAll(app, dest, header) catch |err| return err;
@@ -619,16 +619,72 @@ fn webNetWrite(
     return written;
 }
 
-fn webWriteAll(app: *WebApp, dest: net.Socket.Handle, bytes: []const u8) net.Stream.Writer.Error!usize {
+fn webWriteAll(app: *WebApp, dest: net.Socket.Handle, bytes: []const u8) std.Io.Operation.NetWrite.Error!usize {
     return app.net.write(slotFor(app, dest), bytes) catch |err| switch (err) {
         error.SocketUnconnected => error.SocketUnconnected,
         error.OutOfMemory => error.SystemResources,
     };
 }
 
-fn webNetClose(userdata: ?*anyopaque, handles: []const net.Socket.Handle) void {
+fn webNetClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
     const app: *WebApp = @ptrCast(@alignCast(userdata.?));
-    for (handles) |h| app.net.close(slotFor(app, h));
+    for (sockets) |s| app.net.close(slotFor(app, s.handle));
+}
+
+// Reads and writes reach an Io as operations. Only the two socket ones are real
+// here. Every other operation goes to `failing`.
+const web_http_vtable: phantom.http.Client.VTable = .{ .fetch = webHttpFetch };
+
+// `phantom.http` on the page: one request straight to the fetch hook, with no
+// socket in between. See lib/phantom/http.zig for why the web does not use
+// `std.http.Client` yet.
+fn webHttpFetch(ptr: *anyopaque, options: phantom.http.FetchOptions) phantom.http.FetchError!phantom.http.FetchResult {
+    const app: *WebApp = @ptrCast(@alignCast(ptr));
+    const gpa = app.gpa;
+
+    const uri = std.Uri.parse(options.url) catch return error.InvalidUrl;
+    const hook = app.net.hook orelse return error.NetworkDown;
+    const host_component = uri.host orelse return error.InvalidUrl;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = host_component.toRaw(&host_buf) catch return error.InvalidUrl;
+    const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+
+    var target: std.Io.Writer.Allocating = .init(gpa);
+    defer target.deinit();
+    uri.writeToStream(&target.writer, .{ .path = true, .query = true }) catch return error.OutOfMemory;
+    if (target.written().len == 0) target.writer.writeByte('/') catch return error.OutOfMemory;
+
+    var headers: std.Io.Writer.Allocating = .init(gpa);
+    defer headers.deinit();
+    if (options.content_type) |ct| headers.writer.print("content-type: {s}\r\n", .{ct}) catch return error.OutOfMemory;
+    for (options.extra_headers) |h| headers.writer.print("{s}: {s}\r\n", .{ h.name, h.value }) catch return error.OutOfMemory;
+
+    const method = options.method orelse if (options.payload != null) std.http.Method.POST else .GET;
+    const raw = hook.send(hook.ctx, gpa, .{
+        .method = @tagName(method),
+        .host = host,
+        .port = uri.port orelse default_port,
+        .target = target.written(),
+        .headers = headers.written(),
+        .body = options.payload orelse "",
+    }) orelse return error.NetworkDown;
+    defer gpa.free(raw);
+
+    // The hook answers with `web_net.buildResponse`: a status line, headers
+    // that frame the body by content-length, a blank line, then the body.
+    if (!std.mem.startsWith(u8, raw, "HTTP/1.1 ") or raw.len < 12) return error.InvalidResponse;
+    const code = std.fmt.parseInt(u10, raw[9..12], 10) catch return error.InvalidResponse;
+    const head_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidResponse;
+    if (options.response_writer) |w| w.writeAll(raw[head_end + 4 ..]) catch return error.WriteFailed;
+    return .{ .status = @fromBackingInt(@intCast(code)) };
+}
+
+fn webOperate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+    return switch (operation) {
+        .net_read => |o| .{ .net_read = if (webNetRead(userdata, o.socket_handle, o.data)) |n| .{ .data_len = n } else |err| err },
+        .net_write => |o| .{ .net_write = webNetWrite(userdata, o.socket_handle, o.header, o.data, o.splat) },
+        else => std.Io.failing.vtable.operate(userdata, operation),
+    };
 }
 
 /// Nothing to shut down: one connection is one `fetch`, and neither half of it
@@ -663,8 +719,7 @@ const web_vtable: std.Io.VTable = blk: {
     vt.randomSecure = webRandomSecure;
     vt.netLookup = webNetLookup;
     vt.netConnectIp = webNetConnectIp;
-    vt.netRead = webNetRead;
-    vt.netWrite = webNetWrite;
+    vt.operate = webOperate;
     vt.netClose = webNetClose;
     vt.netShutdown = webNetShutdown;
     break :blk vt;
@@ -752,6 +807,7 @@ pub fn init(
         .read_query = if (ops.read_query != null) readQueryThunk else null,
         .read_host = if (ops.read_host != null) readHostThunk else null,
         .write_location = if (ops.write_location != null) writeLocationThunk else null,
+        .http = .{ .ptr = app, .vtable = &web_http_vtable },
         .open_event_source = if (has_event_source) openEventSourceThunk else null,
         .close_event_source = if (has_event_source) closeEventSourceThunk else null,
         .strategy = strategy,
@@ -786,7 +842,7 @@ pub fn init(
     // body's background to the canvas when the root has none of its own.
     {
         const bg = phantom.ColorScheme.tokyoNight().bg;
-        const decl = try std.fmt.allocPrint(gpa, "margin:0;background:rgb({d},{d},{d})", .{ phantom.backend.dom.ch(bg.r), phantom.backend.dom.ch(bg.g), phantom.backend.dom.ch(bg.b) });
+        const decl = try gpa.print("margin:0;background:rgb({d},{d},{d})", .{ phantom.backend.dom.ch(bg.r), phantom.backend.dom.ch(bg.g), phantom.backend.dom.ch(bg.b) });
         defer gpa.free(decl);
         ops.setStyle(ops.body, decl);
     }
@@ -858,27 +914,27 @@ test "the web std.Io is identical to std.Io.failing in every entry except the th
     @setEvalBranchQuota(8000);
     const implemented = [_][]const u8{
         "now",       "random",       "randomSecure",
-        "netLookup", "netConnectIp", "netRead",
-        "netWrite",  "netClose",     "netShutdown",
+        "netLookup", "netConnectIp", "operate",
+        "netClose",  "netShutdown",
     };
     var app = clockOnlyApp(0, 0);
     const io = webIo(&app);
 
     var checked: usize = 0;
-    inline for (@typeInfo(std.Io.VTable).@"struct".fields) |f| {
+    inline for (@typeInfo(std.Io.VTable).@"struct".field_names) |name| {
         comptime var ours = false;
-        inline for (implemented) |name| {
-            if (comptime std.mem.eql(u8, f.name, name)) ours = true;
+        inline for (implemented) |implemented_name| {
+            if (comptime std.mem.eql(u8, name, implemented_name)) ours = true;
         }
         if (ours) {
-            try std.testing.expect(@field(io.vtable, f.name) != @field(std.Io.failing.vtable, f.name));
+            try std.testing.expect(@field(io.vtable, name) != @field(std.Io.failing.vtable, name));
         } else {
-            try std.testing.expect(@field(io.vtable, f.name) == @field(std.Io.failing.vtable, f.name));
+            try std.testing.expect(@field(io.vtable, name) == @field(std.Io.failing.vtable, name));
             checked += 1;
         }
     }
     // A vtable that shrank to nothing would satisfy the loop above vacuously.
-    try std.testing.expectEqual(@typeInfo(std.Io.VTable).@"struct".fields.len - implemented.len, checked);
+    try std.testing.expectEqual(@typeInfo(std.Io.VTable).@"struct".field_names.len - implemented.len, checked);
 }
 
 test "the web std.Io fills randomness from the host instead of handing back zeros" {
@@ -891,7 +947,7 @@ test "the web std.Io fills randomness from the host instead of handing back zero
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
     defer destroyWebApp(gpa, app);
 
-    var buf = [_]u8{0} ** 32;
+    var buf: [32]u8 = @splat(0);
     app.owner.io.vtable.random(app.owner.io.userdata, &buf);
     var all_zero = true;
     for (buf) |b| {
@@ -899,7 +955,7 @@ test "the web std.Io fills randomness from the host instead of handing back zero
     }
     try std.testing.expect(!all_zero);
 
-    var secure = [_]u8{0} ** 16;
+    var secure: [16]u8 = @splat(0);
     try app.owner.io.vtable.randomSecure(app.owner.io.userdata, &secure);
     try std.testing.expect(secure[0] != 0 or secure[1] != 0);
 }
@@ -916,7 +972,7 @@ test "a host with no random source reports entropy unavailable rather than succe
     // The secure entry can say so. The plain one returns void and cannot, which
     // is why it panics instead; that path is not reachable from a test without
     // taking the process with it.
-    var buf = [_]u8{0} ** 16;
+    var buf: [16]u8 = @splat(0);
     try std.testing.expectError(error.EntropyUnavailable, app.owner.io.vtable.randomSecure(app.owner.io.userdata, &buf));
 }
 
@@ -968,7 +1024,7 @@ test "an over long browser address is refused: it reports the fault and the rout
     defer rec.deinit();
     // Longer than the router's own buffer, parked as if the page had been
     // opened on an address nobody typed by hand.
-    const long = "/" ++ ("a" ** phantom.router.max_path);
+    const long = "/" ++ &@as([phantom.router.max_path]u8, @splat('a'));
     rec.setLocation(long);
 
     const r = phantom.Router{ .routes = &loc_fault_routes, .initial = "/", .not_found = locFaultHome };
@@ -1396,7 +1452,7 @@ test "an over long query is refused and reported rather than truncated to a diff
     const gpa = std.testing.allocator;
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
-    rec.setSearch("state=" ++ ("a" ** 64));
+    rec.setSearch("state=" ++ &@as([64]u8, @splat('a')));
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
     defer destroyWebApp(gpa, app);
 
@@ -1899,4 +1955,70 @@ test "a request made while the tree first mounts reaches the host" {
 
     try std.testing.expect(app.sink.first == null);
     try std.testing.expect(logHas(rec.log.items, "httpSend(GET,sigil.example,80,/api/sites)"));
+}
+
+test "phantom.http on a page goes straight to the fetch hook" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+    var spy = FetchSpy{ .status = 200, .reply = "{\"ok\":true}" };
+    app.net.hook = spy.hook();
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const res = try app.owner.http().fetch(.{ .url = "http://sigil.example/api/sites?page=2", .response_writer = &body.writer });
+    try std.testing.expectEqual(std.http.Status.ok, res.status);
+    try std.testing.expectEqualStrings("{\"ok\":true}", body.written());
+    try std.testing.expectEqualStrings("GET", spy.method[0..spy.method_len]);
+    try std.testing.expectEqualStrings("/api/sites?page=2", spy.target[0..spy.target_len]);
+    try std.testing.expectEqualStrings("sigil.example", spy.host[0..spy.host_len]);
+    try std.testing.expectEqual(@as(u16, 80), spy.port);
+
+    // A payload makes the default method POST and travels as the body.
+    spy.status = 404;
+    const posted = try app.owner.http().fetch(.{ .url = "http://sigil.example/api", .payload = "{}", .content_type = "application/json" });
+    try std.testing.expectEqual(std.http.Status.not_found, posted.status);
+    try std.testing.expectEqualStrings("POST", spy.method[0..spy.method_len]);
+    try std.testing.expectEqualStrings("{}", spy.body[0..spy.body_len]);
+    try std.testing.expectEqualStrings("/api", spy.target[0..spy.target_len]);
+}
+
+test "phantom.http on a page reports a missing network and a bad url" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var ops = rec.ops();
+    ops.http_send = null;
+    const app = try init(gpa, ops, phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+    try std.testing.expectError(error.NetworkDown, app.owner.http().fetch(.{ .url = "http://sigil.example/" }));
+    try std.testing.expectError(error.InvalidUrl, app.owner.http().fetch(.{ .url = "not a url" }));
+
+    var spy = FetchSpy{ .fail = true };
+    app.net.hook = spy.hook();
+    try std.testing.expectError(error.NetworkDown, app.owner.http().fetch(.{ .url = "http://sigil.example/" }));
+}
+
+test "phantom.http.Std runs the same call on std.http.Client" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+    var spy = FetchSpy{ .status = 201, .headers = "transfer-encoding: chunked\r\n", .reply = "made" };
+    app.net.hook = spy.hook();
+
+    // The page's Io under a real std.http.Client: the path a native backend takes.
+    var inner: std.http.Client = .{ .allocator = gpa, .io = app.owner.io };
+    defer inner.deinit();
+    var wrap: phantom.http.Std = .{ .inner = &inner };
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const res = try wrap.client().fetch(.{ .url = "http://sigil.example/api/make", .payload = "x", .response_writer = &body.writer });
+    try std.testing.expectEqual(std.http.Status.created, res.status);
+    try std.testing.expectEqualStrings("made", body.written());
+    try std.testing.expectEqualStrings("POST", spy.method[0..spy.method_len]);
+    try std.testing.expectError(error.InvalidUrl, wrap.client().fetch(.{ .url = "not a url" }));
 }

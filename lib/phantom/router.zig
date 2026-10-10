@@ -369,7 +369,7 @@ test "a location holds the path it was set from" {
 
 test "a location refuses a path longer than the buffer" {
     var loc = Location{};
-    const long = "/" ++ ("a" ** max_path);
+    const long = "/" ++ &@as([max_path]u8, @splat('a'));
     try std.testing.expectError(error.PathTooLong, loc.set(long));
 }
 
@@ -493,7 +493,7 @@ test "a path longer than the buffer is refused and the location does not change"
     var h = try phantom.testing.mount(std.testing.allocator, r.widget());
     defer h.deinit();
     const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
-    const long = "/" ++ ("a" ** max_path);
+    const long = "/" ++ &@as([max_path]u8, @splat('a'));
     state.push(long);
     try h.pump();
     try std.testing.expectEqualStrings("/", state.location());

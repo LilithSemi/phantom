@@ -109,8 +109,8 @@ pub const Term = struct {
     /// The console modes to restore on Windows. Two handles carry two modes, so the
     /// posix `saved` termios cannot hold them. `void` on every other target, so the
     /// field costs nothing there.
-    saved_console: if (builtin.os.tag == .windows) ?@import("term_windows.zig").SavedConsole else void =
-        if (builtin.os.tag == .windows) null else {},
+    saved_console: if (builtin.target.os.tag == .windows) ?@import("term_windows.zig").SavedConsole else void =
+        if (builtin.target.os.tag == .windows) null else {},
     /// The real stderr, saved by `redirectStderr` so `restoreStderr` can put it
     /// back. Null when stderr is not currently redirected.
     saved_stderr: ?std.posix.fd_t = null,
@@ -136,7 +136,7 @@ pub const Term = struct {
     /// there is no SIGWINCH and no termios: see `term_windows.zig`'s `enterRaw`
     /// for what that platform saves and restores instead.
     pub fn enterRaw(self: *Term) !void {
-        if (builtin.os.tag == .windows) return @import("term_windows.zig").enterRaw(self);
+        if (builtin.target.os.tag == .windows) return @import("term_windows.zig").enterRaw(self);
         // A second call while raw mode is already active would read back the raw
         // termios this function already set and save that as the restore state, so
         // `leaveRaw` would then restore raw mode instead of what the user had.
@@ -158,8 +158,8 @@ pub const Term = struct {
         raw.cflag.CSIZE = .CS8;
         // A read returns as soon as one byte arrives and never blocks forever, so
         // the event loop keeps its frame deadline.
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 0;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 1;
+        raw.cc[@backingInt(std.posix.V.MIN)] = 0;
+        raw.cc[@backingInt(std.posix.V.TIME)] = 1;
         try std.posix.tcsetattr(fd, .FLUSH, raw);
 
         var act = std.posix.Sigaction{
@@ -173,14 +173,14 @@ pub const Term = struct {
     /// Restore the terminal. This runs from a `defer`, from the panic hook and from
     /// the signal handlers, so it must be safe to call more than one time.
     pub fn leaveRaw(self: *Term) void {
-        if (builtin.os.tag == .windows) return @import("term_windows.zig").leaveRaw(self);
+        if (builtin.target.os.tag == .windows) return @import("term_windows.zig").leaveRaw(self);
         const original = self.saved orelse return;
         self.saved = null;
         std.posix.tcsetattr(self.in.handle, .FLUSH, original) catch {};
     }
 
     pub fn size(self: *Term) !Size {
-        if (builtin.os.tag == .windows) return @import("term_windows.zig").size(self);
+        if (builtin.target.os.tag == .windows) return @import("term_windows.zig").size(self);
         var ws: std.posix.winsize = undefined;
         const rc = std.posix.system.ioctl(self.out.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
         if (std.posix.errno(rc) != .SUCCESS) return error.NoTerminalSize;
@@ -221,7 +221,7 @@ pub const Term = struct {
     /// silently continuing as though the redirect had worked (see `Session`, which
     /// checks it once it is safe to log again).
     pub fn redirectStderr(self: *Term, io: std.Io, path: []const u8) void {
-        if (builtin.os.tag == .windows) return; // TODO: windows console redirection.
+        if (builtin.target.os.tag == .windows) return; // TODO: windows console redirection.
         if (self.saved_stderr != null) return; // Already redirected.
         if (self.tryStderrTarget(io, path)) {
             self.stderr_target = .log_file;
@@ -254,7 +254,7 @@ pub const Term = struct {
     /// Idempotent, the same way `leaveRaw` is, since it runs from more than one
     /// exit path and any of them may run after another already has.
     pub fn restoreStderr(self: *Term) void {
-        if (builtin.os.tag == .windows) return;
+        if (builtin.target.os.tag == .windows) return;
         const saved = self.saved_stderr orelse return;
         self.saved_stderr = null;
         _ = rawDup2(saved, std.posix.STDERR_FILENO);
@@ -293,7 +293,7 @@ const restore_bytes = ansi.cursor_show ++ ansi.alt_screen_off ++ ansi.sgr_reset;
 /// race that write or read its half updated state. A plain write syscall touches
 /// nothing but the kernel, so it is the one output path a handler can use safely.
 fn rawWrite(fd: std.posix.fd_t, bytes: []const u8) void {
-    if (builtin.os.tag == .windows) return @import("term_windows.zig").rawWrite(fd, bytes);
+    if (builtin.target.os.tag == .windows) return @import("term_windows.zig").rawWrite(fd, bytes);
     if (builtin.link_libc) {
         _ = std.c.write(fd, bytes.ptr, bytes.len);
     } else {
@@ -403,7 +403,7 @@ pub const keep_coredump_env = "PHANTOM_TUI_KEEP_COREDUMP";
 /// no-op there and the panic hook is the only restore path that ever runs.
 pub fn installCleanup(t: *Term, opts: CleanupOptions) void {
     cleanup_target = t;
-    if (builtin.os.tag == .windows) return;
+    if (builtin.target.os.tag == .windows) return;
     if (!opts.install_signal_handlers) return;
     signals_installed = true;
     var act = std.posix.Sigaction{
@@ -465,7 +465,7 @@ pub fn uninstallCleanup() void {
     // signals: `prev_sigint` and `prev_sigterm` were never written, so restoring
     // from them would install whatever stale disposition they last held, or
     // undefined memory if they never held one at all.
-    if (builtin.os.tag != .windows and signals_installed) {
+    if (builtin.target.os.tag != .windows and signals_installed) {
         signals_installed = false;
         std.posix.sigaction(std.posix.SIG.INT, &prev_sigint, null);
         std.posix.sigaction(std.posix.SIG.TERM, &prev_sigterm, null);
@@ -562,7 +562,7 @@ pub fn rootPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 }
 
 test "redirectStderr swaps stderr to a file, and restoreStderr swaps it back" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -595,7 +595,7 @@ test "redirectStderr swaps stderr to a file, and restoreStderr swaps it back" {
 }
 
 test "redirectStderr falls back to /dev/null when the intended path cannot be opened, and never leaves stderr on the real terminal" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -615,7 +615,7 @@ test "redirectStderr falls back to /dev/null when the intended path cannot be op
 }
 
 test "restoreStderr is idempotent, matching leaveRaw's contract" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -638,7 +638,7 @@ fn sigHandlerAddr(act: std.posix.Sigaction) usize {
 }
 
 test "uninstallCleanup clears cleanup_target, so a signal arriving after a Session is gone cannot dereference a dead Term" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -651,7 +651,7 @@ test "uninstallCleanup clears cleanup_target, so a signal arriving after a Sessi
 }
 
 test "uninstallCleanup restores SIGINT and SIGTERM to whatever disposition they had before installCleanup" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -680,7 +680,7 @@ test "uninstallCleanup restores SIGINT and SIGTERM to whatever disposition they 
 }
 
 test "uninstallCleanup restores SIGABRT only when installCleanup actually installed it there" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -702,7 +702,7 @@ test "uninstallCleanup restores SIGABRT only when installCleanup actually instal
 }
 
 test "uninstallCleanup leaves SIGABRT untouched when installCleanup skipped it under PHANTOM_TUI_KEEP_COREDUMP" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();

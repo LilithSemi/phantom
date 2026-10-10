@@ -2,8 +2,8 @@ const std = @import("std");
 
 test "a rendered red rectangle reaches the mapped pixels" {
     const gpa = std.testing.allocator;
-    try prism_backend.requireRaster(gpa);
-    var s = PixelSurface.init(gpa, 32, 32) catch |err| switch (err) {
+    try prism_backend.requireRaster(gpa, std.testing.io);
+    var s = PixelSurface.init(gpa, std.testing.io, 32, 32) catch |err| switch (err) {
         // createBestDevice returns null only when not even the software driver
         // starts, which should not happen. Fail loudly rather than skipping.
         error.NoPrismDevice => return err,
@@ -28,8 +28,8 @@ test "a rendered red rectangle reaches the mapped pixels" {
 
 test "the first frame reports the whole surface as damaged" {
     const gpa = std.testing.allocator;
-    try prism_backend.requireRaster(gpa);
-    var s = try PixelSurface.init(gpa, 16, 16);
+    try prism_backend.requireRaster(gpa, std.testing.io);
+    var s = try PixelSurface.init(gpa, std.testing.io, 16, 16);
     defer s.deinit();
 
     var list: dl.DisplayList = .{};
@@ -44,8 +44,8 @@ test "the first frame reports the whole surface as damaged" {
 
 test "an unchanged frame reports no damage at all" {
     const gpa = std.testing.allocator;
-    try prism_backend.requireRaster(gpa);
-    var s = try PixelSurface.init(gpa, 16, 16);
+    try prism_backend.requireRaster(gpa, std.testing.io);
+    var s = try PixelSurface.init(gpa, std.testing.io, 16, 16);
     defer s.deinit();
 
     var list: dl.DisplayList = .{};
@@ -59,8 +59,8 @@ test "an unchanged frame reports no damage at all" {
 
 test "damage covers only the region that changed" {
     const gpa = std.testing.allocator;
-    try prism_backend.requireRaster(gpa);
-    var s = try PixelSurface.init(gpa, 64, 64);
+    try prism_backend.requireRaster(gpa, std.testing.io);
+    var s = try PixelSurface.init(gpa, std.testing.io, 64, 64);
     defer s.deinit();
 
     var empty: dl.DisplayList = .{};
@@ -86,8 +86,8 @@ test "damage covers only the region that changed" {
 
 test "resize gives a surface of the new size and forces full damage" {
     const gpa = std.testing.allocator;
-    try prism_backend.requireRaster(gpa);
-    var s = try PixelSurface.init(gpa, 16, 16);
+    try prism_backend.requireRaster(gpa, std.testing.io);
+    var s = try PixelSurface.init(gpa, std.testing.io, 16, 16);
     defer s.deinit();
 
     try s.resize(32, 24);
@@ -104,8 +104,8 @@ test "resize gives a surface of the new size and forces full damage" {
 
 test "a zero sized surface renders and reports no pixels, and resizing back up recovers" {
     const gpa = std.testing.allocator;
-    try prism_backend.requireRaster(gpa);
-    var s = try PixelSurface.init(gpa, 0, 0);
+    try prism_backend.requireRaster(gpa, std.testing.io);
+    var s = try PixelSurface.init(gpa, std.testing.io, 0, 0);
     defer s.deinit();
 
     var list: dl.DisplayList = .{};
@@ -208,8 +208,8 @@ pub const PixelSurface = struct {
     /// first frame, which reports the whole surface.
     previous: ?[]u8 = null,
 
-    pub fn init(gpa: std.mem.Allocator, width: u32, height: u32) !PixelSurface {
-        const selected = prism.drivers.createBestDevice(gpa) orelse return error.NoPrismDevice;
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, width: u32, height: u32) !PixelSurface {
+        const selected = prism.drivers.createBestDevice(gpa, io) orelse return error.NoPrismDevice;
         if (bringUp(gpa, selected.device, width, height)) |built| {
             return .{
                 .gpa = gpa,
@@ -226,7 +226,7 @@ pub const PixelSurface = struct {
             // is correct whenever it starts at all.
             selected.device.deinit();
             const sw = prism.drivers.select("software") orelse return error.NoPrismDevice;
-            const sw_device = try sw.createDevice(gpa);
+            const sw_device = try sw.createDevice(gpa, io);
             errdefer sw_device.deinit();
             const built = try bringUp(gpa, sw_device, width, height);
             return .{

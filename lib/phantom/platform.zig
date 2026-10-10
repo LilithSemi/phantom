@@ -4,6 +4,7 @@
 //! null hook does nothing rather than guessing.
 
 const std = @import("std");
+const http_mod = @import("http.zig");
 
 pub const UrlStrategy = enum {
     /// `/#/gallery`. Works on any static host with no configuration.
@@ -72,6 +73,10 @@ pub const EventSource = struct { id: u32 };
 
 pub const Platform = struct {
     ctx: ?*anyopaque = null,
+    /// The HTTP client of a backend that has its own, such as the page `fetch`
+    /// on the web. Null on a backend that uses `std.http.Client`. Read it
+    /// through `BuildOwner.http`.
+    http: ?http_mod.Client = null,
     /// Opens a server-sent event stream on `url`. `types` names the event types
     /// to receive in addition to "message". Null when the stream cannot open.
     open_event_source: ?*const fn (*anyopaque, url: []const u8, types: []const []const u8, sink: ServerEventSink) ?EventSource = null,

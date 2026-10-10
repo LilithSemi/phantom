@@ -127,7 +127,7 @@ pub fn available(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
 /// elsewhere, and every reference to this function sits behind that gate.
 fn keyEventFromLattice(k: lattice.event.KeyEvent) phantom.input.KeyEvent {
     return .{
-        .keysym = @enumFromInt(k.keysym),
+        .keysym = @fromBackingInt(@intCast(k.keysym)),
         .text = k.text,
         .mods = .{
             .shift = k.mods.shift,
@@ -624,12 +624,12 @@ const Fixture = struct {
     session: Session,
 
     fn open(f: *Fixture, gpa: std.mem.Allocator, root: phantom.Root) !void {
-        try phantom.backend.prism.requireRaster(gpa);
         f.threaded = std.Io.Threaded.init(gpa, .{});
         errdefer f.threaded.deinit();
         const io = f.threaded.io();
+        try phantom.backend.prism.requireRaster(gpa, io);
 
-        f.h = try lattice.backends.Headless.init(gpa);
+        f.h = try lattice.backends.Headless.init(gpa, io);
         var ctx = lattice.Context.initWithBackend(f.h.backend());
         errdefer ctx.deinit();
         const surface = try ctx.createSurface(.{

@@ -56,7 +56,7 @@ pub fn new(self: *BuildContext, value: anytype) *@TypeOf(value) {
 
 const SENTINEL_SIZE: usize = 256;
 const SENTINEL_ALIGN: usize = 16;
-var sentinel_buf: [SENTINEL_SIZE]u8 align(SENTINEL_ALIGN) = [_]u8{0} ** SENTINEL_SIZE;
+var sentinel_buf: [SENTINEL_SIZE]u8 align(SENTINEL_ALIGN) = @splat(0);
 
 fn sentinel(comptime T: type) *T {
     if (@sizeOf(T) > SENTINEL_SIZE or @alignOf(T) > SENTINEL_ALIGN) {

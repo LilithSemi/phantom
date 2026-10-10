@@ -115,7 +115,7 @@ const Builder = struct {
             },
             .bullet, .numbered => {
                 try self.flush();
-                const marker = if (l.block == .bullet) "\u{2022}" else try std.fmt.allocPrint(self.b.arena, "{d}.", .{l.number});
+                const marker = if (l.block == .bullet) "\u{2022}" else try self.b.arena.print("{d}.", .{l.number});
                 var spans: std.ArrayList(RichText.Span) = .empty;
                 try self.appendSpans(&spans, l.spans);
                 const gutter = self.td.text_size * 1.5;

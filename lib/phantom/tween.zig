@@ -42,13 +42,13 @@ fn mix(comptime T: type, a: T, b: T, t: f32) T {
         .float => return a + (b - a) * @as(T, @floatCast(t)),
         .@"struct" => |s| {
             var out: T = a;
-            inline for (s.fields) |f| {
-                if (f.type != f32) {
-                    @compileError("Tween(" ++ @typeName(T) ++ "): field '" ++ f.name ++ "' is not f32");
+            inline for (s.field_names, s.field_types) |name, field_type| {
+                if (field_type != f32) {
+                    @compileError("Tween(" ++ @typeName(T) ++ "): field '" ++ name ++ "' is not f32");
                 }
-                const fa = @field(a, f.name);
-                const fb = @field(b, f.name);
-                @field(out, f.name) = fa + (fb - fa) * t;
+                const fa = @field(a, name);
+                const fb = @field(b, name);
+                @field(out, name) = fa + (fb - fa) * t;
             }
             return out;
         },
@@ -102,8 +102,8 @@ test "a tween returns its exact end values at t of 0 and 1" {
 }
 
 test "every curve returns its exact end values at t of 0 and 1" {
-    inline for (@typeInfo(Curve).@"enum".fields) |f| {
-        const curve: Curve = @enumFromInt(f.value);
+    inline for (@typeInfo(Curve).@"enum".field_values) |value| {
+        const curve: Curve = @fromBackingInt(@intCast(value));
         const t = Tween(f32){ .begin = 4, .end = 7, .curve = curve };
         try std.testing.expectEqual(@as(f32, 4), t.at(0));
         try std.testing.expectEqual(@as(f32, 7), t.at(1));
@@ -185,8 +185,8 @@ test "the ease_in_out curves are symmetric about the halfway point" {
 }
 
 test "every curve stays inside 0 to 1 across the whole range" {
-    inline for (@typeInfo(Curve).@"enum".fields) |f| {
-        const curve: Curve = @enumFromInt(f.value);
+    inline for (@typeInfo(Curve).@"enum".field_values) |value| {
+        const curve: Curve = @fromBackingInt(@intCast(value));
         var i: u32 = 0;
         while (i <= 100) : (i += 1) {
             const t = @as(f32, @floatFromInt(i)) / 100.0;
@@ -198,8 +198,8 @@ test "every curve stays inside 0 to 1 across the whole range" {
 
 test "every curve rises without ever going backwards" {
     // A non-monotonic curve makes an animation jitter backwards mid flight.
-    inline for (@typeInfo(Curve).@"enum".fields) |f| {
-        const curve: Curve = @enumFromInt(f.value);
+    inline for (@typeInfo(Curve).@"enum".field_values) |value| {
+        const curve: Curve = @fromBackingInt(@intCast(value));
         var previous: f32 = 0;
         var i: u32 = 1;
         while (i <= 100) : (i += 1) {
