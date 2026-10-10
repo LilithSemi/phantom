@@ -15,7 +15,7 @@
 //!
 //! Enter is left unhandled on purpose. The field does not own the meaning of the
 //! text, so a caller wraps it in a `KeyboardListener` and decides what submitting
-//! means there.
+//! means there. In a field of many lines, Shift and Enter puts in a line break.
 const std = @import("std");
 const phantom = @import("../../phantom.zig");
 const geom = phantom.geometry;
@@ -113,8 +113,22 @@ const RenderCaretText = struct {
     }
 
     /// `layoutParagraph` gives no line after a final line feed. The caret needs
-    /// one to stand on, so this adds an empty line there.
+    /// one to stand on, so this adds an empty line there. A one line field
+    /// keeps all its text on one line, line feeds too.
     fn layoutText(self: *RenderCaretText, wrap_width: f32) !text_layout.Paragraph {
+        if (self.max_lines == 1) {
+            var line = try text_layout.layoutLine(
+                self.gpa,
+                self.font,
+                self.text,
+                self.physical_size,
+                self.text_metrics.*,
+            );
+            errdefer line.deinit(self.gpa);
+            const lines = try self.gpa.alloc(text_layout.Line, 1);
+            lines[0] = line;
+            return .{ .lines = lines, .width = line.width, .height = line.height };
+        }
         var p = try text_layout.layoutParagraph(
             self.gpa,
             self.font,
@@ -156,8 +170,9 @@ const RenderCaretText = struct {
     /// laid out per character, so the glyphs and the code points go in step.
     fn byteAt(self: *const RenderCaretText, line: usize, x: f32) usize {
         const p = self.para orelse return 0;
-        const l = p.lines[@min(line, p.lines.len - 1)];
-        var b = l.end;
+        const n = @min(line, p.lines.len - 1);
+        const l = p.lines[n];
+        var b = self.lineEnd(n);
         var at = l.start;
         for (l.glyphs, 0..) |g, i| {
             if (at >= l.end) break;
@@ -170,6 +185,16 @@ const RenderCaretText = struct {
         }
         const before = grapheme.previousBoundary(self.text, b);
         return if (grapheme.nextBoundary(self.text, before) == b) b else before;
+    }
+
+    /// The last caret position that `lineOf` gives to `line`. Where a word
+    /// broke, the end of the line is the start of the next one, so this is one
+    /// cluster before it.
+    fn lineEnd(self: *const RenderCaretText, line: usize) usize {
+        const p = self.para orelse return 0;
+        const l = p.lines[line];
+        if (line + 1 == p.lines.len or p.lines[line + 1].start > l.end) return l.end;
+        return @max(l.start, grapheme.previousBoundary(self.text, l.end));
     }
 
     /// Takes a new text and caret and lays out again with the last constraints.
@@ -455,6 +480,28 @@ pub const TextFieldController = struct {
         s.caret = if (grapheme.nextBoundary(items, before) == end) end else before;
         s.afterMove();
     }
+
+    /// How many lines the field shows. 1 before it lays out.
+    pub fn lines(self: *const TextFieldController) u16 {
+        const s = self.state orelse return 1;
+        const ro = s.ro orelse return 1;
+        return @max(1, ro.shown_lines);
+    }
+
+    /// True when the caret is on the first visual line, or before layout.
+    pub fn caretOnFirstLine(self: *const TextFieldController) bool {
+        const s = self.state orelse return true;
+        const ro = s.syncedView() orelse return true;
+        return ro.lineOf(s.caret) == 0;
+    }
+
+    /// True when the caret is on the last visual line, or before layout.
+    pub fn caretOnLastLine(self: *const TextFieldController) bool {
+        const s = self.state orelse return true;
+        const ro = s.syncedView() orelse return true;
+        const p = ro.para orelse return true;
+        return ro.lineOf(s.caret) + 1 >= p.lines.len;
+    }
 };
 
 pub const TextField = struct {
@@ -537,6 +584,9 @@ pub const TextField = struct {
         on_lines_change: ?*const fn (ctx: *anyopaque, lines: u16) void = null,
         /// The mounted render object, so line moves can ask it about lines.
         ro: ?*RenderCaretText = null,
+        /// The x that Up and Down aim for, so a short line between two long
+        /// ones does not lose the column. An edit or a sideways move clears it.
+        goal_x: ?f32 = null,
         // The built configs live here so their addresses stay stable across the
         // build, which is what a Widget borrows.
         view: CaretText = undefined,
@@ -669,14 +719,63 @@ pub const TextField = struct {
         }
 
         fn afterEdit(s: *State) void {
+            s.goal_x = null;
             s.showCaret();
             if (s.on_change) |f| f(s.user_ctx, s.buf.items);
             phantom.markNeedsBuild(s);
         }
 
         fn afterMove(s: *State) void {
+            s.goal_x = null;
             s.showCaret();
             phantom.markNeedsBuild(s);
+        }
+
+        /// The render object, laid out again first when the text or the caret
+        /// changed since the last frame. Null when it cannot take the new text.
+        fn syncedView(s: *State) ?*RenderCaretText {
+            const ro = s.ro orelse return null;
+            if (ro.caret != s.caret or !std.mem.eql(u8, ro.text, s.buf.items)) {
+                ro.refresh(s.buf.items, s.caret);
+                if (!std.mem.eql(u8, ro.text, s.buf.items)) return null;
+            }
+            return ro;
+        }
+
+        /// The current visual line, when the field has more than one.
+        fn visualLine(s: *State) ?struct { start: usize, end: usize } {
+            if (s.max_lines <= 1) return null;
+            const ro = s.syncedView() orelse return null;
+            const p = ro.para orelse return null;
+            return .{ .start = p.lines[ro.caret_line].start, .end = ro.lineEnd(ro.caret_line) };
+        }
+
+        /// Puts `typed` in at the caret. A one line field turns each line break
+        /// into a space. A field of many lines turns "\r\n" and "\r" into "\n".
+        fn insertTyped(s: *State, typed: []const u8) bool {
+            const single = s.max_lines <= 1;
+            const has_cr = std.mem.indexOfScalar(u8, typed, '\r') != null;
+            const has_lf = std.mem.indexOfScalar(u8, typed, '\n') != null;
+            if (!has_cr and !(single and has_lf)) return s.insert(typed);
+
+            const gpa = s.base.gpa();
+            var flat: std.ArrayList(u8) = .empty;
+            defer flat.deinit(gpa);
+            flat.ensureTotalCapacity(gpa, typed.len) catch {
+                s.base.sink().report(.oom, "text field could not insert typed text");
+                return false;
+            };
+            var i: usize = 0;
+            while (i < typed.len) : (i += 1) {
+                const c = typed[i];
+                if (c != '\r' and c != '\n') {
+                    flat.appendAssumeCapacity(c);
+                    continue;
+                }
+                if (c == '\r' and i + 1 < typed.len and typed[i + 1] == '\n') i += 1;
+                flat.appendAssumeCapacity(if (single) ' ' else '\n');
+            }
+            return s.insert(flat.items);
         }
 
         // -- callbacks -----------------------------------------------------
@@ -709,13 +808,34 @@ pub const TextField = struct {
                     return true;
                 },
                 .home => {
-                    s.caret = 0;
+                    s.caret = if (s.visualLine()) |l| l.start else 0;
                     s.afterMove();
                     return true;
                 },
                 .end => {
-                    s.caret = s.buf.items.len;
+                    s.caret = if (s.visualLine()) |l| l.end else s.buf.items.len;
                     s.afterMove();
+                    return true;
+                },
+                .enter => {
+                    if (!ev.mods.shift or s.max_lines <= 1) return false;
+                    if (!s.insert("\n")) return true;
+                    s.afterEdit();
+                    return true;
+                },
+                .up, .down => {
+                    if (s.max_lines <= 1) return false;
+                    const ro = s.syncedView() orelse return false;
+                    const p = ro.para orelse return false;
+                    const x = s.goal_x orelse ro.caret_x;
+                    if (ev.keysym == .up) {
+                        s.caret = if (ro.caret_line == 0) 0 else ro.byteAt(ro.caret_line - 1, x);
+                    } else {
+                        s.caret = if (ro.caret_line + 1 >= p.lines.len) s.buf.items.len else ro.byteAt(ro.caret_line + 1, x);
+                    }
+                    s.goal_x = x;
+                    s.showCaret();
+                    phantom.markNeedsBuild(s);
                     return true;
                 },
                 else => {
@@ -724,7 +844,7 @@ pub const TextField = struct {
                     // storage, so `insert` copies it before returning.
                     const typed = ev.text orelse return false;
                     if (typed.len == 0) return false;
-                    if (!s.insert(typed)) return true;
+                    if (!s.insertTyped(typed)) return true;
                     s.afterEdit();
                     return true;
                 },
@@ -1448,4 +1568,224 @@ test "on_lines_change reports each change once" {
 
     try m.h.pump();
     try std.testing.expectEqual(@as(u32, 2), spy.calls);
+}
+
+fn focusLoose(h: *testing.Harness) !void {
+    try h.collectFocus();
+    h.focus.focusNext();
+}
+
+fn fieldState(h: *testing.Harness) !*TextField.State {
+    return h.stateOf(testing.find.byType(TextField), TextField.State);
+}
+
+test "a single-line field draws text with a newline on one line" {
+    const gpa = std.testing.allocator;
+    var field = TextField{ .text = "a\nb" };
+    var f = try Fixture.init(gpa, &field);
+    defer f.deinit();
+    f.harness.viewport = .{ .width = 200, .height = 40 };
+    try f.harness.pump();
+
+    const prims = f.harness.canvas.list.primitives.items;
+    try std.testing.expectEqual(@as(usize, 1), prims.len);
+    try std.testing.expectEqualStrings("a\nb", prims[0].text.text);
+    try std.testing.expectEqualStrings("a\nb", (try f.state()).value());
+}
+
+test "shift and enter inserts a newline in a multi-line field" {
+    const gpa = std.testing.allocator;
+    var field = TextField{ .text = "ab", .max_lines = 3 };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+    try focusLoose(&m.h);
+
+    const s = try fieldState(&m.h);
+    try std.testing.expect(!m.h.focus.dispatch(.{ .keysym = .enter }));
+    try std.testing.expectEqualStrings("ab", s.value());
+    try std.testing.expect(m.h.focus.dispatch(.{ .keysym = .enter, .mods = .{ .shift = true } }));
+    try std.testing.expectEqualStrings("ab\n", s.value());
+}
+
+test "shift and enter does nothing in a single-line field" {
+    const gpa = std.testing.allocator;
+    var field = TextField{ .text = "ab" };
+    var f = try Fixture.init(gpa, &field);
+    defer f.deinit();
+    try f.focus();
+
+    _ = f.manager.dispatch(.{ .keysym = .enter, .mods = .{ .shift = true } });
+    try std.testing.expectEqualStrings("ab", (try f.state()).value());
+}
+
+test "up and down move one visual line and keep the column" {
+    const gpa = std.testing.allocator;
+    var controller = TextFieldController{};
+    var field = TextField{ .text = "abcdef\nab\nabcdef", .max_lines = 3, .controller = &controller };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+    try focusLoose(&m.h);
+    controller.setCaret(4);
+    try m.h.pump();
+
+    _ = m.h.focus.dispatch(.{ .keysym = .down });
+    try std.testing.expectEqual(@as(usize, 9), controller.caret());
+    try m.h.pump();
+    _ = m.h.focus.dispatch(.{ .keysym = .down });
+    try std.testing.expectEqual(@as(usize, 14), controller.caret());
+}
+
+test "up on the first line goes to the start, down on the last goes to the end" {
+    const gpa = std.testing.allocator;
+    var controller = TextFieldController{};
+    var field = TextField{ .text = "abc\ndef", .max_lines = 3, .controller = &controller };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+    try focusLoose(&m.h);
+    controller.setCaret(5);
+    try m.h.pump();
+
+    _ = m.h.focus.dispatch(.{ .keysym = .up });
+    try std.testing.expectEqual(@as(usize, 1), controller.caret());
+    _ = m.h.focus.dispatch(.{ .keysym = .up });
+    try std.testing.expectEqual(@as(usize, 0), controller.caret());
+    // The goal column stays from before the jump to the start.
+    _ = m.h.focus.dispatch(.{ .keysym = .down });
+    try std.testing.expectEqual(@as(usize, 5), controller.caret());
+    _ = m.h.focus.dispatch(.{ .keysym = .down });
+    try std.testing.expectEqual(@as(usize, 7), controller.caret());
+}
+
+test "up and down stay on the target line where a word broke" {
+    const gpa = std.testing.allocator;
+    var controller = TextFieldController{};
+    // Nine cells fit a line, so each line breaks inside the word.
+    var field = TextField{ .text = "abcdefghijklmnopqrstuvwxyzA", .max_lines = 3, .controller = &controller };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+    try focusLoose(&m.h);
+    const ro = try fieldRo(&m.h);
+
+    _ = m.h.focus.dispatch(.{ .keysym = .up });
+    try std.testing.expectEqual(@as(usize, 1), ro.lineOf(controller.caret()));
+    _ = m.h.focus.dispatch(.{ .keysym = .up });
+    try std.testing.expectEqual(@as(usize, 0), ro.lineOf(controller.caret()));
+    _ = m.h.focus.dispatch(.{ .keysym = .down });
+    try std.testing.expectEqual(@as(usize, 1), ro.lineOf(controller.caret()));
+}
+
+test "home and end work on the visual line" {
+    const gpa = std.testing.allocator;
+    var controller = TextFieldController{};
+    var field = TextField{ .text = "alpha beta gamma", .max_lines = 3, .controller = &controller };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+    try focusLoose(&m.h);
+    controller.setCaret(8);
+
+    _ = m.h.focus.dispatch(.{ .keysym = .home });
+    try std.testing.expectEqual(@as(usize, 6), controller.caret());
+    _ = m.h.focus.dispatch(.{ .keysym = .end });
+    try std.testing.expectEqual(@as(usize, 10), controller.caret());
+}
+
+test "on_key still sees up, down and enter first" {
+    const gpa = std.testing.allocator;
+    const Owner = struct {
+        seen: u32 = 0,
+        fn onKey(ctx: *anyopaque, ev: input.KeyEvent) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev.keysym) {
+                .up, .down, .enter, .escape => {
+                    self.seen += 1;
+                    return true;
+                },
+                else => return false,
+            }
+        }
+    };
+    var owner = Owner{};
+    var controller = TextFieldController{};
+    var field = TextField{
+        .text = "ab\ncd",
+        .max_lines = 3,
+        .on_key = Owner.onKey,
+        .ctx = &owner,
+        .controller = &controller,
+    };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+    try focusLoose(&m.h);
+
+    _ = m.h.focus.dispatch(.{ .keysym = .up });
+    _ = m.h.focus.dispatch(.{ .keysym = .down });
+    _ = m.h.focus.dispatch(.{ .keysym = .enter, .mods = .{ .shift = true } });
+    _ = m.h.focus.dispatch(.{ .keysym = .escape });
+    try std.testing.expectEqual(@as(u32, 4), owner.seen);
+    try std.testing.expectEqual(@as(usize, 5), controller.caret());
+    try std.testing.expectEqualStrings("ab\ncd", controller.text());
+    try std.testing.expect((try fieldState(&m.h)).focused);
+}
+
+test "a paste keeps newlines in a multi-line field and flattens them in a single-line one" {
+    const gpa = std.testing.allocator;
+    {
+        var field = TextField{ .max_lines = 3 };
+        var m = try mountLoose(gpa, &field);
+        defer freeLoose(gpa, &m.h, m.col);
+        try m.h.pump();
+        try focusLoose(&m.h);
+        _ = m.h.focus.dispatch(.{ .keysym = .no_symbol, .text = "a\r\nb\nc" });
+        try std.testing.expectEqualStrings("a\nb\nc", (try fieldState(&m.h)).value());
+    }
+    {
+        var field = TextField{};
+        var f = try Fixture.init(gpa, &field);
+        defer f.deinit();
+        try f.focus();
+        f.typeText("a\r\nb\nc");
+        try std.testing.expectEqualStrings("a b c", (try f.state()).value());
+    }
+}
+
+test "the controller reports lines and the caret's first and last line" {
+    const gpa = std.testing.allocator;
+    var controller = TextFieldController{};
+    try std.testing.expectEqual(@as(u16, 1), controller.lines());
+    try std.testing.expect(controller.caretOnFirstLine());
+    try std.testing.expect(controller.caretOnLastLine());
+
+    var field = TextField{ .text = "a\nb\nc", .max_lines = 3, .controller = &controller };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+
+    try std.testing.expectEqual(@as(u16, 3), controller.lines());
+    try std.testing.expect(controller.caretOnLastLine());
+    try std.testing.expect(!controller.caretOnFirstLine());
+
+    controller.setCaret(0);
+    try std.testing.expect(controller.caretOnFirstLine());
+    try std.testing.expect(!controller.caretOnLastLine());
+}
+
+test "two keys between frames still move by line" {
+    const gpa = std.testing.allocator;
+    var controller = TextFieldController{};
+    var field = TextField{ .text = "abc\ndef\nghi", .max_lines = 3, .controller = &controller };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+    try focusLoose(&m.h);
+    controller.setCaret(1);
+
+    _ = m.h.focus.dispatch(.{ .keysym = .down });
+    _ = m.h.focus.dispatch(.{ .keysym = .down });
+    try std.testing.expectEqual(@as(usize, 9), controller.caret());
 }
