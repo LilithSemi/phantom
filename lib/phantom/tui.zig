@@ -1227,9 +1227,12 @@ pub const Session = struct {
                     }
                     _ = self.focus_mgr.dispatch(k);
                 },
-                // Nothing consumes a paste yet. It is decoded so a text field
-                // can take it later with no protocol change.
-                .paste => {},
+                // One key event carries the whole paste, as on the web backend.
+                // The text borrows decoder storage until the next `next` call,
+                // and the focused field copies it before then.
+                .paste => |text| {
+                    if (text.len > 0) _ = self.focus_mgr.dispatch(.{ .keysym = .no_symbol, .text = text });
+                },
                 .resize => |s| {
                     // A forced size is the caller's to change, so a report from
                     // the terminal is decoded and then ignored.
@@ -1868,6 +1871,36 @@ test "feed larger than the decoder's buffer is chunked, so a long paste cannot s
     // through and still stops the session.
     h.session.feed("\x03");
     try std.testing.expect(!try h.session.step());
+}
+
+test "a bracketed paste reaches the focused text field with its newlines" {
+    const gpa = std.testing.allocator;
+    const Prompt = struct {
+        controller: phantom.TextFieldController = .{},
+
+        fn build(ctx: *phantom.BuildContext, self: *@This()) phantom.Widget {
+            return ctx.new(phantom.TextField{
+                .id = "prompt",
+                .max_lines = 3,
+                .controller = &self.controller,
+            }).widget();
+        }
+    };
+    var prompt = Prompt{};
+    const h = try Headless.open(
+        gpa,
+        "paste",
+        "",
+        phantom.Root.of(Prompt, Prompt.build, &prompt),
+        headlessOpts(.stop),
+    );
+    defer h.close();
+
+    try std.testing.expect(try h.session.step());
+    try std.testing.expect(h.session.focus_mgr.focusById("prompt"));
+    h.session.feed("\x1b[200~a\nb\x1b[201~");
+    try std.testing.expect(try h.session.step());
+    try std.testing.expectEqualStrings("a\nb", prompt.controller.text());
 }
 
 test "a relative band moves with the cursor instead of naming a screen row" {

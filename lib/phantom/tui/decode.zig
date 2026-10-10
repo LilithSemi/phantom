@@ -439,6 +439,9 @@ pub const Decoder = struct {
         // and discarded instead: a stray reply is a well formed sequence, not
         // garbage, and not a key.
         if (std.mem.indexOfScalar(u8, "]P^X_", b[1]) != null) return self.parseStringSeq();
+        if (b[1] == '\r' or b[1] == '\n') {
+            return .{ .consumed = 2, .event = .{ .key = .{ .keysym = .enter, .mods = .{ .alt = true } } } };
+        }
         // ESC then a printable byte is the alt modifier on that key. Alt held means
         // a shortcut, so it carries no text.
         const cp = b[1];
@@ -995,6 +998,15 @@ test "an escape prefixed letter is the alt modifier" {
     const ev = d.next().?;
     try std.testing.expectEqual(input.Keysym.fromCodepoint('a'), ev.key.keysym);
     try std.testing.expect(ev.key.mods.alt);
+}
+
+test "an escape before a carriage return is alt and enter" {
+    var d = Decoder{};
+    d.feed("\x1b\r");
+    const ev = d.next().?;
+    try std.testing.expectEqual(input.Keysym.enter, ev.key.keysym);
+    try std.testing.expect(ev.key.mods.alt);
+    try std.testing.expect(ev.key.text == null);
 }
 
 test "a lone escape byte decodes as the escape key" {

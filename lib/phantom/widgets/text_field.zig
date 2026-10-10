@@ -14,8 +14,8 @@
 //!     advance under the GPU's proportional ones.
 //!
 //! Enter is left unhandled on purpose. The field does not own the meaning of the
-//! text, so a caller wraps it in a `KeyboardListener` and decides what submitting
-//! means there. In a field of many lines, Shift and Enter puts in a line break.
+//! text, so a caller handles Enter in `on_key` to submit. In a field of many
+//! lines, Shift and Enter or Alt and Enter puts in a line break.
 const std = @import("std");
 const phantom = @import("../../phantom.zig");
 const geom = phantom.geometry;
@@ -82,6 +82,9 @@ const RenderCaretText = struct {
     placeholder: []const u8 = "",
     placeholder_color: geom.Color = undefined,
     placeholder_line: ?text_layout.Line = null,
+    /// The placeholder glyphs and bytes that fit inside the box.
+    placeholder_glyphs: usize = 0,
+    placeholder_end: usize = 0,
     /// How far the view has scrolled right, in physical units. Kept across
     /// layouts so a caret that is already visible does not jump. Only a one
     /// line field scrolls sideways.
@@ -95,6 +98,9 @@ const RenderCaretText = struct {
     physical_caret_width: f32 = 0,
     line_height: f32 = 0,
     shown_lines: u16 = 0,
+    /// The lines that fit in the box the parent gave. A tight parent can give
+    /// fewer than `shown_lines`.
+    visible_lines: u16 = 1,
     lines_cb: ?*const fn (ctx: *anyopaque, lines: u16) void = null,
     lines_ctx: *anyopaque = undefined,
     /// The constraints of the last layout, so `refresh` can lay out again
@@ -201,11 +207,13 @@ const RenderCaretText = struct {
     /// The State calls this before a line move when its buffer changed since
     /// the last frame. On a failed copy the old text stays.
     fn refresh(self: *RenderCaretText, text: []const u8, caret: usize) void {
-        const owned = self.gpa.dupe(u8, text) catch return;
-        self.gpa.free(self.text);
-        self.text = owned;
-        self.caret = @min(caret, owned.len);
-        if (self.last_constraints) |c| _ = layoutFn(&self.base, c);
+        if (!std.mem.eql(u8, self.text, text)) {
+            const owned = self.gpa.dupe(u8, text) catch return;
+            self.gpa.free(self.text);
+            self.text = owned;
+        }
+        self.caret = @min(caret, self.text.len);
+        if (self.last_constraints) |c| self.base.size = layoutFn(&self.base, c);
     }
 
     fn layoutFn(base: *RenderObject, c: layout.BoxConstraints) geom.PhysicalSize {
@@ -247,10 +255,13 @@ const RenderCaretText = struct {
         // its natural width. Everywhere else it fills what it was offered.
         const width = if (std.math.isInf(c.max_width)) p.width + self.physical_caret_width else c.max_width;
         const size = c.constrain(.{ .width = width, .height = height });
+        const fit: f32 = if (self.line_height > 0) @floor(size.height / self.line_height) else 1;
+        const visible: u16 = @intFromFloat(std.math.clamp(fit, 1, @as(f32, @floatFromInt(shown))));
+        self.visible_lines = visible;
 
         if (self.caret_line < self.first_line) self.first_line = self.caret_line;
-        if (self.caret_line >= self.first_line + shown) self.first_line = self.caret_line + 1 - shown;
-        self.first_line = @min(self.first_line, p.lines.len -| shown);
+        if (self.caret_line >= self.first_line + visible) self.first_line = self.caret_line + 1 - visible;
+        self.first_line = @min(self.first_line, p.lines.len -| visible);
 
         if (self.max_lines == 1) {
             // Keep the caret inside the view. A long prompt in a narrow field
@@ -275,6 +286,7 @@ const RenderCaretText = struct {
                 self.physical_size,
                 self.text_metrics.*,
             ) catch null;
+            if (self.placeholder_line) |l| self.clipPlaceholder(l, size.width);
         }
 
         if (shown != self.shown_lines) {
@@ -284,10 +296,28 @@ const RenderCaretText = struct {
         return size;
     }
 
+    /// A field of many lines draws only the placeholder glyphs that fit in
+    /// `width`. A one line field draws all of it, as it does its text.
+    fn clipPlaceholder(self: *RenderCaretText, l: text_layout.Line, width: f32) void {
+        self.placeholder_glyphs = l.glyphs.len;
+        self.placeholder_end = self.placeholder.len;
+        if (self.max_lines == 1) return;
+        var at: usize = 0;
+        for (l.glyphs, 0..) |_, i| {
+            const right = if (i + 1 < l.glyphs.len) l.glyphs[i + 1].x else l.width;
+            if (right > width or at >= self.placeholder.len) {
+                self.placeholder_glyphs = i;
+                self.placeholder_end = at;
+                return;
+            }
+            at += std.unicode.utf8ByteSequenceLength(self.placeholder[at]) catch 1;
+        }
+    }
+
     fn paintFn(base: *RenderObject, cv: *Canvas, offset: geom.PhysicalOffset) anyerror!void {
         const self: *RenderCaretText = @fieldParentPtr("base", base);
         const p = self.para orelse return;
-        const last = @min(self.first_line + self.shown_lines, p.lines.len);
+        const last = @min(self.first_line + self.visible_lines, p.lines.len);
         // The caret goes down first so a glyph under a block caret still reads.
         if (self.caret_visible and self.caret_line >= self.first_line and self.caret_line < last) {
             const row: f32 = @floatFromInt(self.caret_line - self.first_line);
@@ -314,9 +344,10 @@ const RenderCaretText = struct {
             });
         }
         if (self.placeholder_line) |l| {
+            if (self.placeholder_glyphs == 0) return;
             try cv.drawText(.{
-                .glyphs = l.glyphs,
-                .text = self.placeholder,
+                .glyphs = l.glyphs[0..self.placeholder_glyphs],
+                .text = self.placeholder[0..self.placeholder_end],
                 .font = @ptrCast(self.font),
                 .size = self.physical_size,
                 .color = self.placeholder_color,
@@ -481,7 +512,17 @@ pub const TextFieldController = struct {
         s.afterMove();
     }
 
-    /// How many lines the field shows. 1 before it lays out.
+    /// Puts `new_text` in at the caret and moves the caret after it. Line
+    /// breaks change as in a paste. `on_change` fires.
+    pub fn insert(self: *TextFieldController, new_text: []const u8) error{OutOfMemory}!void {
+        const s = self.state orelse return;
+        if (new_text.len == 0) return;
+        try s.insertText(new_text);
+        s.afterEdit();
+    }
+
+    /// How many lines the field shows, from the last layout. That is the value
+    /// a row split needs. 1 before it lays out.
     pub fn lines(self: *const TextFieldController) u16 {
         const s = self.state orelse return 1;
         const ro = s.ro orelse return 1;
@@ -489,6 +530,8 @@ pub const TextFieldController = struct {
     }
 
     /// True when the caret is on the first visual line, or before layout.
+    /// A change since the last frame makes this lay the field out again, which
+    /// can call `on_lines_change` from inside this read.
     pub fn caretOnFirstLine(self: *const TextFieldController) bool {
         const s = self.state orelse return true;
         const ro = s.syncedView() orelse return true;
@@ -496,6 +539,7 @@ pub const TextFieldController = struct {
     }
 
     /// True when the caret is on the last visual line, or before layout.
+    /// It can call `on_lines_change` as `caretOnFirstLine` does.
     pub fn caretOnLastLine(self: *const TextFieldController) bool {
         const s = self.state orelse return true;
         const ro = s.syncedView() orelse return true;
@@ -687,15 +731,6 @@ pub const TextField = struct {
 
         // -- editing -------------------------------------------------------
 
-        fn insert(s: *State, bytes: []const u8) bool {
-            s.buf.insertSlice(s.base.gpa(), s.caret, bytes) catch {
-                s.base.sink().report(.oom, "text field could not insert typed text");
-                return false;
-            };
-            s.caret += bytes.len;
-            return true;
-        }
-
         fn backspace(s: *State) bool {
             if (s.caret == 0) return false; // no edit, and no unsigned underflow
             const start = grapheme.previousBoundary(s.buf.items, s.caret);
@@ -752,19 +787,20 @@ pub const TextField = struct {
 
         /// Puts `typed` in at the caret. A one line field turns each line break
         /// into a space. A field of many lines turns "\r\n" and "\r" into "\n".
-        fn insertTyped(s: *State, typed: []const u8) bool {
+        fn insertText(s: *State, typed: []const u8) error{OutOfMemory}!void {
+            const gpa = s.base.gpa();
             const single = s.max_lines <= 1;
             const has_cr = std.mem.indexOfScalar(u8, typed, '\r') != null;
             const has_lf = std.mem.indexOfScalar(u8, typed, '\n') != null;
-            if (!has_cr and !(single and has_lf)) return s.insert(typed);
+            if (!has_cr and !(single and has_lf)) {
+                try s.buf.insertSlice(gpa, s.caret, typed);
+                s.caret += typed.len;
+                return;
+            }
 
-            const gpa = s.base.gpa();
             var flat: std.ArrayList(u8) = .empty;
             defer flat.deinit(gpa);
-            flat.ensureTotalCapacity(gpa, typed.len) catch {
-                s.base.sink().report(.oom, "text field could not insert typed text");
-                return false;
-            };
+            try flat.ensureTotalCapacity(gpa, typed.len);
             var i: usize = 0;
             while (i < typed.len) : (i += 1) {
                 const c = typed[i];
@@ -775,7 +811,16 @@ pub const TextField = struct {
                 if (c == '\r' and i + 1 < typed.len and typed[i + 1] == '\n') i += 1;
                 flat.appendAssumeCapacity(if (single) ' ' else '\n');
             }
-            return s.insert(flat.items);
+            try s.buf.insertSlice(gpa, s.caret, flat.items);
+            s.caret += flat.items.len;
+        }
+
+        fn insertTyped(s: *State, typed: []const u8) bool {
+            s.insertText(typed) catch {
+                s.base.sink().report(.oom, "text field could not insert typed text");
+                return false;
+            };
+            return true;
         }
 
         // -- callbacks -----------------------------------------------------
@@ -818,8 +863,11 @@ pub const TextField = struct {
                     return true;
                 },
                 .enter => {
-                    if (!ev.mods.shift or s.max_lines <= 1) return false;
-                    if (!s.insert("\n")) return true;
+                    // Alt and Enter is the second line break key, because a
+                    // terminal without the kitty protocol sends Shift and Enter
+                    // as a plain Enter.
+                    if (!(ev.mods.shift or ev.mods.alt) or s.max_lines <= 1) return false;
+                    if (!s.insertTyped("\n")) return true;
                     s.afterEdit();
                     return true;
                 },
@@ -1415,10 +1463,16 @@ test "characterCount counts characters and not bytes" {
 }
 
 /// Mounts `field` inside a Column, so its height is loose and it can grow.
-fn mountLoose(gpa: std.mem.Allocator, field: *const TextField) !struct { h: testing.Harness, col: *phantom.widgets.Flex } {
+const Loose = struct { h: testing.Harness, col: *phantom.widgets.Flex };
+
+fn mountLoose(gpa: std.mem.Allocator, field: *const TextField) !Loose {
+    return mountLooseWidget(gpa, field.widget());
+}
+
+fn mountLooseWidget(gpa: std.mem.Allocator, child: Widget) !Loose {
     const col = try gpa.create(phantom.widgets.Flex);
     errdefer gpa.destroy(col);
-    const children = try gpa.dupe(Widget, &.{field.widget()});
+    const children = try gpa.dupe(Widget, &.{child});
     errdefer gpa.free(children);
     col.* = phantom.Column(.{ .children = children });
     var h = try testing.mount(gpa, col.widget());
@@ -1672,10 +1726,13 @@ test "up and down stay on the target line where a word broke" {
 
     _ = m.h.focus.dispatch(.{ .keysym = .up });
     try std.testing.expectEqual(@as(usize, 1), ro.lineOf(controller.caret()));
+    try std.testing.expectEqual(@as(usize, 17), controller.caret());
     _ = m.h.focus.dispatch(.{ .keysym = .up });
     try std.testing.expectEqual(@as(usize, 0), ro.lineOf(controller.caret()));
+    try std.testing.expectEqual(@as(usize, 8), controller.caret());
     _ = m.h.focus.dispatch(.{ .keysym = .down });
     try std.testing.expectEqual(@as(usize, 1), ro.lineOf(controller.caret()));
+    try std.testing.expectEqual(@as(usize, 17), controller.caret());
 }
 
 test "home and end work on the visual line" {
@@ -1788,4 +1845,125 @@ test "two keys between frames still move by line" {
     _ = m.h.focus.dispatch(.{ .keysym = .down });
     _ = m.h.focus.dispatch(.{ .keysym = .down });
     try std.testing.expectEqual(@as(usize, 9), controller.caret());
+}
+
+test "a field under a tight parent paints and scrolls inside its box" {
+    const gpa = std.testing.allocator;
+    const Spy = struct {
+        last: u16 = 0,
+        fn onLines(ctx: *anyopaque, lines: u16) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.last = lines;
+        }
+    };
+    var spy = Spy{};
+    var field = TextField{ .text = "a\nb", .max_lines = 3, .on_lines_change = Spy.onLines, .ctx = &spy };
+    var box = phantom.SizedBox{ .height = 16, .child = field.widget() };
+    var m = try mountLooseWidget(gpa, box.widget());
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+    try focusLoose(&m.h);
+    try m.h.pump();
+
+    var runs: usize = 0;
+    var caret: ?geom.PhysicalRect = null;
+    for (m.h.canvas.list.primitives.items) |p| switch (p) {
+        .text => |t| {
+            runs += 1;
+            try std.testing.expectEqualStrings("b", t.text);
+        },
+        .rrect => |r| caret = r.rect,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), runs);
+    const rect = caret orelse return error.NoCaret;
+    try std.testing.expect(rect.y >= 0);
+    try std.testing.expect(rect.y + rect.height <= 16);
+    try std.testing.expectEqual(@as(u16, 2), spy.last);
+}
+
+test "alt and enter inserts a newline in a multi-line field" {
+    const gpa = std.testing.allocator;
+    var field = TextField{ .text = "ab", .max_lines = 3 };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+    try focusLoose(&m.h);
+
+    try std.testing.expect(m.h.focus.dispatch(.{ .keysym = .enter, .mods = .{ .alt = true } }));
+    try std.testing.expectEqualStrings("ab\n", (try fieldState(&m.h)).value());
+}
+
+test "alt and enter does nothing in a single-line field" {
+    const gpa = std.testing.allocator;
+    var field = TextField{ .text = "ab" };
+    var f = try Fixture.init(gpa, &field);
+    defer f.deinit();
+    try f.focus();
+
+    _ = f.manager.dispatch(.{ .keysym = .enter, .mods = .{ .alt = true } });
+    try std.testing.expectEqualStrings("ab", (try f.state()).value());
+}
+
+test "a controller inserts at the caret like a paste" {
+    const gpa = std.testing.allocator;
+    var controller = TextFieldController{};
+    try controller.insert("ignored");
+
+    var recorder = Recorder{};
+    var field = TextField{
+        .text = "ac",
+        .max_lines = 3,
+        .controller = &controller,
+        .on_change = Recorder.onChange,
+        .ctx = &recorder,
+    };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+
+    controller.setCaret(1);
+    try controller.insert("b\r\n");
+    try std.testing.expectEqualStrings("ab\nc", controller.text());
+    try std.testing.expectEqual(@as(usize, 3), controller.caret());
+    try std.testing.expectEqual(@as(u32, 1), recorder.calls);
+    try std.testing.expectEqualStrings("ab\nc", recorder.text());
+}
+
+test "a line query after a caret move keeps the text and updates the size" {
+    const gpa = std.testing.allocator;
+    var controller = TextFieldController{};
+    var field = TextField{ .text = "a", .max_lines = 3, .controller = &controller };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+    const ro = try fieldRo(&m.h);
+
+    const before = ro.text.ptr;
+    controller.setCaret(0);
+    try std.testing.expect(controller.caretOnFirstLine());
+    try std.testing.expectEqual(before, ro.text.ptr);
+
+    try controller.setText("a\nb");
+    try std.testing.expect(controller.caretOnLastLine());
+    try std.testing.expectEqual(@as(f32, 32), ro.base.size.height);
+}
+
+test "a long placeholder stays inside a narrow multi-line field" {
+    const gpa = std.testing.allocator;
+    var field = TextField{ .max_lines = 3, .placeholder = "Type a message for the agent" };
+    var m = try mountLoose(gpa, &field);
+    defer freeLoose(gpa, &m.h, m.col);
+    try m.h.pump();
+
+    var runs: usize = 0;
+    for (m.h.canvas.list.primitives.items) |p| switch (p) {
+        .text => |t| {
+            runs += 1;
+            const last = t.glyphs[t.glyphs.len - 1];
+            try std.testing.expect(t.origin.x + last.x + 8 <= 80);
+        },
+        else => {},
+    };
+    try std.testing.expect(runs > 0);
 }
