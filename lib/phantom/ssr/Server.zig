@@ -2,6 +2,7 @@
 //! gets that file. Any other path under the base is a page: the server renders
 //! it with `ssr.render` at the size the browser reports. A missing file with an
 //! extension the server knows, such as "favicon.ico", gets 404 and no render.
+//! So does a route that ends in ".html".
 //!
 //! Every request renders fresh, also for a route the build prerendered. A
 //! prerendered page has the default size only, and a fresh page has the size,
@@ -642,7 +643,9 @@ fn hostName(buf: []u8, value: []const u8) ?[]const u8 {
 }
 
 /// The content type of a file name, or null for an extension this server
-/// does not know. A missing file of a known type answers 404 with no render.
+/// does not know. The case of the extension does not matter. A missing file
+/// of a known type answers 404 with no render, so a route that ends in
+/// ".html" answers 404.
 fn fileType(path: []const u8) ?[]const u8 {
     const types = [_]struct { []const u8, []const u8 }{
         .{ ".html", "text/html; charset=utf-8" },
@@ -667,7 +670,7 @@ fn fileType(path: []const u8) ?[]const u8 {
         .{ ".woff2", "font/woff2" },
     };
     for (types) |t| {
-        if (std.mem.endsWith(u8, path, t[0])) return t[1];
+        if (std.ascii.endsWithIgnoreCase(path, t[0])) return t[1];
     }
     return null;
 }
@@ -1159,7 +1162,7 @@ test "a missing file with an extension answers 404 and renders no page" {
     var site: TestSite = undefined;
     try site.init(.plain(routerRoot));
     defer site.deinit();
-    for ([_][]const u8{ "/favicon.ico", "/robots.txt", "/missing.js", "/fonts/none.otf", "/a/b.png", "/x.wasm", "/C:/x.css" }) |target| {
+    for ([_][]const u8{ "/favicon.ico", "/FAVICON.ICO", "/robots.txt", "/missing.js", "/fonts/none.otf", "/a/b.Png", "/x.wasm", "/C:/x.css", "/about.html" }) |target| {
         const reply = try site.get(target);
         defer reply.deinit();
         try std.testing.expectEqual(@as(u16, 404), reply.status());

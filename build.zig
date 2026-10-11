@@ -460,13 +460,13 @@ fn addDistFile(b: *std.Build, files: *std.ArrayList([]const u8), rel: []const u8
 // loopback only. All three read the dir from the PHANTOM_SERVE_DIR env var
 // (node/bun `-e` eval mode does not expose a positional arg at a stable argv
 // index, so an env var is used uniformly).
-// Content-Type: .wasm -> application/wasm, .js -> text/javascript,
+// Content-Type: .wasm -> application/wasm, .js and .mjs -> text/javascript,
 // .html -> text/html, .css -> text/css, .otf -> font/otf, anything else ->
 // application/octet-stream.
-// A path with no file extension is a route, not a file, so it maps to that
-// path's own index.html, the page addWebApp prerenders for it. A route with
-// no prerendered page gets shell.html, so the app boots there with no content
-// from another route.
+// Each script tries the file, then the index.html in that path, the page
+// addWebApp prerenders for a route. A path with no prerendered page gets
+// shell.html, so the app boots there with no content from another route. A
+// path whose extension is in the asset list of ssr.Server gets 404 instead.
 // Each script resolves the request against the served root and refuses a
 // path that escapes it (a "../" walk answers 404), so a client cannot read
 // files elsewhere on the developer's disk.
