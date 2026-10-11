@@ -47,8 +47,13 @@ pub const WebApp = struct {
     /// The fonts already registered with the browser, so each is registered
     /// once. Page-lifetime, because a face registered on one frame has to still
     /// count as registered on the next.
-    fonts_seen: [max_fonts]*const phantom.text.Font = undefined,
+    /// Kept by `text.Font.id`, because two loads of one file are one face.
+    fonts_seen: [max_fonts]u64 = undefined,
     fonts_seen_len: usize = 0,
+    /// True when a server rendered the page. A font with no url then comes
+    /// from the file the server serves, never from a `data:` url that
+    /// `font-src 'self'` refuses.
+    fonts_served: bool = false,
     /// The scroll regions of the last frame. Lives for the whole page.
     /// `scrollChanged` finds the view of a region here.
     scroll_mem: phantom.backend.dom_calls.ScrollMemory = .{},
@@ -122,11 +127,7 @@ pub const WebApp = struct {
         defer self.gpa.free(fonts);
 
         for (fonts) |font_ptr| {
-            var already = false;
-            for (self.fonts_seen[0..self.fonts_seen_len]) |seen| {
-                if (seen == font_ptr) already = true;
-            }
-            if (already) continue;
+            if (self.fontSeen(font_ptr.id)) continue;
             if (self.fonts_seen_len == self.fonts_seen.len) {
                 // Bounded on purpose. A tree with more distinct fonts than this
                 // is a mistake worth reporting rather than a case worth growing
@@ -137,7 +138,8 @@ pub const WebApp = struct {
 
             var fam: [phantom.backend.dom_calls.family_len]u8 = undefined;
             const family = phantom.backend.dom_calls.fontFamily(&fam, font_ptr);
-            const src = phantom.backend.dom_calls.fontSrc(self.gpa, self.ops.base, font_ptr) catch {
+            const no_url: phantom.backend.dom_calls.NoUrl = if (self.fonts_served) .file else .embed;
+            const src = phantom.backend.dom_calls.fontSrc(self.gpa, self.ops.base, font_ptr, no_url) catch {
                 self.sink.report(.oom, "a font source could not be built");
                 return;
             };
@@ -149,7 +151,40 @@ pub const WebApp = struct {
             var rule_buf: [512]u8 = undefined;
             self.ops.addFont(&rule_buf, family, src);
 
-            self.fonts_seen[self.fonts_seen_len] = font_ptr;
+            self.fonts_seen[self.fonts_seen_len] = font_ptr.id;
+            self.fonts_seen_len += 1;
+        }
+    }
+
+    fn fontSeen(self: *const WebApp, id: u64) bool {
+        for (self.fonts_seen[0..self.fonts_seen_len]) |seen| {
+            if (seen == id) return true;
+        }
+        return false;
+    }
+
+    /// Adopt the page a server rendered as the last frame. The view must be
+    /// at the size the server rendered. See `dom_calls.hydrate`.
+    fn hydrate(self: *WebApp) void {
+        var canvas = phantom.Canvas.init(self.gpa);
+        canvas.sink = self.sink;
+        defer canvas.deinit();
+        defer _ = self.arena.reset(.retain_capacity);
+        if (!self.frame(&canvas)) return;
+        const adopted = phantom.backend.dom_calls.hydrate(self.gpa, self.ops, canvas.list, self.viewport(), background, self.sink, &self.page) catch |err| {
+            self.sink.report(.render_failed, @errorName(err));
+            return;
+        };
+        if (!adopted) return;
+
+        // The server sheet already declares a face for each font of this
+        // frame, so the page does not add a second one.
+        const fonts = phantom.backend.dom.collectFonts(self.gpa, canvas.list) catch return;
+        defer self.gpa.free(fonts);
+        for (fonts) |font_ptr| {
+            if (self.fonts_seen_len == self.fonts_seen.len) return;
+            if (self.fontSeen(font_ptr.id)) continue;
+            self.fonts_seen[self.fonts_seen_len] = font_ptr.id;
             self.fonts_seen_len += 1;
         }
     }
@@ -871,8 +906,19 @@ pub fn init(
     device_pixel_ratio: f32,
     strategy: phantom.UrlStrategy,
 ) !*WebApp {
-    const app = try mount(gpa, ops, root, logical_viewport, device_pixel_ratio, strategy);
+    // A page a server rendered is adopted. Its first frame is at the size the
+    // server rendered, so it has the server's shape, and the render at the
+    // real size below patches what differs.
+    const served = servedSize(ops);
+    const first_size = switch (served) {
+        .size => |s| s,
+        .none, .unusable => logical_viewport,
+    };
+    const app = try mount(gpa, ops, root, first_size, device_pixel_ratio, strategy);
     errdefer app.deinit();
+    if (served == .unusable) app.sink.report(.hydrate_mismatch, "the server page names a size that is not usable, so it is built again");
+    // A server serves the font files of each page it renders.
+    app.fonts_served = served != .none;
 
     // Reset the default body margin and paint the branded background to the
     // window edges, once. Applied to the body element rather than through a
@@ -899,8 +945,38 @@ pub fn init(
         ops.setStyle(ops.body, decl);
     }
 
+    if (served == .size) {
+        app.hydrate();
+        app.owner.setActiveViewMetrics(.{ .size = logical_viewport, .dpr = device_pixel_ratio, .text_scale = 1.0 });
+    }
     app.render();
     return app;
+}
+
+const ServedSize = union(enum) {
+    /// No server rendered the page.
+    none,
+    unusable,
+    size: phantom.LogicalSize,
+};
+
+/// The largest side a server page can name, in phantom px.
+const max_served_side = 1 << 15;
+
+/// The size a server rendered the page at, from `data-phantom-size="WxH"`
+/// on the body.
+fn servedSize(ops: phantom.backend.dom_calls.DomOps) ServedSize {
+    var buf: [32]u8 = undefined;
+    const raw = ops.readAttribute(ops.body, "data-phantom-size", &buf) orelse return .none;
+    const x = std.mem.indexOfScalar(u8, raw, 'x') orelse return .unusable;
+    const w = std.fmt.parseFloat(f32, raw[0..x]) catch return .unusable;
+    const h = std.fmt.parseFloat(f32, raw[x + 1 ..]) catch return .unusable;
+    if (!usableSide(w) or !usableSide(h)) return .unusable;
+    return .{ .size = .{ .width = w, .height = h } };
+}
+
+fn usableSide(v: f32) bool {
+    return std.math.isFinite(v) and v >= 1 and v <= max_served_side;
 }
 
 /// Build the widget tree with the platform hooks `ops` has, and draw nothing.
@@ -2510,4 +2586,123 @@ test "a path route read with a trailing slash is the route without it" {
         var buf: [phantom.router.max_path]u8 = undefined;
         try std.testing.expectEqualStrings(case.want, app.owner.platform.readLocation(&buf).?);
     }
+}
+
+/// Writes the first frame of `root` at `size` into the body of `rec`, the way
+/// a server page has it. `size_attr` is the size as the page prints it.
+fn servePage(gpa: std.mem.Allocator, rec: *phantom.backend.dom_calls.Recorder, root: phantom.Root, size: phantom.LogicalSize, size_attr: []const u8) !void {
+    var scratch = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer scratch.deinit();
+    const server = try mount(gpa, scratch.ops(), root, size, 1.0, .path);
+    defer server.deinit();
+    var canvas = phantom.Canvas.init(gpa);
+    canvas.sink = server.sink;
+    defer canvas.deinit();
+    _ = server.frame(&canvas);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const tree = try phantom.backend.vdom.build(arena_state.allocator(), canvas.list, server.viewport(), background, server.sink);
+    try rec.serveTree(tree.root);
+    try rec.addAttribute(rec.ops().body, "data-phantom-size", size_attr);
+}
+
+test "init adopts a server page and makes no element, at the server size or another" {
+    const gpa = std.testing.allocator;
+    const served: phantom.LogicalSize = .{ .width = 200, .height = 150 };
+    for ([_]phantom.LogicalSize{ served, .{ .width = 320, .height = 200 } }) |size| {
+        var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+        defer rec.deinit();
+        try servePage(gpa, &rec, phantom.Root.plain(textRoot), served, "200x150");
+        const app = try init(gpa, rec.ops(), phantom.Root.plain(textRoot), size, 1.0, .path);
+        defer app.deinit();
+
+        try std.testing.expectEqual(@as(?phantom.FaultSink.Fault, null), app.sink.first);
+        try std.testing.expect(app.page.last != null);
+        try std.testing.expect(app.fonts_served);
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(rec.log.items, "createElement"));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(rec.log.items, "clearChildren("));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(rec.log.items, "removeChild("));
+        try std.testing.expectEqual(@as(usize, 0), rec.misuse);
+        // The container is styled once when it is adopted, and once more when
+        // the window is not the size the server rendered.
+        const container_styles = countOccurrences(rec.log.items, "setStyle(101,");
+        try std.testing.expectEqual(@as(usize, if (size.width == served.width) 1 else 2), container_styles);
+    }
+}
+
+test "init builds a server page of another shape again and reports it" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const size: phantom.LogicalSize = .{ .width = 200, .height = 150 };
+    try servePage(gpa, &rec, phantom.Root.plain(textRoot), size, "200x150");
+    // The server page has a node more than the first frame.
+    _ = try rec.addElement(101, .element, "div");
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(textRoot), size, 1.0, .path);
+    defer app.deinit();
+
+    try std.testing.expectEqual(phantom.FaultCode.hydrate_mismatch, app.sink.first.?.code);
+    try std.testing.expect(logHas(rec.log.items, "clearChildren(1)"));
+    try std.testing.expect(countOccurrences(rec.log.items, "createElement") > 0);
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
+}
+
+test "init builds a server page that names an unusable size again and reports it" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "wide", "200x", "0x150", "infx150", "200x99999999" }) |attr| {
+        var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+        defer rec.deinit();
+        try servePage(gpa, &rec, phantom.Root.plain(textRoot), .{ .width = 200, .height = 150 }, attr);
+        const app = try init(gpa, rec.ops(), phantom.Root.plain(textRoot), .{ .width = 200, .height = 150 }, 1.0, .path);
+        defer app.deinit();
+        try std.testing.expectEqual(phantom.FaultCode.hydrate_mismatch, app.sink.first.?.code);
+        try std.testing.expect(logHas(rec.log.items, "clearChildren(1)"));
+        try std.testing.expectEqual(@as(usize, 0), countOccurrences(rec.log.items, "firstChild("));
+    }
+}
+
+test "a server page registers no font its sheet declares, and no data url for a later one" {
+    const gpa = std.testing.allocator;
+    const Fixture = struct {
+        font: phantom.text.Font,
+
+        fn build(b: *phantom.BuildContext, self: *@This()) phantom.Widget {
+            return b.new(phantom.Text{ .text = "hi", .font = &self.font }).widget();
+        }
+    };
+    // Fonts loaded from bytes have no url. A client-only page embeds them.
+    var fixture: Fixture = .{ .font = try phantom.text.Font.load(gpa, phantom.text.builtin.neuropol_bytes) };
+    defer fixture.font.deinit(gpa);
+    const root = phantom.Root.of(Fixture, Fixture.build, &fixture);
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const size: phantom.LogicalSize = .{ .width = 200, .height = 150 };
+    try servePage(gpa, &rec, root, size, "200x150");
+    const app = try init(gpa, rec.ops(), root, size, 1.0, .path);
+    defer app.deinit();
+    try std.testing.expect(app.page.last != null);
+    try std.testing.expectEqual(@as(usize, 1), app.fonts_seen_len);
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(rec.log.items, "addFont("));
+
+    // A second load of the same file is the same face.
+    var again = try phantom.text.Font.load(gpa, phantom.text.builtin.neuropol_bytes);
+    defer again.deinit(gpa);
+    var later_font = try phantom.text.Font.load(gpa, phantom.text.builtin.mesmerize_rg_bytes);
+    defer later_font.deinit(gpa);
+    const glyphs = [_]phantom.display_list.PositionedGlyph{.{ .cp = 'h', .x = 0, .y = 0 }};
+    var same = try oneTextRun(gpa, &again, &glyphs);
+    defer same.deinit(gpa);
+    app.registerFonts(same);
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(rec.log.items, "addFont("));
+
+    // A font that first shows on a later frame comes from the file the
+    // server serves.
+    var later = try oneTextRun(gpa, &later_font, &glyphs);
+    defer later.deinit(gpa);
+    app.registerFonts(later);
+    var fam: [phantom.backend.dom_calls.family_len]u8 = undefined;
+    var want: [128]u8 = undefined;
+    const family = phantom.backend.dom_calls.fontFamily(&fam, &later_font);
+    try std.testing.expect(logHas(rec.log.items, try std.fmt.bufPrint(&want, "addFont({s},url(\"/fonts/{s}.otf\") format(\"opentype\"))", .{ family, family })));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(rec.log.items, "data:"));
 }

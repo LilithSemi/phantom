@@ -201,9 +201,11 @@ const Builder = struct {
         for (self.rules.items) |rule| {
             if (rule.hash == hash) return;
         }
+        // The page sets the base colour on the element, and an element style
+        // wins over a rule that is not important.
         var css: std.ArrayList(u8) = .empty;
-        if (hover.len > 0) try css.print(self.arena, ".{s}:hover{{{s}}}", .{ cls, hover });
-        if (active.len > 0) try css.print(self.arena, ".{s}:active{{{s}}}", .{ cls, active });
+        if (hover.len > 0) try css.print(self.arena, ".{s}:hover{{{s} !important}}", .{ cls, hover });
+        if (active.len > 0) try css.print(self.arena, ".{s}:active{{{s} !important}}", .{ cls, active });
         // A pointer cursor tells the visitor that the rectangle responds to a tap.
         try css.print(self.arena, ".{s}{{cursor:pointer}}", .{cls});
         try self.rules.append(self.arena, .{ .hash = hash, .css = css.items });
@@ -421,8 +423,8 @@ test "vdom: two interactive rrects of one colour share a class and one rule" {
     try std.testing.expect(std.mem.startsWith(u8, a[0].value, "pb-"));
     try std.testing.expectEqualStrings(a[0].value, b[0].value);
     try std.testing.expectEqual(@as(usize, 1), tree.rules.len);
-    var want: [64]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, tree.rules[0].css, try std.fmt.bufPrint(&want, ".{s}:hover{{background:rgba(0,0,128,1)}}", .{a[0].value})) != null);
+    var want: [96]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, tree.rules[0].css, try std.fmt.bufPrint(&want, ".{s}:hover{{background:rgba(0,0,128,1) !important}}", .{a[0].value})) != null);
     try std.testing.expect(std.mem.indexOf(u8, tree.rules[0].css, "{cursor:pointer}") != null);
     try std.testing.expect(std.mem.indexOf(u8, tree.rules[0].css, ":active") == null);
 }

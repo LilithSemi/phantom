@@ -34,6 +34,10 @@ pub const FaultCode = enum {
     /// offsets for. The region past that limit still opens and keeps its div,
     /// but its view and its div do not sync their offsets in either direction.
     region_overflow,
+    /// The page a server rendered does not have the shape of the first frame,
+    /// so the web backend did not adopt it. The body is cleared and built
+    /// again.
+    hydrate_mismatch,
 };
 
 pub const Fault = struct {

@@ -109,6 +109,47 @@ fn setTextContent(ctx: *anyopaque, node: u32, textv: []const u8) void {
     const el = dom.Element{ .handle = node };
     el.set_textContent(textv);
 }
+// The walk over a page a server rendered. Each element handle goes to the
+// caller, which keeps it or releases it.
+fn firstChild(ctx: *anyopaque, node: u32) u32 {
+    _ = ctx;
+    const el = dom.Element{ .handle = node };
+    const child = el.get_firstElementChild() orelse return 0;
+    return child.handle;
+}
+fn nextSibling(ctx: *anyopaque, node: u32) u32 {
+    _ = ctx;
+    const el = dom.Element{ .handle = node };
+    const next = el.get_nextElementSibling() orelse return 0;
+    return next.handle;
+}
+const xhtml_ns = "http://www.w3.org/1999/xhtml";
+fn readElement(ctx: *anyopaque, node: u32, buf: []u8) ?phantom.backend.dom_calls.DomOps.ElementName {
+    _ = ctx;
+    const el = dom.Element{ .handle = node };
+    const ns = el.get_namespaceURI() orelse return null;
+    defer webidl.rt.freeStr(ns);
+    const kind: phantom.backend.vdom.Kind = if (std.mem.eql(u8, ns, xhtml_ns))
+        .element
+    else if (std.mem.eql(u8, ns, phantom.backend.dom_calls.svg_ns))
+        .element_svg
+    else
+        return null;
+    const name = el.get_localName();
+    defer webidl.rt.freeStr(name);
+    if (name.len > buf.len) return null;
+    @memcpy(buf[0..name.len], name);
+    return .{ .kind = kind, .tag = buf[0..name.len] };
+}
+fn readAttribute(ctx: *anyopaque, node: u32, name: []const u8, buf: []u8) ?[]const u8 {
+    _ = ctx;
+    const el = dom.Element{ .handle = node };
+    const value = el.getAttribute(name) orelse return null;
+    defer webidl.rt.freeStr(value);
+    if (value.len > buf.len) return null;
+    @memcpy(buf[0..value.len], value);
+    return buf[0..value.len];
+}
 fn release(ctx: *anyopaque, node: u32) void {
     _ = ctx;
     const n = dom.Node{ .handle = node };
@@ -448,6 +489,10 @@ export fn init(doc_handle: u32, body_handle: u32, window_handle: u32, root_font:
         .remove_child = removeChild,
         .insert_before = insertBefore,
         .remove_attribute = removeAttribute,
+        .first_child = firstChild,
+        .next_sibling = nextSibling,
+        .read_element = readElement,
+        .read_attribute = readAttribute,
     };
     const strategy: phantom.UrlStrategy = if (strategy_is_hash) .hash else .path;
     const app = phantom.web.init(std.heap.wasm_allocator, ops, phantom.Root.plain(app_root.root), .{ .width = vw, .height = vh }, toCss(dpr), strategy) catch return 0;

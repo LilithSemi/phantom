@@ -135,6 +135,21 @@ pub const DomOps = struct {
     insert_before: ?*const fn (ctx: *anyopaque, parent: u32, child: u32, ref: u32) void = null,
     /// Null falls back to setting the attribute to an empty value.
     remove_attribute: ?*const fn (ctx: *anyopaque, node: u32, name: []const u8) void = null,
+    /// The first element child of `node`, or 0 when it has none. Text nodes
+    /// are skipped. The caller owns the handle. Null on a host that cannot
+    /// walk the page, which then builds a server page again. See `hydrate`.
+    first_child: ?*const fn (ctx: *anyopaque, node: u32) u32 = null,
+    /// The next element sibling of `node`, or 0 when it has none. The caller
+    /// owns the handle.
+    next_sibling: ?*const fn (ctx: *anyopaque, node: u32) u32 = null,
+    /// The kind and local name of element `node`, with the name in `buf`.
+    /// Null when the name does not fit, or the namespace is not HTML or SVG.
+    read_element: ?*const fn (ctx: *anyopaque, node: u32, buf: []u8) ?ElementName = null,
+    /// Writes the value of attribute `name` of `node` into `buf`. Null when
+    /// the node does not have it or the value does not fit.
+    read_attribute: ?*const fn (ctx: *anyopaque, node: u32, name: []const u8, buf: []u8) ?[]const u8 = null,
+
+    pub const ElementName = struct { kind: vdom.Kind, tag: []const u8 };
 
     pub fn createElement(self: DomOps, tag: []const u8) u32 {
         return self.create_element(self.ctx, tag);
@@ -213,6 +228,22 @@ pub const DomOps = struct {
         const f = self.remove_attribute orelse return self.setAttribute(node, name, "");
         f(self.ctx, node, name);
     }
+    pub fn firstChild(self: DomOps, node: u32) u32 {
+        const f = self.first_child orelse return 0;
+        return f(self.ctx, node);
+    }
+    pub fn nextSibling(self: DomOps, node: u32) u32 {
+        const f = self.next_sibling orelse return 0;
+        return f(self.ctx, node);
+    }
+    pub fn readElement(self: DomOps, node: u32, buf: []u8) ?ElementName {
+        const f = self.read_element orelse return null;
+        return f(self.ctx, node, buf);
+    }
+    pub fn readAttribute(self: DomOps, node: u32, name: []const u8, buf: []u8) ?[]const u8 {
+        const f = self.read_attribute orelse return null;
+        return f(self.ctx, node, name, buf);
+    }
 };
 
 /// The CSS family name for a font. See `vdom.fontFamily`.
@@ -224,11 +255,9 @@ pub const family_len = vdom.family_len;
 /// argument. Caller owns the returned slice.
 ///
 /// A font that says where it is served from is referenced by its url, under
-/// `base`. One that does not has its bytes embedded as a `data:` URL, which
-/// is the only thing left to do with it and which `font-src 'self'` refuses:
-/// see `text.Font.url`.
-pub fn fontSrc(gpa: std.mem.Allocator, base: []const u8, font_ptr: *const text.Font) ![]u8 {
-    if (font_ptr.url != null) {
+/// `base`. `no_url` chooses for one that does not. See `NoUrl`.
+pub fn fontSrc(gpa: std.mem.Allocator, base: []const u8, font_ptr: *const text.Font, no_url: NoUrl) ![]u8 {
+    if (font_ptr.url != null or no_url == .file) {
         return gpa.print("url(\"{f}\") format(\"opentype\")", .{dom.fontUrl(base, font_ptr)});
     }
     const enc = std.base64.standard.Encoder;
@@ -237,6 +266,16 @@ pub fn fontSrc(gpa: std.mem.Allocator, base: []const u8, font_ptr: *const text.F
     _ = enc.encode(b64, font_ptr.bytes);
     return gpa.print("url(data:font/otf;base64,{s}) format(\"opentype\")", .{b64});
 }
+
+/// Where a font with no url comes from.
+pub const NoUrl = enum {
+    /// Its bytes go into a `data:` URL, which `font-src 'self'` refuses. A
+    /// page that no server rendered has no other place to get them.
+    embed,
+    /// The file `dom.fontFilePath` names, under the base. A server and a
+    /// prerendered site serve it there.
+    file,
+};
 
 /// Build the `@font-face` block for a list of fonts. Caller owns the slice.
 ///
@@ -249,7 +288,7 @@ pub fn fontFaceCss(gpa: std.mem.Allocator, base: []const u8, fonts: []const *tex
     errdefer buf.deinit(gpa);
     for (fonts) |font_ptr| {
         var fam: [family_len]u8 = undefined;
-        const src = try fontSrc(gpa, base, font_ptr);
+        const src = try fontSrc(gpa, base, font_ptr, .embed);
         defer gpa.free(src);
         try buf.print(gpa, "@font-face{{font-family:{s};src:{s}}}", .{ fontFamily(&fam, font_ptr), src });
     }
@@ -643,6 +682,95 @@ fn renderAll(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList
     patch.finish(reset_scroll);
 }
 
+/// Takes the page a server rendered into the body as the last tree, so the
+/// next `render` patches it in place. `list` is the first frame, at the size
+/// the server rendered. Call it once, before the first `render`.
+///
+/// The walk matches each node to the element at its place by kind and tag,
+/// and makes no element. Then each element gets the style and class of its
+/// node, so its style moves from the `pN` rule of the server sheet to the
+/// CSSOM. The text is set again, because a frame on the client can differ
+/// from the frame on the server, for example a clock. The server sheet
+/// already holds the interactive rules, so `page` records them as added.
+///
+/// Returns false and changes nothing when the body does not have the shape
+/// of the tree: `sink` gets `hydrate_mismatch`, each handle the walk took is
+/// released, and the next `render` builds the body again. Also false, with
+/// no fault, on a host that cannot walk the page or patch it.
+pub fn hydrate(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink, page: *PageState) !bool {
+    std.debug.assert(page.last == null);
+    if (ops.first_child == null or ops.next_sibling == null or ops.read_element == null) return false;
+    if (ops.insert_before == null or ops.remove_child == null) return false;
+    const next: u1 = 1 - page.live;
+    var arena_state = page.arenas[next].promote(gpa);
+    defer page.arenas[next] = arena_state.state;
+    errdefer _ = arena_state.reset(.retain_capacity);
+    const arena = arena_state.allocator();
+
+    const tree = try vdom.build(arena, list, viewport, bg, sink);
+    const handles = try allocHandles(arena, tree.root, tree.count);
+    try page.rules.ensureUnusedCapacity(gpa, @intCast(tree.rules.len));
+
+    const walk: Walk = .{ .ops = ops };
+    const first = ops.firstChild(ops.body);
+    if (first == 0 or !walk.adopt(tree.root, handles, first, 0)) {
+        walk.release(handles, 0);
+        if (sink) |s| s.report(.hydrate_mismatch, "the server page does not match the first frame, so it is built again");
+        _ = arena_state.reset(.retain_capacity);
+        return false;
+    }
+    walk.restyle(tree.root, handles, 0);
+    for (tree.rules) |rule| page.rules.putAssumeCapacity(rule.hash, {});
+    page.last = .{ .root = tree.root, .handles = handles };
+    page.live = next;
+    return true;
+}
+
+/// The longest tag `vdom.build` makes, with room to spare.
+const max_tag_len = 16;
+
+const Walk = struct {
+    ops: DomOps,
+
+    /// Keeps `el` in `h`, then matches its element children to the children
+    /// of `node` in order. False at the first kind, tag or count that differs.
+    fn adopt(self: Walk, node: vdom.Node, h: *Handles, el: u32, depth: usize) bool {
+        std.debug.assert(depth < vdom.max_tree_depth);
+        h.handle = el;
+        var buf: [max_tag_len]u8 = undefined;
+        const name = self.ops.readElement(el, &buf) orelse return false;
+        if (name.kind != node.kind or !std.mem.eql(u8, name.tag, node.tag)) return false;
+        var child = self.ops.firstChild(el);
+        for (node.children, h.children) |c, *ch| {
+            if (child == 0) return false;
+            if (!self.adopt(c, ch, child, depth + 1)) return false;
+            child = self.ops.nextSibling(child);
+        }
+        if (child == 0) return true;
+        self.ops.releaseNode(child);
+        return false;
+    }
+
+    fn restyle(self: Walk, node: vdom.Node, h: *const Handles, depth: usize) void {
+        std.debug.assert(depth < vdom.max_tree_depth);
+        if (node.style.len > 0) self.ops.setStyle(h.handle, node.style);
+        if (findAttr(node.attrs, "class")) |class| {
+            self.ops.setAttribute(h.handle, "class", class);
+        } else {
+            self.ops.removeAttribute(h.handle, "class");
+        }
+        if (node.text.len > 0) self.ops.setTextContent(h.handle, node.text);
+        for (node.children, h.children) |child, *ch| self.restyle(child, ch, depth + 1);
+    }
+
+    /// Releases each handle the walk kept. A node it did not reach has none.
+    fn release(self: Walk, h: *const Handles, depth: usize) void {
+        std.debug.assert(depth < vdom.max_tree_depth);
+        for (h.children) |*ch| self.release(ch, depth + 1);
+        if (h.handle != 0) self.ops.releaseNode(h.handle);
+    }
+};
+
 // Recording mock for tests. No global mutable state: each fn casts ctx to *Recorder.
 // Exported so a test outside this file (a WebApp test with no browser) can
 // drive one through `phantom.backend.dom_calls.Recorder`.
@@ -676,6 +804,14 @@ pub const Recorder = struct {
     /// of each element in a moved subtree to zero. This mock does the same,
     /// so it must know the subtree.
     parents: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Elements a server wrote into the page before the first render, in
+    /// document order. `first_child`, `next_sibling` and `read_element` walk
+    /// them. A test adds them with `addElement`.
+    served: std.ArrayList(Served) = .empty,
+    served_attrs: std.ArrayList(ServedAttr) = .empty,
+
+    const Served = struct { handle: u32, parent: u32, kind: vdom.Kind, tag: []const u8 };
+    const ServedAttr = struct { node: u32, name: []const u8, value: []const u8 };
 
     /// Comfortably past `router.max_path`, so a test can park a location here
     /// that is too long for the router's own buffer without touching this
@@ -809,6 +945,89 @@ pub const Recorder = struct {
         self.log.deinit(self.gpa);
         self.released.deinit(self.gpa);
         self.parents.deinit(self.gpa);
+        self.served.deinit(self.gpa);
+        self.served_attrs.deinit(self.gpa);
+    }
+
+    /// Puts an element the server wrote at the end of `parent`, without
+    /// recording a call. `tag` must outlive the Recorder.
+    pub fn addElement(self: *Recorder, parent: u32, kind: vdom.Kind, tag: []const u8) !u32 {
+        self.next_handle += 1;
+        try self.served.append(self.gpa, .{ .handle = self.next_handle, .parent = parent, .kind = kind, .tag = tag });
+        try self.parents.put(self.gpa, self.next_handle, parent);
+        return self.next_handle;
+    }
+
+    /// Gives a served element an attribute, without recording a call. Both
+    /// strings must outlive the Recorder.
+    pub fn addAttribute(self: *Recorder, node: u32, name: []const u8, value: []const u8) !void {
+        try self.served_attrs.append(self.gpa, .{ .node = node, .name = name, .value = value });
+    }
+
+    /// Writes `root` into the body the way a server page has it: the tree in
+    /// document order, then the boot script.
+    pub fn serveTree(self: *Recorder, root: vdom.Node) !void {
+        try self.serveNode(root, 1, 0);
+        _ = try self.addElement(1, .element, "script");
+    }
+
+    fn serveNode(self: *Recorder, node: vdom.Node, parent: u32, depth: usize) !void {
+        std.debug.assert(depth < vdom.max_tree_depth);
+        const handle = try self.addElement(parent, node.kind, node.tag);
+        for (node.children) |child| try self.serveNode(child, handle, depth + 1);
+    }
+
+    fn servedAfter(self: *Recorder, parent: u32, from: usize) u32 {
+        for (self.served.items[from..]) |s| {
+            if (s.parent == parent) return s.handle;
+        }
+        return 0;
+    }
+
+    fn firstChild(ctx: *anyopaque, node: u32) u32 {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
+        const child = self.servedAfter(node, 0);
+        self.rec("firstChild({d})->{d}", .{ node, child });
+        return child;
+    }
+
+    fn nextSibling(ctx: *anyopaque, node: u32) u32 {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
+        var next: u32 = 0;
+        for (self.served.items, 0..) |s, i| {
+            if (s.handle == node) {
+                next = self.servedAfter(s.parent, i + 1);
+                break;
+            }
+        }
+        self.rec("nextSibling({d})->{d}", .{ node, next });
+        return next;
+    }
+
+    fn readElement(ctx: *anyopaque, node: u32, buf: []u8) ?DomOps.ElementName {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
+        for (self.served.items) |s| {
+            if (s.handle != node) continue;
+            if (s.tag.len > buf.len) return null;
+            @memcpy(buf[0..s.tag.len], s.tag);
+            return .{ .kind = s.kind, .tag = buf[0..s.tag.len] };
+        }
+        return null;
+    }
+
+    fn readAttribute(ctx: *anyopaque, node: u32, name: []const u8, buf: []u8) ?[]const u8 {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
+        for (self.served_attrs.items) |a| {
+            if (a.node != node or !std.mem.eql(u8, a.name, name)) continue;
+            if (a.value.len > buf.len) return null;
+            @memcpy(buf[0..a.value.len], a.value);
+            return buf[0..a.value.len];
+        }
+        return null;
     }
 
     /// Puts `child` under `parent`. A child that was in the page already
@@ -962,6 +1181,10 @@ pub const Recorder = struct {
             .remove_child = removeChild,
             .insert_before = insertBefore,
             .remove_attribute = removeAttribute,
+            .first_child = firstChild,
+            .next_sibling = nextSibling,
+            .read_element = readElement,
+            .read_attribute = readAttribute,
         };
     }
 };
@@ -2493,4 +2716,166 @@ test "dom_calls: a render that fails makes no DOM call and keeps the last tree" 
     try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "release("));
     try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "removeChild("));
     try std.testing.expectEqual(@as(usize, 0), rec.misuse);
+}
+
+/// The tree `render` builds for `list`, written into the body of `rec` the
+/// way a server page has it.
+fn servePage(rec: *Recorder, arena: std.mem.Allocator, list: display_list.DisplayList, size: geometry.PhysicalSize) !vdom.Tree {
+    const tree = try vdom.build(arena, list, size, geometry.Color.rgb(0, 0, 0), null);
+    try rec.serveTree(tree.root);
+    return tree;
+}
+
+test "dom_calls: a server page at the size of the first frame is adopted and makes no element" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var mem = ScrollMemory{};
+    var sink = FaultSink{};
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try appendMixed(gpa, &list);
+    const size: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
+    const bg = geometry.Color.rgb(0, 0, 0);
+    // Container 101, rrect 102, scroll outer 103 and inner 104, clip 105,
+    // svg 106, title 107, path 108, script 109.
+    const tree = try servePage(&rec, arena_state.allocator(), list, size);
+
+    try std.testing.expect(try hydrate(gpa, rec.ops(), list, size, bg, &sink, &page));
+    try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "createElement"));
+    try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "release("));
+    try std.testing.expectEqual(@as(usize, 0), sink.count);
+    // The style of each node moves to the CSSOM, and the server class goes.
+    var buf: [256]u8 = undefined;
+    for (101..109) |h| {
+        const class_set = try std.fmt.bufPrint(&buf, "setAttribute({d},class,", .{h});
+        const removed = countLines(rec.log.items, class_set) + countLines(rec.log.items, try std.fmt.bufPrint(&buf, "removeAttribute({d},class)", .{h}));
+        try std.testing.expectEqual(@as(usize, 1), removed);
+    }
+    try std.testing.expectEqualStrings(tree.root.children[0].attrs[0].value, classAt(rec.log.items, 0).?);
+    try std.testing.expect(contains(rec.log.items, try std.fmt.bufPrint(&buf, "setStyle(101,{s})", .{tree.root.style})));
+    try std.testing.expect(contains(rec.log.items, "setTextContent(107,Gate)"));
+    try std.testing.expectEqual(@as(u32, 1), page.rules.count());
+
+    // The first render at that size only reads the scroll offset, and adds
+    // no rule the server sheet has.
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, bg, &sink, &mem, &page, false);
+    try std.testing.expectEqual(@as(usize, 1), rec.log.items.len - start);
+    try std.testing.expectEqualStrings("readScrollOffset(103)->0,0", rec.log.items[start]);
+    try std.testing.expectEqual(@as(u32, 103), mem.handles[0]);
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
+}
+
+test "dom_calls: a server page at another size is patched where the frame changed" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var mem = ScrollMemory{};
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try appendMixed(gpa, &list);
+    const served: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
+    const bg = geometry.Color.rgb(0, 0, 0);
+    _ = try servePage(&rec, arena_state.allocator(), list, served);
+    try std.testing.expect(try hydrate(gpa, rec.ops(), list, served, bg, null, &page));
+
+    // The window is wider and the box moved. Only the container and the box
+    // change.
+    list.primitives.items[0].rrect.rect.x = 30;
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, .{ .width = 160, .height = 90 }, bg, null, &mem, &page, false);
+    const after = rec.log.items[start..];
+    try std.testing.expectEqual(@as(usize, 0), countLines(after, "createElement"));
+    try std.testing.expectEqual(@as(usize, 0), countLines(after, "removeChild("));
+    try std.testing.expectEqual(@as(usize, 0), countLines(after, "clearChildren("));
+    try std.testing.expectEqual(@as(usize, 2), countLines(after, "setStyle("));
+    try std.testing.expect(contains(after, "setStyle(101,position:relative;width:10rem;height:5.625rem;"));
+    try std.testing.expect(contains(after, "setStyle(102,position:absolute;left:1.875rem;"));
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
+}
+
+test "dom_calls: a server page of another shape reports the mismatch and is built again" {
+    const gpa = std.testing.allocator;
+    const Case = enum { tag, missing, extra, empty };
+    for ([_]Case{ .tag, .missing, .extra, .empty }) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        var rec = Recorder{ .gpa = gpa };
+        defer rec.deinit();
+        var page: PageState = .{};
+        defer page.deinit(gpa);
+        var sink = FaultSink{};
+        var list = display_list.DisplayList{};
+        defer list.deinit(gpa);
+        try appendMixed(gpa, &list);
+        const size: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
+        const bg = geometry.Color.rgb(0, 0, 0);
+        switch (case) {
+            // The server drew an image where the box is.
+            .tag => {
+                _ = try servePage(&rec, arena_state.allocator(), list, size);
+                rec.served.items[1].tag = "img";
+            },
+            // The server drew no box.
+            .missing => {
+                _ = try servePage(&rec, arena_state.allocator(), list, size);
+                _ = rec.served.orderedRemove(1);
+            },
+            // The server drew a second box after the region.
+            .extra => {
+                _ = try servePage(&rec, arena_state.allocator(), list, size);
+                _ = try rec.addElement(101, .element, "div");
+            },
+            .empty => {},
+        }
+
+        try std.testing.expect(!try hydrate(gpa, rec.ops(), list, size, bg, &sink, &page));
+        try std.testing.expectEqual(FaultSink.FaultCode.hydrate_mismatch, sink.first.?.code);
+        try std.testing.expectEqual(@as(?Retained, null), page.last);
+        try std.testing.expectEqual(@as(u32, 0), page.rules.count());
+        // Each element handle the walk took is released once, and nothing
+        // in the page changed.
+        var taken: usize = 0;
+        for (rec.log.items) |l| {
+            if (!std.mem.startsWith(u8, l, "firstChild(") and !std.mem.startsWith(u8, l, "nextSibling(")) continue;
+            if (!std.mem.endsWith(u8, l, "->0")) taken += 1;
+        }
+        try std.testing.expectEqual(taken, countLines(rec.log.items, "release("));
+        try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "setStyle("));
+        try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "class"));
+
+        const start = rec.log.items.len;
+        try render(gpa, rec.ops(), list, size, bg, null, null, &page, false);
+        const after = rec.log.items[start..];
+        try std.testing.expectEqualStrings("clearChildren(1)", after[0]);
+        try std.testing.expectEqual(@as(usize, 8), countLines(after, "createElement"));
+        try std.testing.expectEqual(@as(usize, 1), countLines(after, "addRule("));
+        try std.testing.expectEqual(@as(usize, 0), rec.misuse);
+    }
+}
+
+test "dom_calls: a host that cannot walk the page builds it again with no fault" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var sink = FaultSink{};
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try appendMixed(gpa, &list);
+    var ops = rec.ops();
+    ops.first_child = null;
+    try std.testing.expect(!try hydrate(gpa, ops, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), &sink, &page));
+    try std.testing.expectEqual(@as(usize, 0), rec.log.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sink.count);
 }

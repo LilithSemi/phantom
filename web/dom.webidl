@@ -9,6 +9,12 @@ interface Element {
   attribute DOMString textContent;
   attribute double scrollLeft;
   attribute double scrollTop;
+  // These read a page a server rendered, so the client can adopt it.
+  readonly attribute DOMString localName;
+  readonly attribute DOMString? namespaceURI;
+  readonly attribute Element? firstElementChild;
+  readonly attribute Element? nextElementSibling;
+  DOMString? getAttribute(DOMString name);
   undefined setAttribute(DOMString name, DOMString value);
   undefined removeAttribute(DOMString name);
   Node appendChild(Node node);

@@ -97,6 +97,7 @@ pub const Status = enum {
             .link_unsupported,
             .location_too_long,
             .region_overflow,
+            .hydrate_mismatch,
             => false,
         };
     }

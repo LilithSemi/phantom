@@ -770,7 +770,7 @@ test "renderPage: a small tree gives this html and css, with no inline style" {
         ".p1{position:absolute;left:0;top:0;width:2rem;height:1rem;border-radius:0;background:rgba(255,0,0,1)}" ++
         ".p2{position:absolute;left:0;top:1rem;width:2rem;height:1rem;border-radius:0.25rem;background:rgba(0,0,255,1)}" ++
         ".p3{position:absolute;left:0.5rem;top:0;white-space:pre;font-family:pf-0b107d216918b3e5;font-size:1rem;color:rgba(255,255,255,1)}" ++
-        ".pb-788763ab9d2ec3be:hover{background:rgba(0,255,0,1)}.pb-788763ab9d2ec3be{cursor:pointer}", page.css);
+        ".pb-788763ab9d2ec3be:hover{background:rgba(0,255,0,1) !important}.pb-788763ab9d2ec3be{cursor:pointer}", page.css);
     try std.testing.expectEqual(@as(usize, 0), page.fonts.len);
 }
 
