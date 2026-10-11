@@ -223,7 +223,7 @@ pub const family_len = vdom.family_len;
 /// `@font-face` rule, and what the `FontFace` constructor takes as its second
 /// argument. Caller owns the returned slice.
 ///
-/// A font that says where it is served from is referenced BY URL, under
+/// A font that says where it is served from is referenced by its url, under
 /// `base`. One that does not has its bytes embedded as a `data:` URL, which
 /// is the only thing left to do with it and which `font-src 'self'` refuses:
 /// see `text.Font.url`.

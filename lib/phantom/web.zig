@@ -843,7 +843,7 @@ pub const CssScale = struct {
 };
 
 /// Build the widget tree, draw the first frame and keep owner/arena/view alive
-/// for the page lifetime. Returns a heap-allocated *WebApp; the caller (JS via
+/// for the page lifetime. Returns a heap-allocated *WebApp. The caller (JS via
 /// wasm) must store the returned pointer and pass it to the dispatch entries.
 /// The page never calls `deinit`, because its process ends with it.
 ///
@@ -863,11 +863,11 @@ pub fn init(
     errdefer app.deinit();
 
     // Reset the default body margin and paint the branded background to the
-    // window edges, ONCE. Applied to the body ELEMENT rather than through a
+    // window edges, once. Applied to the body element rather than through a
     // stylesheet, and that choice is load bearing twice over.
     //
     // A browser gives `body` an 8px margin of its own, and the container this
-    // backend draws into is sized to the WHOLE viewport, so any margin at all
+    // backend draws into is sized to the whole viewport, so any margin at all
     // pushes the whole page down and right: two strips of unthemed white at the
     // top and left, and the same amount lost off the bottom and right, unseen.
     //
@@ -875,7 +875,7 @@ pub fn init(
     // backend already proves on every frame, for every node it positions. A rule
     // in a sheet has one more thing that has to be true, a sheet to put it in,
     // and this is the one declaration whose failure is not cosmetic: it takes
-    // the whole page off its origin. The rules that DO need a sheet are the ones
+    // the whole page off its origin. The rules that do need a sheet are the ones
     // that cannot be written any other way, hover and `@font-face`.
     //
     // Setting it on `body` also reaches `html`, because a browser propagates the

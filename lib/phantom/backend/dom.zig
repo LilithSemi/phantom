@@ -140,9 +140,17 @@ pub fn fontFilePath(buf: *[font_path_len]u8, font_ptr: *const text.Font) []const
     return std.fmt.bufPrint(buf, font_dir ++ "{s}.otf", .{family}) catch unreachable;
 }
 
-/// True when `base` is a usable page base: it starts and ends with '/'.
+/// True when `base` is a usable page base: it starts and ends with '/', and
+/// carries none of `"`, `<`, `>`, `\` or a control character. A server
+/// prints `base` straight into an HTML attribute (see
+/// `ssr.Document.writeHtml`) and into a CSS `url("...")` (see `fontSrc`), so
+/// any of those would let it break out of the attribute or the CSS string.
 pub fn validBase(base: []const u8) bool {
-    return base.len > 0 and base[0] == '/' and base[base.len - 1] == '/';
+    if (base.len == 0 or base[0] != '/' or base[base.len - 1] != '/') return false;
+    for (base) |c| {
+        if (c == '"' or c == '<' or c == '>' or c == '\\' or c < 0x20) return false;
+    }
+    return true;
 }
 
 /// The url a page fetches a font from, printed with `{f}`. A relative
