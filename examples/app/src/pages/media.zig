@@ -32,10 +32,7 @@ fn icons(b: *phantom.BuildContext) phantom.Widget {
             b.new(phantom.Padding{ .insets = .{ .bottom = 6 }, .child = icon.widget() }).widget(),
             gallery.text(b, @tagName(id), .{ .size = 13, .color = c.fg_muted }),
         }) }));
-        // A column of open height is as wide as its widest child, so Center
-        // puts it in the middle of the tile.
-        const centered = b.new(phantom.Center(.{ .child = column.widget() }));
-        out.* = b.new(phantom.SizedBox{ .width = 120, .child = centered.widget() }).widget();
+        out.* = b.new(phantom.SizedBox{ .width = 120, .child = column.widget() }).widget();
     }
     // Rows of five keep the grid inside a narrow window.
     const per_row = 5;

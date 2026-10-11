@@ -33,7 +33,8 @@ pub const CrossAxisAlignment = enum { start, center, end };
 /// content instead of stretching to a wide bound. A `Flexible` or `Expanded`
 /// child asks for a share of the space `.min` is trying not to take; `.min`
 /// wins, so that child sees no free space and gets none, the same treatment
-/// a flex factor gets on a genuinely unbounded axis.
+/// a flex factor gets on a genuinely unbounded axis. A minimum extent in the
+/// constraints still wins over `.min`.
 pub const MainAxisSize = enum { max, min };
 
 /// How much of its share a flexible child must take. `Expanded` uses `.tight`,
@@ -51,6 +52,12 @@ fn crossExtent(axis: Axis, s: geom.PhysicalSize) f32 {
     return switch (axis) {
         .vertical => s.width,
         .horizontal => s.height,
+    };
+}
+fn sizeFor(axis: Axis, main: f32, cross: f32) geom.PhysicalSize {
+    return switch (axis) {
+        .vertical => .{ .width = cross, .height = main },
+        .horizontal => .{ .width = main, .height = cross },
     };
 }
 fn offsetFor(axis: Axis, main_pos: f32, cross_pos: f32) geom.PhysicalOffset {
@@ -262,9 +269,13 @@ pub const RenderFlex = struct {
 
         // total_cross is the tallest (or widest) child seen above. Standard flex
         // behaviour sizes the cross axis to that child whenever the parent did not
-        // hand this flex a bound to fill.
-        const cross_ext = if (main_unbounded or cross_unbounded) total_cross else crossExtent(self.direction, size);
-        const spacing = spacingFor(self.main, main_ext - total_main, self.children.items.len);
+        // hand this flex a bound to fill. The constraints have the last word on
+        // both axes, so a minimum extent makes the flex grow past its children.
+        const wanted_main = if (shrink_main) total_main else mainExtent(self.direction, size);
+        const wanted_cross = if (main_unbounded or cross_unbounded) total_cross else crossExtent(self.direction, size);
+        const final = c.constrain(sizeFor(self.direction, wanted_main, wanted_cross));
+        const cross_ext = crossExtent(self.direction, final);
+        const spacing = spacingFor(self.main, mainExtent(self.direction, final) - total_main, self.children.items.len);
         var main_pos: f32 = spacing.leading;
         for (self.children.items) |ch| {
             const cm = mainExtent(self.direction, ch.size);
@@ -281,16 +292,7 @@ pub const RenderFlex = struct {
             };
             main_pos += cm + spacing.between;
         }
-        return switch (self.direction) {
-            .vertical => .{
-                .width = cross_ext,
-                .height = if (shrink_main) total_main else size.height,
-            },
-            .horizontal => .{
-                .width = if (shrink_main) total_main else size.width,
-                .height = cross_ext,
-            },
-        };
+        return final;
     }
 
     pub fn paintFn(base: *RenderObject, cv: *Canvas, offset: geom.PhysicalOffset) anyerror!void {
@@ -604,7 +606,7 @@ test "a .min Row inside a wide bounded constraint reports the width its children
     try rf.children.append(gpa, &b.base);
 
     // The bound is 1000, far past what the two children need.
-    const size = rf.base.layout(layout.BoxConstraints.tight(.{ .width = 1000, .height = 100 }));
+    const size = rf.base.layout(layout.BoxConstraints.loose(.{ .width = 1000, .height = 100 }));
     try std.testing.expectEqual(@as(f32, 50), size.width); // 20 + 30, not 1000
 }
 
@@ -651,7 +653,7 @@ test "a .min Row centered on its main axis still packs its children at the leadi
     try rf.children.append(gpa, &a.base);
     try rf.children.append(gpa, &b.base);
 
-    _ = rf.base.layout(layout.BoxConstraints.tight(.{ .width = 1000, .height = 100 }));
+    _ = rf.base.layout(layout.BoxConstraints.loose(.{ .width = 1000, .height = 100 }));
     // A `.min` row's own size is its children's extent, so there is no slack
     // between that extent and the row's reported width for `.center` to
     // split. Both children sit exactly where `.start` would have put them.
@@ -678,7 +680,7 @@ test "a .min Column end-aligned on its main axis still packs its children at the
     try rf.children.append(gpa, &a.base);
     try rf.children.append(gpa, &b.base);
 
-    const size = rf.base.layout(layout.BoxConstraints.tight(.{ .width = 100, .height = 900 }));
+    const size = rf.base.layout(layout.BoxConstraints.loose(.{ .width = 100, .height = 900 }));
     try std.testing.expectEqual(@as(f32, 60), size.height); // 20 + 40, not 900
     try std.testing.expectEqual(@as(f32, 0), rf.offsets.items[0].y);
     try std.testing.expectEqual(@as(f32, 20), rf.offsets.items[1].y);
@@ -1266,6 +1268,73 @@ test "a Column given a bounded height and an infinite max width reports its wide
     try rf.children.append(gpa, &b.base);
     const size = rf.base.layout(.{ .min_width = 0, .max_width = std.math.inf(f32), .min_height = 0, .max_height = 200 });
     try std.testing.expectEqual(@as(f32, 50), size.width);
+}
+
+test "a Column of open height inside a tight width takes that width and centers its children in it" {
+    const gpa = std.testing.allocator;
+    var a = NaturalBox.make(40, 20);
+    var b = NaturalBox.make(60, 30);
+    var rf = makeFlex(gpa, .vertical, .start);
+    rf.cross = .center;
+    defer {
+        rf.children.deinit(gpa);
+        rf.offsets.deinit(gpa);
+    }
+    try rf.children.append(gpa, &a.base);
+    try rf.children.append(gpa, &b.base);
+    const size = rf.base.layout(.{ .min_width = 110, .max_width = 110, .min_height = 0, .max_height = std.math.inf(f32) });
+    try std.testing.expectEqual(@as(f32, 110), size.width);
+    try std.testing.expectEqual(@as(f32, 50), size.height);
+    try std.testing.expectEqual(@as(f32, 35), rf.offsets.items[0].x);
+    try std.testing.expectEqual(@as(f32, 25), rf.offsets.items[1].x);
+}
+
+test "a Row of open width inside a tight height takes that height and puts its children at the end of it" {
+    const gpa = std.testing.allocator;
+    var a = NaturalBox.make(20, 40);
+    var b = NaturalBox.make(30, 60);
+    var rf = makeFlex(gpa, .horizontal, .start);
+    rf.cross = .end;
+    defer {
+        rf.children.deinit(gpa);
+        rf.offsets.deinit(gpa);
+    }
+    try rf.children.append(gpa, &a.base);
+    try rf.children.append(gpa, &b.base);
+    const size = rf.base.layout(.{ .min_width = 0, .max_width = std.math.inf(f32), .min_height = 110, .max_height = 110 });
+    try std.testing.expectEqual(@as(f32, 50), size.width);
+    try std.testing.expectEqual(@as(f32, 110), size.height);
+    try std.testing.expectEqual(@as(f32, 70), rf.offsets.items[0].y);
+    try std.testing.expectEqual(@as(f32, 50), rf.offsets.items[1].y);
+}
+
+test "a Column of open height is never shorter than its minimum height" {
+    const gpa = std.testing.allocator;
+    var a = NaturalBox.make(40, 20);
+    var rf = makeFlex(gpa, .vertical, .end);
+    defer {
+        rf.children.deinit(gpa);
+        rf.offsets.deinit(gpa);
+    }
+    try rf.children.append(gpa, &a.base);
+    const size = rf.base.layout(.{ .min_width = 0, .max_width = 200, .min_height = 100, .max_height = std.math.inf(f32) });
+    try std.testing.expectEqual(@as(f32, 100), size.height);
+    // The column is taller than its child, so the main alignment has space to give.
+    try std.testing.expectEqual(@as(f32, 80), rf.offsets.items[0].y);
+}
+
+test "a SizedBox of fixed width around a Column of open height is as wide as the SizedBox" {
+    const gpa = std.testing.allocator;
+    var fill = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) };
+    var swatch = phantom.SizedBox{ .width = 40, .height = 20, .child = fill.widget() };
+    const kids = [_]Widget{swatch.widget()};
+    var col = Column(.{ .cross = .center, .children = &kids });
+    var sized = phantom.SizedBox{ .width = 110, .child = col.widget() };
+
+    var h = try testing.mount(gpa, sized.widget());
+    defer h.deinit();
+    const size = h.root.renderObject().?.layout(.{ .min_width = 0, .max_width = 400, .min_height = 0, .max_height = std.math.inf(f32) });
+    try std.testing.expectEqual(@as(f32, 110), size.width);
 }
 
 // Depth-first search for the first render object with an on_up handler, the
