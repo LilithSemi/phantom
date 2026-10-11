@@ -763,3 +763,16 @@ test "writePage lists each page, stylesheet and font file it writes, once" {
         gpa.free(bytes);
     }
 }
+
+test "a route with a trailing slash renders the same page as the route" {
+    const gpa = std.testing.allocator;
+    var plain = try renderAt("/about", "/");
+    defer plain.deinit(gpa);
+    var slash = try renderAt("/about/", "/");
+    defer slash.deinit(gpa);
+    try std.testing.expectEqualStrings(plain.html, slash.html);
+    try std.testing.expectEqualStrings(plain.css, slash.css);
+    var missing = try renderAt("/nowhere", "/");
+    defer missing.deinit(gpa);
+    try std.testing.expect(!std.mem.eql(u8, missing.css, slash.css));
+}

@@ -440,13 +440,23 @@ fn readLocationThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
     const app: *WebApp = @ptrCast(@alignCast(ctx));
     // `init` installs this thunk only when `ops.read_location` is set, so the
     // hook is never null here.
-    return app.ops.read_location.?(app.ops.ctx, buf) orelse {
+    const path = app.ops.read_location.?(app.ops.ctx, buf) orelse {
         // The real address does not fit `buf`. Taking the first max_path
         // bytes would land the tree on a different, shorter route than the
         // one the user is actually on, so the read is refused instead.
         app.sink.report(.location_too_long, "the browser address is longer than the buffer that reads it");
         return null;
     };
+    if (app.owner.platform.strategy != .path) return path;
+    return routePath(path, app.ops.base);
+}
+
+/// A static host sends "/about" on to "/about/", the folder of its page. The
+/// route is "/about", so one trailing '/' goes, unless the path is the base.
+fn routePath(path: []const u8, base: []const u8) []const u8 {
+    if (path.len <= 1 or path[path.len - 1] != '/') return path;
+    if (std.mem.eql(u8, path, base)) return path;
+    return path[0 .. path.len - 1];
 }
 
 fn readQueryThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
@@ -2475,4 +2485,26 @@ test "phantom.http.Std runs the same call on std.http.Client" {
     try std.testing.expectEqualStrings("made", body.written());
     try std.testing.expectEqualStrings("POST", spy.method[0..spy.method_len]);
     try std.testing.expectError(error.InvalidUrl, wrap.client().fetch(.{ .url = "not a url" }));
+}
+
+test "a path route read with a trailing slash is the route without it" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { base: []const u8, at: []const u8, want: []const u8 }{
+        .{ .base = "/", .at = "/about/", .want = "/about" },
+        .{ .base = "/", .at = "/about", .want = "/about" },
+        .{ .base = "/", .at = "/", .want = "/" },
+        .{ .base = "/app/", .at = "/app/", .want = "/app/" },
+        .{ .base = "/app/", .at = "/app/docs/intro/", .want = "/app/docs/intro" },
+    };
+    for (cases) |case| {
+        var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+        defer rec.deinit();
+        rec.setLocation(case.at);
+        var ops = rec.ops();
+        ops.base = case.base;
+        const app = try init(gpa, ops, phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+        defer app.deinit();
+        var buf: [phantom.router.max_path]u8 = undefined;
+        try std.testing.expectEqualStrings(case.want, app.owner.platform.readLocation(&buf).?);
+    }
 }

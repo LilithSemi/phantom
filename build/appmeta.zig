@@ -86,8 +86,10 @@ pub const AppOptions = struct {
     default_size: Size = .{ .width = 1280, .height = 800 },
     /// The site path that the page is served at. Every url the page holds goes
     /// under it as a root-absolute url, so a nested route boots without a
-    /// `<base>` tag. Must start and end with '/'. Validate with
-    /// `validateBasePath`.
+    /// `<base>` tag. With no `<base>`, a relative url that the app passes to
+    /// `openEventSource` or `openUrl` resolves against the page url, so on
+    /// "/docs/intro" the url "events" is "/docs/events". Must start and end
+    /// with '/'. Validate with `validateBasePath`.
     base_path: []const u8 = "/",
 };
 
