@@ -13,8 +13,8 @@ pub fn build(b: *std.Build) void {
     const app = phantom.addApp(b, phantom_dep, .{
         .id = "org.example.phantom.demo",
         .name = .{ .default = "Phantom Demo" },
-        .summary = .{ .default = "A minimal PhantomUI demo application" },
-        .description = .{ .default = "Padded blue box rendered by the PhantomUI framework." },
+        .summary = .{ .default = "A gallery of every PhantomUI widget" },
+        .description = .{ .default = "Every widget PhantomUI has, one page per category, with live examples." },
         .categories = &.{.utility},
         .root = b.path("src/app.zig"),
         .developer = "Example Developer",
