@@ -507,19 +507,37 @@ const Patch = struct {
                 self.create(node, h, parent, before, depth);
                 continue;
             };
-            if (j != at) self.move(parent, old[j], old_h[j].handle, before);
+            if (j != at) self.move(parent, old[j], &old_h[j], before);
             old_h[j].placed = true;
             self.update(old[j], &old_h[j], node, h, depth);
         }
     }
 
-    /// A browser can drop the scroll offset of an element that leaves the
-    /// document, so a moved scroll div gets its offset back.
-    fn move(self: *Patch, parent: u32, old: vdom.Node, handle: u32, before: ?u32) void {
-        const offset = if (old.scroll != null) self.ops.readScrollOffset(handle) else null;
-        self.insert(parent, handle, before);
-        const o = offset orelse return;
-        if (o.x != 0 or o.y != 0) self.ops.writeScrollOffset(handle, o);
+    /// A browser sets the scroll offset of each element in a moved subtree
+    /// to zero. So each scroll div in the subtree gets its offset back.
+    fn move(self: *Patch, parent: u32, old: vdom.Node, old_h: *const Handles, before: ?u32) void {
+        var saved: Saved = .{};
+        self.save(&saved, old, old_h, 0);
+        self.insert(parent, old_h.handle, before);
+        for (saved.entries[0..saved.count]) |entry| self.ops.writeScrollOffset(entry.handle, entry.offset);
+    }
+
+    const Saved = struct {
+        entries: [max_scroll_regions]struct { handle: u32, offset: geometry.PhysicalOffset } = undefined,
+        count: usize = 0,
+    };
+
+    fn save(self: *Patch, saved: *Saved, node: vdom.Node, h: *const Handles, depth: usize) void {
+        std.debug.assert(depth < vdom.max_tree_depth);
+        if (saved.count == max_scroll_regions) return;
+        if (node.scroll != null) {
+            const offset = self.ops.readScrollOffset(h.handle) orelse return;
+            if (offset.x != 0 or offset.y != 0) {
+                saved.entries[saved.count] = .{ .handle = h.handle, .offset = offset };
+                saved.count += 1;
+            }
+        }
+        for (node.children, h.children) |child, *ch| self.save(saved, child, ch, depth + 1);
     }
 
     fn remove(self: *Patch, parent: u32, h: *const Handles) void {
@@ -656,6 +674,10 @@ pub const Recorder = struct {
     /// its release or released it again. A test expects zero.
     released: std.AutoHashMapUnmanaged(u32, void) = .empty,
     misuse: usize = 0,
+    /// The parent of each node in the page. A browser sets the scroll offset
+    /// of each element in a moved subtree to zero. This mock does the same,
+    /// so it must know the subtree.
+    parents: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 
     /// Comfortably past `router.max_path`, so a test can park a location here
     /// that is too long for the router's own buffer without touching this
@@ -788,6 +810,28 @@ pub const Recorder = struct {
         for (self.log.items) |l| self.gpa.free(l);
         self.log.deinit(self.gpa);
         self.released.deinit(self.gpa);
+        self.parents.deinit(self.gpa);
+    }
+
+    /// Puts `child` under `parent`. A child that was in the page already
+    /// moves, and each scroll offset in its subtree goes back to zero.
+    fn place(self: *Recorder, parent: u32, child: u32) void {
+        if (self.parents.contains(child)) self.zeroSubtree(child);
+        self.parents.put(self.gpa, child, parent) catch {};
+    }
+
+    fn zeroSubtree(self: *Recorder, root: u32) void {
+        for (self.scroll_offsets[0..self.scroll_offsets_len]) |*e| {
+            var node = e.node;
+            var depth: usize = 0;
+            while (depth <= vdom.max_tree_depth) : (depth += 1) {
+                if (node == root) {
+                    e.offset = .zero;
+                    break;
+                }
+                node = self.parents.get(node) orelse break;
+            }
+        }
     }
 
     fn use(self: *Recorder, node: u32) void {
@@ -851,6 +895,7 @@ pub const Recorder = struct {
         self.use(parent);
         self.use(child);
         self.rec("appendChild({d},{d})", .{ parent, child });
+        self.place(parent, child);
     }
 
     fn insertBefore(ctx: *anyopaque, parent: u32, child: u32, ref: u32) void {
@@ -859,6 +904,7 @@ pub const Recorder = struct {
         self.use(child);
         self.use(ref);
         self.rec("insertBefore({d},{d},{d})", .{ parent, child, ref });
+        self.place(parent, child);
     }
 
     fn removeChild(ctx: *anyopaque, parent: u32, child: u32) void {
@@ -866,6 +912,8 @@ pub const Recorder = struct {
         self.use(parent);
         self.use(child);
         self.rec("removeChild({d},{d})", .{ parent, child });
+        self.zeroSubtree(child);
+        _ = self.parents.remove(child);
     }
 
     fn removeAttribute(ctx: *anyopaque, node: u32, name: []const u8) void {
@@ -2279,6 +2327,53 @@ test "dom_calls: a keyed scroll region that moves keeps its div, its offset, and
     try std.testing.expectEqual(@as(u32, 102), mem.handles[1]);
     try std.testing.expectEqual(@as(?*pointer.PointerHandlers, &b.handlers), mem.targets[0]);
     try std.testing.expectEqual(@as(f32, 60), b.offset.y);
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
+}
+
+test "dom_calls: a scroll region inside a moved node keeps its offset" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var mem = ScrollMemory{};
+    var k = TestView{};
+    k.init();
+    var s = TestView{};
+    s.init();
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    const size: geometry.PhysicalSize = .{ .width = 200, .height = 100 };
+    const clip: display_list.Primitive = .{ .push_clip = .{ .rect = .{ .x = 0, .y = 0, .width = 50, .height = 50 } } };
+
+    try list.append(gpa, testRegion(&k));
+    try list.append(gpa, .{ .pop_scroll = {} });
+    try list.append(gpa, clip);
+    try list.append(gpa, testRegion(&s));
+    try list.append(gpa, .{ .pop_scroll = {} });
+    try list.append(gpa, .{ .pop_clip = {} });
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
+    const s_div = mem.handles[1];
+    rec.setScrollOffset(s_div, .{ .x = 0, .y = 70 });
+    s.offset.y = 70;
+
+    // The clip that holds the region now comes before the keyed region.
+    list.primitives.clearRetainingCapacity();
+    try list.append(gpa, clip);
+    try list.append(gpa, testRegion(&s));
+    try list.append(gpa, .{ .pop_scroll = {} });
+    try list.append(gpa, .{ .pop_clip = {} });
+    try list.append(gpa, testRegion(&k));
+    try list.append(gpa, .{ .pop_scroll = {} });
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
+    const after = rec.log.items[start..];
+
+    try std.testing.expect(contains(after, "insertBefore("));
+    try std.testing.expectEqual(s_div, mem.handles[0]);
+    try std.testing.expectEqual(@as(f32, 70), s.offset.y);
+    try std.testing.expectEqual(@as(f32, 70), Recorder.readScrollOffset(&rec, s_div).y);
+    try std.testing.expect(!mem.synced);
     try std.testing.expectEqual(@as(usize, 0), rec.misuse);
 }
 
