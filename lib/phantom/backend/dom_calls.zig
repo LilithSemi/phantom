@@ -687,20 +687,22 @@ fn renderAll(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList
 /// the server rendered. Call it once, before the first `render`.
 ///
 /// The walk matches each node to the element at its place by kind and tag,
-/// and makes no element. Then each element gets the style and class of its
-/// node, so its style moves from the `pN` rule of the server sheet to the
-/// CSSOM. The text is set again, because a frame on the client can differ
-/// from the frame on the server, for example a clock. The server sheet
+/// and makes no element. Then each element gets the style, attributes and
+/// text of its node, so its style moves from the `pN` rule of the server
+/// sheet to the CSSOM and the `pN` class goes. A frame on the client can
+/// differ from the frame on the server at the same shape, for example a
+/// clock, and the retained tree must hold what the page shows. Each region
+/// whose view is not at the top scrolls to its offset. The server sheet
 /// already holds the interactive rules, so `page` records them as added.
 ///
 /// Returns false and changes nothing when the body does not have the shape
 /// of the tree: `sink` gets `hydrate_mismatch`, each handle the walk took is
 /// released, and the next `render` builds the body again. Also false, with
-/// no fault, on a host that cannot walk the page or patch it.
+/// no fault, on a host that cannot walk, patch or release.
 pub fn hydrate(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink, page: *PageState) !bool {
     std.debug.assert(page.last == null);
     if (ops.first_child == null or ops.next_sibling == null or ops.read_element == null) return false;
-    if (ops.insert_before == null or ops.remove_child == null) return false;
+    if (ops.insert_before == null or ops.remove_child == null or ops.release == null) return false;
     const next: u1 = 1 - page.live;
     var arena_state = page.arenas[next].promote(gpa);
     defer page.arenas[next] = arena_state.state;
@@ -720,6 +722,7 @@ pub fn hydrate(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLi
         return false;
     }
     walk.restyle(tree.root, handles, 0);
+    walk.scroll(tree.root, handles, 0);
     for (tree.rules) |rule| page.rules.putAssumeCapacity(rule.hash, {});
     page.last = .{ .root = tree.root, .handles = handles };
     page.live = next;
@@ -751,16 +754,27 @@ const Walk = struct {
         return false;
     }
 
+    /// Gives each element the style, attributes and text of its node, so the
+    /// page shows the client frame where it differs from the server frame.
     fn restyle(self: Walk, node: vdom.Node, h: *const Handles, depth: usize) void {
         std.debug.assert(depth < vdom.max_tree_depth);
         if (node.style.len > 0) self.ops.setStyle(h.handle, node.style);
-        if (findAttr(node.attrs, "class")) |class| {
-            self.ops.setAttribute(h.handle, "class", class);
-        } else {
-            self.ops.removeAttribute(h.handle, "class");
-        }
-        if (node.text.len > 0) self.ops.setTextContent(h.handle, node.text);
+        for (node.attrs) |attr| self.ops.setAttribute(h.handle, attr.name, attr.value);
+        if (findAttr(node.attrs, "class") == null) self.ops.removeAttribute(h.handle, "class");
+        // A box at the place of a server text div must lose the text.
+        const leaf_div = node.kind == .element and node.children.len == 0 and std.mem.eql(u8, node.tag, "div");
+        if (node.text.len > 0 or leaf_div) self.ops.setTextContent(h.handle, node.text);
         for (node.children, h.children) |child, *ch| self.restyle(child, ch, depth + 1);
+    }
+
+    /// Scrolls each region to the offset of its view. Runs after `restyle`,
+    /// so each content div has its size and the offset is not clamped.
+    fn scroll(self: Walk, node: vdom.Node, h: *const Handles, depth: usize) void {
+        std.debug.assert(depth < vdom.max_tree_depth);
+        if (node.scroll) |s| {
+            if (s.offset.x != 0 or s.offset.y != 0) self.ops.writeScrollOffset(h.handle, s.offset);
+        }
+        for (node.children, h.children) |child, *ch| self.scroll(child, ch, depth + 1);
     }
 
     /// Releases each handle the walk kept. A node it did not reach has none.
@@ -2863,19 +2877,104 @@ test "dom_calls: a server page of another shape reports the mismatch and is buil
     }
 }
 
-test "dom_calls: a host that cannot walk the page builds it again with no fault" {
+test "dom_calls: a host that cannot walk the page or release a handle builds it again with no fault" {
     const gpa = std.testing.allocator;
+    for (0..2) |case| {
+        var rec = Recorder{ .gpa = gpa };
+        defer rec.deinit();
+        var page: PageState = .{};
+        defer page.deinit(gpa);
+        var sink = FaultSink{};
+        var list = display_list.DisplayList{};
+        defer list.deinit(gpa);
+        try appendMixed(gpa, &list);
+        var ops = rec.ops();
+        if (case == 0) ops.first_child = null else ops.release = null;
+        try std.testing.expect(!try hydrate(gpa, ops, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), &sink, &page));
+        try std.testing.expectEqual(@as(usize, 0), rec.log.items.len);
+        try std.testing.expectEqual(@as(usize, 0), sink.count);
+    }
+}
+
+test "dom_calls: a client frame that differs from the server's at the same shape takes its attributes and text" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
     var rec = Recorder{ .gpa = gpa };
     defer rec.deinit();
     var page: PageState = .{};
     defer page.deinit(gpa);
-    var sink = FaultSink{};
+    var font = try text.Font.load(gpa, text.builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    var bytes = [_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01 };
+    var img = image_mod.Image.fromBytes(&bytes, 10, 10);
+    const size: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
+    const bg = geometry.Color.rgb(0, 0, 0);
+    const run: display_list.TextRun = .{ .glyphs = &.{}, .text = "12:00", .font = &font, .size = 16, .color = geometry.Color.rgb(1, 1, 1), .origin = .{ .x = 0, .y = 0 } };
     var list = display_list.DisplayList{};
     defer list.deinit(gpa);
-    try appendMixed(gpa, &list);
-    var ops = rec.ops();
-    ops.first_child = null;
-    try std.testing.expect(!try hydrate(gpa, ops, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), &sink, &page));
-    try std.testing.expectEqual(@as(usize, 0), rec.log.items.len);
-    try std.testing.expectEqual(@as(usize, 0), sink.count);
+    // Container 101, clock 102, svg 103, path 104, img 105, label 106.
+    try list.append(gpa, .{ .text = run });
+    try list.append(gpa, .{ .icon = .{ .id = .torii, .size = .{ .width = 16, .height = 16 }, .color = geometry.Color.rgb(1, 0, 0), .origin = .{ .x = 0, .y = 20 } } });
+    try list.append(gpa, .{ .image = .{ .image = &img, .rect = .{ .x = 0, .y = 40, .width = 10, .height = 10 } } });
+    var label = run;
+    label.text = "gone";
+    label.origin.y = 60;
+    try list.append(gpa, .{ .text = label });
+    _ = try servePage(&rec, arena_state.allocator(), list, size);
+
+    // The client draws a later time, another icon colour, other image bytes
+    // and a box where the server drew a label.
+    list.primitives.items[0].text.text = "12:01";
+    list.primitives.items[1].icon.color = geometry.Color.rgb(0, 0, 1);
+    bytes[9] = 0x02;
+    list.primitives.items[3] = .{ .rrect = .{ .rect = .{ .x = 0, .y = 60, .width = 5, .height = 5 }, .radius = 0, .color = geometry.Color.rgb(1, 0, 0) } };
+    try std.testing.expect(try hydrate(gpa, rec.ops(), list, size, bg, null, &page));
+    try std.testing.expect(contains(rec.log.items, "setTextContent(102,12:01)"));
+    try std.testing.expect(contains(rec.log.items, "setAttribute(104,stroke,rgba(0,0,255,1))"));
+    try std.testing.expect(contains(rec.log.items, "setAttribute(105,src,data:image/png;base64,iVBORw0KGgoAAg==)"));
+    try std.testing.expect(contains(rec.log.items, "setTextContent(106,)"));
+    try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "createElement"));
+
+    // The retained tree is what the page shows, so the same frame sends nothing.
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, bg, null, null, &page, false);
+    try std.testing.expectEqual(start, rec.log.items.len);
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
+}
+
+test "dom_calls: a region whose view is not at the top keeps its offset through hydration" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var mem = ScrollMemory{};
+    var view = TestView{};
+    view.init();
+    // A jumpTo before the first frame.
+    view.offset.y = 40;
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, testRegion(&view));
+    try list.append(gpa, .{ .rrect = .{ .rect = .{ .x = 0, .y = 0, .width = 100, .height = 20 }, .radius = 0, .color = geometry.Color.rgb(0, 0, 1) } });
+    try list.append(gpa, .{ .pop_scroll = {} });
+    const size: geometry.PhysicalSize = .{ .width = 200, .height = 100 };
+    const bg = geometry.Color.rgb(0, 0, 0);
+    // Container 101, outer 102, inner 103, row 104.
+    _ = try servePage(&rec, arena_state.allocator(), list, size);
+
+    try std.testing.expect(try hydrate(gpa, rec.ops(), list, size, bg, null, &page));
+    const written = indexOfLine(rec.log.items, "writeScrollOffset(102,0,40)").?;
+    try std.testing.expect(written > indexOfLine(rec.log.items, "setStyle(103,").?);
+
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, bg, null, &mem, &page, false);
+    const after = rec.log.items[start..];
+    try std.testing.expect(contains(after, "readScrollOffset(102)->0,40"));
+    try std.testing.expect(!contains(after, "writeScrollOffset("));
+    try std.testing.expectEqual(@as(f32, 40), view.offset.y);
+    try std.testing.expect(!mem.synced);
 }

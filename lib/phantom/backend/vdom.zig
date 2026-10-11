@@ -202,7 +202,8 @@ const Builder = struct {
             if (rule.hash == hash) return;
         }
         // The page sets the base colour on the element, and an element style
-        // wins over a rule that is not important.
+        // wins over a rule that is not important. So a colour the tree draws
+        // for a key press does not show while the pointer is over the element.
         var css: std.ArrayList(u8) = .empty;
         if (hover.len > 0) try css.print(self.arena, ".{s}:hover{{{s} !important}}", .{ cls, hover });
         if (active.len > 0) try css.print(self.arena, ".{s}:active{{{s} !important}}", .{ cls, active });

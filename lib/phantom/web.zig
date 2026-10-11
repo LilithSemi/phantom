@@ -906,17 +906,17 @@ pub fn init(
     device_pixel_ratio: f32,
     strategy: phantom.UrlStrategy,
 ) !*WebApp {
-    // A page a server rendered is adopted. Its first frame is at the size the
-    // server rendered, so it has the server's shape, and the render at the
-    // real size below patches what differs.
-    const served = servedSize(ops);
-    const first_size = switch (served) {
-        .size => |s| s,
-        .none, .unusable => logical_viewport,
+    // A page a server rendered is adopted. Its first frame is at the size and
+    // dpr the server rendered, so it has the server's shape, and the render
+    // with the real metrics below patches what differs.
+    const served = servedMetrics(ops);
+    const first: Served = switch (served) {
+        .metrics => |m| m,
+        .none, .unusable => .{ .size = logical_viewport, .dpr = device_pixel_ratio },
     };
-    const app = try mount(gpa, ops, root, first_size, device_pixel_ratio, strategy);
+    const app = try mount(gpa, ops, root, first.size, first.dpr, strategy);
     errdefer app.deinit();
-    if (served == .unusable) app.sink.report(.hydrate_mismatch, "the server page names a size that is not usable, so it is built again");
+    if (served == .unusable) app.sink.report(.hydrate_mismatch, "the server page names a size or dpr that is not usable, so it is built again");
     // A server serves the font files of each page it renders.
     app.fonts_served = served != .none;
 
@@ -945,7 +945,7 @@ pub fn init(
         ops.setStyle(ops.body, decl);
     }
 
-    if (served == .size) {
+    if (served == .metrics) {
         app.hydrate();
         app.owner.setActiveViewMetrics(.{ .size = logical_viewport, .dpr = device_pixel_ratio, .text_scale = 1.0 });
     }
@@ -953,26 +953,35 @@ pub fn init(
     return app;
 }
 
-const ServedSize = union(enum) {
+const Served = struct { size: phantom.LogicalSize, dpr: f32 };
+
+const ServedMetrics = union(enum) {
     /// No server rendered the page.
     none,
     unusable,
-    size: phantom.LogicalSize,
+    metrics: Served,
 };
 
 /// The largest side a server page can name, in phantom px.
 const max_served_side = 1 << 15;
+/// The largest dpr a server page can name.
+const max_served_dpr = 64;
 
-/// The size a server rendered the page at, from `data-phantom-size="WxH"`
-/// on the body.
-fn servedSize(ops: phantom.backend.dom_calls.DomOps) ServedSize {
+/// The size and dpr a server rendered the page at, from
+/// `data-phantom-size="WxH"` and `data-phantom-dpr` on the body. A page with
+/// no dpr was rendered at 1.
+fn servedMetrics(ops: phantom.backend.dom_calls.DomOps) ServedMetrics {
     var buf: [32]u8 = undefined;
     const raw = ops.readAttribute(ops.body, "data-phantom-size", &buf) orelse return .none;
     const x = std.mem.indexOfScalar(u8, raw, 'x') orelse return .unusable;
     const w = std.fmt.parseFloat(f32, raw[0..x]) catch return .unusable;
     const h = std.fmt.parseFloat(f32, raw[x + 1 ..]) catch return .unusable;
     if (!usableSide(w) or !usableSide(h)) return .unusable;
-    return .{ .size = .{ .width = w, .height = h } };
+    var dpr_buf: [16]u8 = undefined;
+    const dpr_raw = ops.readAttribute(ops.body, "data-phantom-dpr", &dpr_buf) orelse "1";
+    const dpr = std.fmt.parseFloat(f32, dpr_raw) catch return .unusable;
+    if (!std.math.isFinite(dpr) or dpr <= 0 or dpr > max_served_dpr) return .unusable;
+    return .{ .metrics = .{ .size = .{ .width = w, .height = h }, .dpr = dpr } };
 }
 
 fn usableSide(v: f32) bool {
@@ -2737,4 +2746,44 @@ test "a resize rebuilds a widget that reads the width in its build" {
 
     app.resize(.{ .width = 320, .height = 300 }, 1.0);
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(rec.log.items, ",narrow)"));
+}
+
+/// One label at dpr 1 and two at dpr 2, so a frame at the wrong dpr has
+/// another shape than the server page.
+const DprLabels = struct {
+    pub const State = struct {
+        base: phantom.StateBase = .{},
+        pub fn build(_: *State, b: *phantom.BuildContext) anyerror!phantom.Widget {
+            const one = b.new(phantom.Text{ .text = "1x" }).widget();
+            if (phantom.MediaQuery.of(b).dpr < 2) return one;
+            const two = b.new(phantom.Text{ .text = "2x" }).widget();
+            return b.new(phantom.Column(.{ .children = b.newSlice(phantom.Widget, &.{ one, two }) })).widget();
+        }
+    };
+    pub fn widget(self: *const DprLabels) phantom.Widget {
+        return phantom.StatefulWidget(DprLabels, self);
+    }
+};
+
+const dpr_labels = DprLabels{};
+
+fn dprLabelsRoot(_: *phantom.BuildContext) phantom.Widget {
+    return dpr_labels.widget();
+}
+
+test "the hydration frame is at the server dpr, and the real dpr then patches the page" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const size: phantom.LogicalSize = .{ .width = 200, .height = 150 };
+    try servePage(gpa, &rec, phantom.Root.plain(dprLabelsRoot), size, "200x150");
+    try rec.addAttribute(rec.ops().body, "data-phantom-dpr", "1");
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(dprLabelsRoot), size, 2.0, .path);
+    defer app.deinit();
+
+    try std.testing.expectEqual(@as(?phantom.FaultSink.Fault, null), app.sink.first);
+    try std.testing.expect(app.page.last != null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(rec.log.items, "createElement"));
+    try std.testing.expect(logHas(rec.log.items, "setTextContent(104,2x)"));
+    try std.testing.expect(!logHas(rec.log.items, "clearChildren(1)"));
 }

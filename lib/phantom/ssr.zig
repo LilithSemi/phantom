@@ -118,6 +118,8 @@ pub const Document = struct {
     fonts: []dom.FontFile,
     /// The size the page was laid out at, in phantom px.
     size: phantom.PhysicalSize,
+    /// The device pixels for one phantom px the page was rendered at.
+    dpr: f32,
     base: []u8,
 
     pub fn deinit(self: *Document, gpa: std.mem.Allocator) void {
@@ -135,10 +137,11 @@ pub const Document = struct {
 
     /// Write the whole page. `shell` is the index.html of the application
     /// that `addApp` writes. The page keeps the shell and its boot script, and
-    /// gets a link to the stylesheet, the body content first in the body, and
-    /// the layout size in `data-phantom-size`. No `<base>` is added: a policy
-    /// with `base-uri 'none'` refuses it, so the shell must use root-absolute
-    /// urls to boot on a nested route. The `addApp` shell does.
+    /// gets a link to the stylesheet, the body content first in the body, the
+    /// layout size in `data-phantom-size` and the dpr in `data-phantom-dpr`.
+    /// No `<base>` is added: a policy with `base-uri 'none'` refuses it, so the
+    /// shell must use root-absolute urls to boot on a nested route. The
+    /// `addApp` shell does.
     ///
     /// `shell` must be plain, lowercase HTML: this finds `</head>` and `<body`
     /// by a literal text search, not by parsing markup, so neither tag name
@@ -159,7 +162,7 @@ pub const Document = struct {
         try w.writeAll(shell[0..head_end]);
         try w.print("<link rel=\"stylesheet\" href=\"{s}{s}{s}{s}\" />", .{ self.base, self.css_path, if (query.len > 0) "?" else "", query });
         try w.writeAll(shell[head_end..body_end]);
-        try w.print(" data-phantom-size=\"{d}x{d}\">", .{ self.size.width, self.size.height });
+        try w.print(" data-phantom-size=\"{d}x{d}\" data-phantom-dpr=\"{d}\">", .{ self.size.width, self.size.height, self.dpr });
         try w.writeAll(self.html);
         try w.writeAll(shell[body_end + 1 ..]);
     }
@@ -214,6 +217,7 @@ pub fn render(gpa: std.mem.Allocator, opts: Options) !Document {
         .css_path = css_path,
         .fonts = try fonts.toOwnedSlice(gpa),
         .size = opts.viewport,
+        .dpr = opts.dpr,
         .base = base,
     };
 }
@@ -553,7 +557,7 @@ test "writeHtml puts the page in the shell and keeps the boot script" {
         ,
         doc.css_path,
         \\" /></head>
-        \\  <body data-phantom-size="120x80">
+        \\  <body data-phantom-size="120x80" data-phantom-dpr="1">
         ,
         doc.html,
         \\
@@ -575,7 +579,7 @@ test "writeHtml adds no base and keeps the attributes of the body" {
     defer out.deinit();
     try doc.writeHtml(&out.writer, "<html><head></head><body class=\"x\"></body></html>");
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "<base") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<body class=\"x\" data-phantom-size=\"120x80\"><div class=\"p0\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<body class=\"x\" data-phantom-size=\"120x80\" data-phantom-dpr=\"1\"><div class=\"p0\">") != null);
 }
 
 test "writeHtml refuses a shell with no head end or no body" {
