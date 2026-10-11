@@ -362,7 +362,11 @@ const enter = async (f) => {
 const documentHandle = host.intern(document);
 const bodyHandle = host.intern(document.body);
 const windowHandle = host.intern(window);
-const app = await w.init(documentHandle, bodyHandle, windowHandle);
+// The page is written in rem, so the wasm side needs the root font size to
+// turn CSS px into its own px. A user can change it, so it is read again on
+// each resize.
+const rootFont = () => parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+const app = await w.init(documentHandle, bodyHandle, windowHandle, rootFont());
 document.body.addEventListener("click", (e) => enter(() => w.dispatchTap(app, e.clientX, e.clientY)));
 
 // The keyboard. These numbers are X11 keysyms, which is what
@@ -446,7 +450,7 @@ window.addEventListener("compositionend", (e) => enter(() => sendText(e.data)));
 // with no string to pass in: the wasm side reads the new location
 // back itself, so the JS host never allocates inside the module.
 window.addEventListener("popstate", () => enter(() => w.locationChanged(app)));
-const onResize = () => enter(() => w.resize(app, window.innerWidth, window.innerHeight, window.devicePixelRatio));
+const onResize = () => enter(() => w.resize(app, window.innerWidth, window.innerHeight, window.devicePixelRatio, rootFont()));
 window.addEventListener("resize", onResize);
 matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener("change", onResize);
 // t is the rAF timestamp: monotonic, same origin as performance.now.

@@ -5,6 +5,40 @@ const text = @import("../text.zig");
 const image_mod = @import("../image/Image.zig");
 const vdom = @import("vdom.zig");
 
+/// The CSS px in one rem when the user keeps the browser's default font size.
+pub const px_per_rem = 16;
+
+/// A length in phantom px, printed in rem with `{f}`. Zoom and the user's font
+/// size then scale the whole page.
+pub const Rem = struct {
+    px: f32,
+
+    /// Four decimals. One unit is 1/625 px, so whole and half px print
+    /// exactly, and the same value always prints the same text.
+    pub fn format(self: Rem, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        // A layout never gets near this size. The clamp keeps the cast below
+        // in range when a value is not finite.
+        const max_px = 1.0e9;
+        const px: f64 = if (std.math.isNan(self.px)) 0 else std.math.clamp(self.px, -max_px, max_px);
+        const units: i64 = @intFromFloat(@round(px * (10000.0 / px_per_rem)));
+        if (units == 0) return w.writeByte('0');
+        if (units < 0) try w.writeByte('-');
+        const abs = @abs(units);
+        try w.print("{d}", .{abs / 10000});
+        const frac = abs % 10000;
+        if (frac != 0) {
+            var buf: [4]u8 = undefined;
+            const digits = std.fmt.bufPrint(&buf, "{d:0>4}", .{frac}) catch unreachable;
+            try w.print(".{s}", .{std.mem.trimEnd(u8, digits, "0")});
+        }
+        try w.writeAll("rem");
+    }
+};
+
+pub fn rem(px: f32) Rem {
+    return .{ .px = px };
+}
+
 pub fn ch(v: f32) u8 {
     const scaled = std.math.clamp(v, 0.0, 1.0) * 255.0;
     return @intFromFloat(@round(scaled));
@@ -139,8 +173,8 @@ test "renderToString emits an @font-face and a positioned text div" {
     try std.testing.expect(std.mem.indexOf(u8, html, try std.fmt.bufPrint(&want, ";font-family:{s};", .{vdom.fontFamily(&fam, &font)})) != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "base64,") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, ">Hello<") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "left:12px") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "font-size:24px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "left:0.75rem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "font-size:1.5rem") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "background:rgb(0,0,0)") != null);
 }
 
@@ -156,10 +190,10 @@ test "renderToString emits a positioned div with border-radius" {
     const html = try renderToString(std.testing.allocator, list, geom.PhysicalSize{ .width = 800, .height = 600 }, geom.Color.rgb(0, 0, 0));
     defer std.testing.allocator.free(html);
 
-    try std.testing.expect(std.mem.indexOf(u8, html, "left:40px") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "top:40px") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "border-radius:16px") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "width:720px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "left:2.5rem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "top:2.5rem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "border-radius:1rem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "width:45rem") != null);
     // verify the float->0..255 channel conversion (0.15,0.35,0.85 -> 38,89,217)
     try std.testing.expect(std.mem.indexOf(u8, html, "rgba(38,89,217,1)") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "background:rgb(0,0,0)") != null);
@@ -203,21 +237,21 @@ test "renderToString: filled rrect uses background and no border; stroked rrect 
 
     // (a) Filled div: background present, no border property.
     try std.testing.expect(std.mem.indexOf(u8, html, "background:rgba(255,0,0,1)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "left:10px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "left:0.625rem") != null);
 
     // (b) Stroked div: border + box-sizing + transparent background + stroke color.
-    try std.testing.expect(std.mem.indexOf(u8, html, "border:3px solid rgba(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "border:0.1875rem solid rgba(") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "box-sizing:border-box") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "background:transparent") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "left:60px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "left:3.75rem") != null);
 
     // (c) Filled rrect regression: byte-for-byte match of the pre-change format.
     // The filled div must be exactly this string with no border property.
-    const expected_filled = "<div style=\"position:absolute;left:10px;top:20px;width:100px;height:50px;border-radius:5px;background:rgba(255,0,0,1)\"></div>";
+    const expected_filled = "<div style=\"position:absolute;left:0.625rem;top:1.25rem;width:6.25rem;height:3.125rem;border-radius:0.3125rem;background:rgba(255,0,0,1)\"></div>";
     try std.testing.expect(std.mem.indexOf(u8, html, expected_filled) != null);
     // Filled rrect must NOT contain any border property.
     // We check the filled div substring does not contain "border:".
-    const filled_start = std.mem.indexOf(u8, html, "left:10px").?;
+    const filled_start = std.mem.indexOf(u8, html, "left:0.625rem").?;
     const filled_end = std.mem.indexOf(u8, html[filled_start..], "</div>").? + filled_start + 6;
     try std.testing.expect(std.mem.indexOf(u8, html[filled_start..filled_end], "border:") == null);
 }
@@ -234,7 +268,7 @@ test "renderToString: plain filled rrect is byte-identical (no class, no pb styl
     defer std.testing.allocator.free(html);
 
     // (a) Byte-identical plain filled rrect: no class, no pb style.
-    const expected_filled = "<div style=\"position:absolute;left:10px;top:20px;width:100px;height:50px;border-radius:5px;background:rgba(255,0,0,1)\"></div>";
+    const expected_filled = "<div style=\"position:absolute;left:0.625rem;top:1.25rem;width:6.25rem;height:3.125rem;border-radius:0.3125rem;background:rgba(255,0,0,1)\"></div>";
     try std.testing.expect(std.mem.indexOf(u8, html, expected_filled) != null);
     // No class= attribute on this rrect.
     try std.testing.expect(std.mem.indexOf(u8, html, "class=") == null);
@@ -306,6 +340,26 @@ test "alpha() formats CSS alpha compactly: opaque 1, transparent 0, fractional t
     try std.testing.expectEqualStrings("0.15", alpha(&buf, 0.15));
 }
 
+test "rem prints px over 16 with at most four decimals and no trailing zeros" {
+    var buf: [32]u8 = undefined;
+    const cases = [_]struct { px: f32, want: []const u8 }{
+        .{ .px = 0, .want = "0" },
+        .{ .px = -0.0, .want = "0" },
+        .{ .px = 16, .want = "1rem" },
+        .{ .px = 10, .want = "0.625rem" },
+        .{ .px = 1, .want = "0.0625rem" },
+        .{ .px = 0.5, .want = "0.0313rem" },
+        .{ .px = 1023.2, .want = "63.95rem" },
+        .{ .px = -24, .want = "-1.5rem" },
+        .{ .px = 1.0 / 3.0, .want = "0.0208rem" },
+        .{ .px = std.math.nan(f32), .want = "0" },
+        .{ .px = std.math.inf(f32), .want = "62500000rem" },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqualStrings(c.want, try std.fmt.bufPrint(&buf, "{f}", .{rem(c.px)}));
+    }
+}
+
 test "renderToString: fractional alpha is compact (no long float representation)" {
     var list = dl.DisplayList{};
     defer list.deinit(std.testing.allocator);
@@ -338,10 +392,10 @@ test "renderToString: image with encoded bytes emits <img> tag with data URL" {
     // Must contain the data URL prefix for PNG.
     try std.testing.expect(std.mem.indexOf(u8, html, "data:image/png;base64,") != null);
     // Must contain the positioned style values.
-    try std.testing.expect(std.mem.indexOf(u8, html, "left:8px") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "top:16px") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "width:20px") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "height:10px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "left:0.5rem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "top:1rem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "width:1.25rem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "height:0.625rem") != null);
 }
 
 test "renderToString: image fromRgba (no encoded bytes) emits no img tag" {
@@ -377,9 +431,9 @@ test "renderToString: an icon emits an inline svg whose viewBox is the grid and 
     // The two must differ: an svg sized at its viewBox would pass a test that
     // only looked at one of them, and would draw every icon at 24 pixels.
     try std.testing.expect(std.mem.indexOf(u8, html, "viewBox=\"0 0 24 24\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "width=\"40\" height=\"40\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "width:2.5rem;height:2.5rem") != null);
     // Positioned like every other primitive, from the primitive's own origin.
-    try std.testing.expect(std.mem.indexOf(u8, html, "position:absolute;left:6px;top:9px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "position:absolute;left:0.375rem;top:0.5625rem") != null);
 }
 
 test "renderToString: an icon is a stroked centreline, not a filled shape" {
@@ -428,8 +482,8 @@ test "renderToString: an icon at twice the size reuses one path at a larger widt
     const d_start = std.mem.indexOf(u8, a, "d=\"").? + 3;
     const d_end = std.mem.indexOfScalarPos(u8, a, d_start, '"').?;
     try std.testing.expect(std.mem.indexOf(u8, b, a[d_start..d_end]) != null);
-    try std.testing.expect(std.mem.indexOf(u8, a, "width=\"16\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, b, "width=\"32\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a, "width:1rem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b, "width:2rem") != null);
 }
 
 test "renderToString: a labelled icon carries an svg title, so it has an accessible name" {
@@ -513,7 +567,7 @@ test "renderToString: an icon inside a scroll region is placed relative to the r
     const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 300, .height = 200 }, geom.Color.rgb(0, 0, 0));
     defer gpa.free(html);
     // 30-10 and 60-20, the same subtraction every other primitive makes.
-    try std.testing.expect(std.mem.indexOf(u8, html, "left:20px;top:40px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "left:1.25rem;top:2.5rem") != null);
 }
 
 test "renderToString: push_scroll emits overflow:scroll containers and adjusts child coords" {
@@ -540,11 +594,11 @@ test "renderToString: push_scroll emits overflow:scroll containers and adjusts c
 
     // Outer scroll container at viewport position
     try std.testing.expect(std.mem.indexOf(u8, html, "overflow:scroll") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "left:10px;top:20px;width:100px;height:50px;overflow:scroll") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "left:0.625rem;top:1.25rem;width:6.25rem;height:3.125rem;overflow:scroll") != null);
     // Inner content div with content size
-    try std.testing.expect(std.mem.indexOf(u8, html, "position:relative;width:100px;height:300px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "position:relative;width:6.25rem;height:18.75rem") != null);
     // Child rrect with adjusted coords: left=0 (10-10), top=100 (120-20)
-    try std.testing.expect(std.mem.indexOf(u8, html, "left:0px;top:100px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "left:0;top:6.25rem") != null);
     // Closing tags for both divs
     try std.testing.expect(std.mem.indexOf(u8, html, "</div></div>") != null);
 }
@@ -567,8 +621,8 @@ test "renderToString: a mark in a box that is not square stretches instead of le
     const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
     defer gpa.free(html);
     try std.testing.expect(std.mem.indexOf(u8, html, "preserveAspectRatio=\"none\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "width=\"16\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "height=\"48\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "width:1rem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "height:3rem") != null);
     // The viewBox stays the authoring grid, so one centreline still serves
     // every size and the stroke width keeps its grid units.
     try std.testing.expect(std.mem.indexOf(u8, html, "viewBox=\"0 0 24 24\"") != null);

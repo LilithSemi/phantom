@@ -158,18 +158,32 @@ fn clearChildren(ctx: *anyopaque, node: u32) void {
     const el = dom.Element{ .handle = node };
     el.set_innerHTML("");
 }
+/// Every length that crosses between the browser and phantom in this file goes
+/// through this scale. `init` and `resize` set it from the root font size.
+var css_scale: phantom.web.CssScale = .{};
+
+fn setRootFont(root_font: f64) void {
+    css_scale = .fromRootFont(root_font);
+}
+fn fromCss(v: f64) f32 {
+    return css_scale.fromCss(v);
+}
+fn toCss(v: f32) f32 {
+    return css_scale.toCss(v);
+}
+
 // The browser owns the scroll position of a region. These two hooks read it
 // for the view and write it when phantom moved the region.
 fn readScrollOffset(ctx: *anyopaque, node: u32) phantom.PhysicalOffset {
     _ = ctx;
     const el = dom.Element{ .handle = node };
-    return .{ .x = @floatCast(el.get_scrollLeft()), .y = @floatCast(el.get_scrollTop()) };
+    return .{ .x = fromCss(el.get_scrollLeft()), .y = fromCss(el.get_scrollTop()) };
 }
 fn writeScrollOffset(ctx: *anyopaque, node: u32, offset: phantom.PhysicalOffset) void {
     _ = ctx;
     const el = dom.Element{ .handle = node };
-    el.set_scrollLeft(offset.x);
-    el.set_scrollTop(offset.y);
+    el.set_scrollLeft(toCss(offset.x));
+    el.set_scrollTop(toCss(offset.y));
 }
 
 // Reads the address bar into buf, according to the build's url strategy. A
@@ -391,11 +405,12 @@ fn writeLocation(ctx: *anyopaque, path: []const u8, mode: phantom.WriteMode) voi
     }
 }
 
-export fn init(doc_handle: u32, body_handle: u32, window_handle: u32) usize {
+export fn init(doc_handle: u32, body_handle: u32, window_handle: u32, root_font: f64) usize {
     const win = dom.Window{ .handle = window_handle };
-    const vw: u32 = win.get_innerWidth();
-    const vh: u32 = win.get_innerHeight();
-    const dpr: f64 = win.get_devicePixelRatio();
+    setRootFont(root_font);
+    const vw = fromCss(@floatFromInt(win.get_innerWidth()));
+    const vh = fromCss(@floatFromInt(win.get_innerHeight()));
+    const dpr: f32 = @floatCast(win.get_devicePixelRatio());
     dom_ctx = .{ .doc = doc_handle, .window = window_handle };
     // Every panic from here on has a window to report through.
     dom_ready = true;
@@ -432,18 +447,19 @@ export fn init(doc_handle: u32, body_handle: u32, window_handle: u32) usize {
         .remove_attribute = removeAttribute,
     };
     const strategy: phantom.UrlStrategy = if (strategy_is_hash) .hash else .path;
-    const app = phantom.web.init(std.heap.wasm_allocator, ops, phantom.Root.plain(app_root.root), .{ .width = @floatFromInt(vw), .height = @floatFromInt(vh) }, @floatCast(dpr), strategy) catch return 0;
+    const app = phantom.web.init(std.heap.wasm_allocator, ops, phantom.Root.plain(app_root.root), .{ .width = vw, .height = vh }, toCss(dpr), strategy) catch return 0;
     return @intFromPtr(app);
 }
 export fn dispatchTap(app: usize, x: f32, y: f32) void {
     if (app == 0) return;
     const a: *phantom.web.WebApp = @ptrFromInt(app);
-    a.dispatchTap(x, y);
+    a.dispatchTap(fromCss(x), fromCss(y));
 }
-export fn resize(app: usize, w: u32, h: u32, dpr: f64) void {
+export fn resize(app: usize, w: u32, h: u32, dpr: f64, root_font: f64) void {
     if (app == 0) return;
     const a: *phantom.web.WebApp = @ptrFromInt(app);
-    a.resize(.{ .width = @floatFromInt(w), .height = @floatFromInt(h) }, @floatCast(dpr));
+    setRootFont(root_font);
+    a.resize(.{ .width = fromCss(@floatFromInt(w)), .height = fromCss(@floatFromInt(h)) }, toCss(@floatCast(dpr)));
 }
 // wall_ms is Date.now (settable, Unix epoch). mono_ms is the animation
 // frame timestamp (monotonic, page time origin). Both are needed: the
@@ -457,7 +473,7 @@ export fn tick(app: usize, wall_ms: f64, mono_ms: f64) void {
 export fn scrollChanged(app: usize, index: u32, x: f32, y: f32) void {
     if (app == 0) return;
     const a: *phantom.web.WebApp = @ptrFromInt(app);
-    a.scrollChanged(index, x, y);
+    a.scrollChanged(index, fromCss(x), fromCss(y));
 }
 // The browser moved back or forward. The address bar already shows the new
 // location, so this reads it back and tells the tree, rather than taking the

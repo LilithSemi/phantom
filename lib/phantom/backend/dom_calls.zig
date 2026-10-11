@@ -1018,8 +1018,8 @@ test "dom_calls: fill rrect creates a styled div appended to the container" {
     try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     // clears body, builds the container, then the rrect div with the right style + append.
     try std.testing.expect(contains(rec.log.items, "clearChildren(1)"));
-    try std.testing.expect(contains(rec.log.items, "position:relative;width:200px"));
-    try std.testing.expect(contains(rec.log.items, "left:10px;top:20px;width:30px;height:40px;border-radius:4px;background:rgba(255,0,0,1)"));
+    try std.testing.expect(contains(rec.log.items, "position:relative;width:12.5rem"));
+    try std.testing.expect(contains(rec.log.items, "left:0.625rem;top:1.25rem;width:1.875rem;height:2.5rem;border-radius:0.25rem;background:rgba(255,0,0,1)"));
 }
 
 test "dom_calls: a text primitive names its font the same way the font-face does" {
@@ -1095,7 +1095,7 @@ test "dom_calls: stroke rrect records a border:...solid rgba style" {
     try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     // Must have border-radius, box-sizing, and the border solid rgba style.
     try std.testing.expect(contains(rec.log.items, "box-sizing:border-box"));
-    try std.testing.expect(contains(rec.log.items, "border:2px solid rgba("));
+    try std.testing.expect(contains(rec.log.items, "border:0.125rem solid rgba("));
     try std.testing.expect(contains(rec.log.items, "background:transparent"));
 }
 
@@ -1211,11 +1211,11 @@ test "dom_calls: push_scroll creates outer+inner divs and adjusts child coords" 
     try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     // Outer div has overflow:scroll and the viewport position/size.
     try std.testing.expect(contains(rec.log.items, "overflow:scroll"));
-    try std.testing.expect(contains(rec.log.items, "left:10px;top:20px;width:100px;height:50px;overflow:scroll"));
+    try std.testing.expect(contains(rec.log.items, "left:0.625rem;top:1.25rem;width:6.25rem;height:3.125rem;overflow:scroll"));
     // Inner div has position:relative and the content size.
-    try std.testing.expect(contains(rec.log.items, "position:relative;width:100px;height:300px"));
+    try std.testing.expect(contains(rec.log.items, "position:relative;width:6.25rem;height:18.75rem"));
     // The rrect is appended to the inner div with adjusted coords: left=0 (10-10), top=100 (120-20).
-    try std.testing.expect(contains(rec.log.items, "left:0px;top:100px"));
+    try std.testing.expect(contains(rec.log.items, "left:0;top:6.25rem"));
 }
 
 test "dom_calls: a clip nested in a scroll positions itself relative to the scroll's origin, not the canvas" {
@@ -1238,10 +1238,10 @@ test "dom_calls: a clip nested in a scroll positions itself relative to the scro
     try list.append(gpa, .{ .pop_clip = {} });
     try list.append(gpa, .{ .pop_scroll = {} });
     try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
-    try std.testing.expect(contains(rec.log.items, "left:20px;top:30px;width:40px;height:40px"));
+    try std.testing.expect(contains(rec.log.items, "left:1.25rem;top:1.875rem;width:2.5rem;height:2.5rem"));
     // The un-adjusted absolute position must not appear: that would place the
     // clip twice as far from the scroll's own corner as it should be.
-    try std.testing.expect(!contains(rec.log.items, "left:30px;top:50px;width:40px;height:40px"));
+    try std.testing.expect(!contains(rec.log.items, "left:1.875rem;top:3.125rem;width:2.5rem;height:2.5rem"));
 }
 
 test "dom_calls: after a clip inside a scroll pops, later primitives return to the scroll's own div and origin" {
@@ -1279,7 +1279,7 @@ test "dom_calls: after a clip inside a scroll pops, later primitives return to t
     // rrect div=105, second rrect div=106.
     try std.testing.expect(contains(rec.log.items, "appendChild(103,106)"));
     try std.testing.expect(!contains(rec.log.items, "appendChild(101,106)"));
-    try std.testing.expect(contains(rec.log.items, "left:5px;top:5px;width:9px;height:9px"));
+    try std.testing.expect(contains(rec.log.items, "left:0.3125rem;top:0.3125rem;width:0.5625rem;height:0.5625rem"));
 }
 
 test "dom_calls: after a scroll nested inside another scroll pops, later primitives return to the outer scroll's div and origin" {
@@ -1318,7 +1318,7 @@ test "dom_calls: after a scroll nested inside another scroll pops, later primiti
     // first rrect div=106, second rrect div=107.
     try std.testing.expect(contains(rec.log.items, "appendChild(103,107)"));
     try std.testing.expect(!contains(rec.log.items, "appendChild(101,107)"));
-    try std.testing.expect(contains(rec.log.items, "left:5px;top:5px;width:7px;height:7px"));
+    try std.testing.expect(contains(rec.log.items, "left:0.3125rem;top:0.3125rem;width:0.4375rem;height:0.4375rem"));
 }
 
 test "dom_calls: a region nested past max_region_depth is skipped and reports a fault, without breaking the pops that follow" {
@@ -1356,7 +1356,7 @@ test "dom_calls: a region nested past max_region_depth is skipped and reports a 
     // was correctly unwound and the one refused push left nothing dangling for
     // its matching pop to (mis)restore.
     try std.testing.expect(contains(rec.log.items, "appendChild(101,134)"));
-    try std.testing.expect(contains(rec.log.items, "left:1px;top:2px;width:3px;height:4px"));
+    try std.testing.expect(contains(rec.log.items, "left:0.0625rem;top:0.125rem;width:0.1875rem;height:0.25rem"));
 }
 
 test "dom_calls: image with encoded bytes emits createElement(img), style, and data URL src" {
@@ -1377,7 +1377,7 @@ test "dom_calls: image with encoded bytes emits createElement(img), style, and d
     // A createElement("img") call must be recorded.
     try std.testing.expect(contains(rec.log.items, "createElement(img)"));
     // The style attribute must include left/top/width/height.
-    try std.testing.expect(contains(rec.log.items, "left:5px;top:15px;width:64px;height:32px"));
+    try std.testing.expect(contains(rec.log.items, "left:0.3125rem;top:0.9375rem;width:4rem;height:2rem"));
     // The src attribute value must begin with the data URL prefix for PNG.
     var found_src = false;
     for (rec.log.items) |l| {
@@ -1423,13 +1423,12 @@ test "dom_calls: an icon creates an svg in the SVG namespace holding one stroked
     // the namespaced call is the fact this pins.
     try std.testing.expect(contains(rec.log.items, "createElementNS(http://www.w3.org/2000/svg,svg)"));
     try std.testing.expect(contains(rec.log.items, "createElementNS(http://www.w3.org/2000/svg,path)"));
-    // The viewBox is the grid and the size is the request: two different values.
+    // The viewBox is the grid. The size is the request, in the style below.
     try std.testing.expect(contains(rec.log.items, "viewBox,0 0 24 24"));
-    try std.testing.expect(contains(rec.log.items, "width,40"));
-    try std.testing.expect(contains(rec.log.items, "height,40"));
+    try std.testing.expect(!contains(rec.log.items, ",width,"));
     // Through the CSSOM, not as a `style` attribute: the attribute form is what
     // a strict Content Security Policy refuses.
-    try std.testing.expect(contains(rec.log.items, "setStyle(") and contains(rec.log.items, "position:absolute;left:6px;top:9px"));
+    try std.testing.expect(contains(rec.log.items, "setStyle(") and contains(rec.log.items, "position:absolute;left:0.375rem;top:0.5625rem;width:2.5rem;height:2.5rem"));
     // A stroked centreline, not a filled outline.
     try std.testing.expect(contains(rec.log.items, "fill,none"));
     try std.testing.expect(contains(rec.log.items, "stroke-width,1.7"));

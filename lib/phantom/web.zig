@@ -243,7 +243,7 @@ pub const WebApp = struct {
     }
 
     pub fn dispatchTap(self: *WebApp, x: f32, y: f32) void {
-        // Web layout scale = text_scale = 1.0, so clientX/Y are physical coords.
+        // The page gives the tap in phantom px, the same space as the layout.
         const p = phantom.PhysicalOffset{ .x = x, .y = y };
         // The focus moves before the tap is delivered, so a handler that moves it
         // somewhere else of its own accord (a button that focuses a search box) has
@@ -786,14 +786,40 @@ pub fn webIo(app: *WebApp) std.Io {
     return .{ .userdata = app, .vtable = &web_vtable };
 }
 
+/// The CSS px in one phantom px. The DOM backend writes lengths in rem, so the
+/// browser draws one phantom px as the root font size over 16 CSS px. Each
+/// length that crosses between the page and phantom goes through this.
+pub const CssScale = struct {
+    css_per_px: f32 = 1,
+
+    /// `root_font` is the computed font size of the root element in CSS px.
+    /// It comes from the page, so a value that is not a usable size gives the
+    /// browser default.
+    pub fn fromRootFont(root_font: f64) CssScale {
+        const default: f64 = phantom.backend.dom.px_per_rem;
+        const ok = std.math.isFinite(root_font) and root_font >= 1 and root_font <= 1000;
+        const px = if (ok) root_font else default;
+        return .{ .css_per_px = @floatCast(px / default) };
+    }
+
+    pub fn fromCss(self: CssScale, v: f64) f32 {
+        return @floatCast(v / self.css_per_px);
+    }
+
+    pub fn toCss(self: CssScale, v: f32) f32 {
+        return v * self.css_per_px;
+    }
+};
+
 /// Build the widget tree and keep owner/arena/view alive for the page lifetime.
 /// Returns a heap-allocated *WebApp; the caller (JS via wasm) must store the
 /// returned pointer and pass it to the dispatch entries. Never deinit: the page
 /// owns it.
 ///
-/// logical_viewport: window inner size in CSS px (logical; browser handles DPR).
-/// device_pixel_ratio: stored in MediaQueryData for widgets to read; NOT applied
-/// to layout because the browser maps CSS px to physical pixels via DPR itself.
+/// logical_viewport: window inner size in phantom px (see `CssScale`).
+/// device_pixel_ratio: device pixels for one phantom px, stored in
+/// MediaQueryData for widgets to read. Layout does not use it, because the
+/// browser maps CSS px to device pixels itself.
 pub fn init(
     gpa: std.mem.Allocator,
     ops: phantom.backend.dom_calls.DomOps,
@@ -928,6 +954,21 @@ fn clockOnlyApp(wall_ns: i96, mono_ns: i96) WebApp {
         .wall_ns = wall_ns,
         .mono_ns = mono_ns,
     };
+}
+
+test "a root font of 20 css px makes one phantom px 1.25 css px, both ways" {
+    const s = CssScale.fromRootFont(20);
+    try std.testing.expectEqual(@as(f32, 1.25), s.css_per_px);
+    try std.testing.expectEqual(@as(f32, 1024), s.fromCss(1280));
+    try std.testing.expectEqual(@as(f32, 100), s.toCss(80));
+    try std.testing.expectEqual(@as(f32, 37.5), s.fromCss(s.toCss(37.5)));
+}
+
+test "a root font size that is not usable gives the default scale" {
+    for ([_]f64{ 0, -16, 0.5, 5000, std.math.nan(f64), std.math.inf(f64) }) |bad| {
+        try std.testing.expectEqual(@as(f32, 1), CssScale.fromRootFont(bad).css_per_px);
+    }
+    try std.testing.expectEqual(@as(f32, 1), CssScale.fromRootFont(16).css_per_px);
 }
 
 test "the web std.Io reports the wall clock the browser last pushed" {

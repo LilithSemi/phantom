@@ -344,5 +344,5 @@ test "the web backend clips to the rounded shape the widget asked for" {
 
     // A browser can express the whole shape, so it gets the whole shape.
     try h.expectHtml("overflow:hidden");
-    try h.expectHtml("border-radius:16px");
+    try h.expectHtml("border-radius:1rem");
 }

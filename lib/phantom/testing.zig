@@ -316,8 +316,8 @@ test "mount + pump the padded blue box, assert tree/layout/html" {
 
     try t.expect(find.byType(phantom.ColoredBox), .found);
     try t.expectSize(find.byType(phantom.ColoredBox), 720, 520);
-    try t.expectHtml("border-radius:16px");
-    try t.expectHtml("left:40px");
+    try t.expectHtml("border-radius:1rem");
+    try t.expectHtml("left:2.5rem");
 }
 
 test "Tier 2: padded blue box rasterizes with a blue center and background padding gap" {

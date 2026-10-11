@@ -163,9 +163,9 @@ const Builder = struct {
         const o = self.offset();
         var abuf: [8]u8 = undefined;
         const style = if (r.stroke_width > 0)
-            try self.arena.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent", .{ r.rect.x - o.x, r.rect.y - o.y, r.rect.width, r.rect.height, r.radius, r.stroke_width, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) })
+            try self.arena.print("position:absolute;left:{f};top:{f};width:{f};height:{f};border-radius:{f};box-sizing:border-box;border:{f} solid rgba({d},{d},{d},{s});background:transparent", .{ dom.rem(r.rect.x - o.x), dom.rem(r.rect.y - o.y), dom.rem(r.rect.width), dom.rem(r.rect.height), dom.rem(r.radius), dom.rem(r.stroke_width), dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) })
         else
-            try self.arena.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;background:rgba({d},{d},{d},{s})", .{ r.rect.x - o.x, r.rect.y - o.y, r.rect.width, r.rect.height, r.radius, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
+            try self.arena.print("position:absolute;left:{f};top:{f};width:{f};height:{f};border-radius:{f};background:rgba({d},{d},{d},{s})", .{ dom.rem(r.rect.x - o.x), dom.rem(r.rect.y - o.y), dom.rem(r.rect.width), dom.rem(r.rect.height), dom.rem(r.radius), dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
 
         if (r.hover_color == null and r.active_color == null) {
             return self.add(.{ .kind = .element, .tag = "div", .style = style });
@@ -206,7 +206,7 @@ const Builder = struct {
         // An image with no encoded bytes has nothing an <img> can show.
         if (im.bytes.len == 0) return;
         const o = self.offset();
-        const style = try self.arena.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px", .{ img.rect.x - o.x, img.rect.y - o.y, img.rect.width, img.rect.height });
+        const style = try self.arena.print("position:absolute;left:{f};top:{f};width:{f};height:{f}", .{ dom.rem(img.rect.x - o.x), dom.rem(img.rect.y - o.y), dom.rem(img.rect.width), dom.rem(img.rect.height) });
         const enc = std.base64.standard.Encoder;
         const prefix = try self.arena.print("data:{s};base64,", .{image_mod.Image.mime(im.format)});
         const src = try self.arena.alloc(u8, prefix.len + enc.calcSize(im.bytes.len));
@@ -229,14 +229,14 @@ const Builder = struct {
         // centreline serves every size. The stroke width stays in grid units.
         var gbuf: [svg_path.coord_len]u8 = undefined;
         const grid_s = svg_path.coord(&gbuf, icon_builtin.grid);
-        const svg_attrs = try self.arena.alloc(Attr, 4);
+        const svg_attrs = try self.arena.alloc(Attr, 2);
         svg_attrs[0] = .{ .name = "viewBox", .value = try self.arena.print("0 0 {s} {s}", .{ grid_s, grid_s }) };
         // Without this the browser centres the square grid in a box that is
         // not square and the mark comes out short.
         svg_attrs[1] = .{ .name = "preserveAspectRatio", .value = "none" };
-        svg_attrs[2] = .{ .name = "width", .value = try self.arena.print("{d}", .{ic.size.width}) };
-        svg_attrs[3] = .{ .name = "height", .value = try self.arena.print("{d}", .{ic.size.height}) };
-        const style = try self.arena.print("position:absolute;left:{d}px;top:{d}px", .{ ic.origin.x - o.x, ic.origin.y - o.y });
+        // The size is in the style, because the width and height attributes
+        // take no rem.
+        const style = try self.arena.print("position:absolute;left:{f};top:{f};width:{f};height:{f}", .{ dom.rem(ic.origin.x - o.x), dom.rem(ic.origin.y - o.y), dom.rem(ic.size.width), dom.rem(ic.size.height) });
 
         var abuf: [8]u8 = undefined;
         var sbuf: [svg_path.coord_len]u8 = undefined;
@@ -272,11 +272,11 @@ const Builder = struct {
         // `white-space:pre` keeps the line breaks and spaces this framework
         // already chose. Without it the browser collapses runs of spaces and
         // can break the run again.
-        const style = try self.arena.print("position:absolute;left:{d}px;top:{d}px;white-space:pre;font-family:{s};font-size:{d}px;color:rgba({d},{d},{d},{s}){s}{s}", .{
-            run.origin.x - o.x,
-            run.origin.y - o.y,
+        const style = try self.arena.print("position:absolute;left:{f};top:{f};white-space:pre;font-family:{s};font-size:{f};color:rgba({d},{d},{d},{s}){s}{s}", .{
+            dom.rem(run.origin.x - o.x),
+            dom.rem(run.origin.y - o.y),
             fontFamily(&fam, font_ptr),
-            run.size,
+            dom.rem(run.size),
             dom.ch(run.color.r),
             dom.ch(run.color.g),
             dom.ch(run.color.b),
@@ -296,7 +296,7 @@ const Builder = struct {
         const outer: Node = .{
             .kind = .element,
             .tag = "div",
-            .style = try self.arena.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll", .{ sr.viewport.x - o.x, sr.viewport.y - o.y, sr.viewport.width, sr.viewport.height }),
+            .style = try self.arena.print("position:absolute;left:{f};top:{f};width:{f};height:{f};overflow:scroll", .{ dom.rem(sr.viewport.x - o.x), dom.rem(sr.viewport.y - o.y), dom.rem(sr.viewport.width), dom.rem(sr.viewport.height) }),
             .attrs = attrs,
             .key = sr.handlers,
             .scroll = .{ .offset = sr.offset, .moved = sr.moved, .handlers = sr.handlers },
@@ -304,7 +304,7 @@ const Builder = struct {
         const inner: Node = .{
             .kind = .element,
             .tag = "div",
-            .style = try self.arena.print("position:relative;width:{d}px;height:{d}px", .{ sr.content.width, sr.content.height }),
+            .style = try self.arena.print("position:relative;width:{f};height:{f}", .{ dom.rem(sr.content.width), dom.rem(sr.content.height) }),
         };
         if (self.open(.{ .node = inner, .outer = outer, .origin = .{ .x = sr.viewport.x, .y = sr.viewport.y } }, "scroll region nesting exceeded max_region_depth, region skipped")) {
             self.regions += 1;
@@ -318,7 +318,7 @@ const Builder = struct {
         const node: Node = .{
             .kind = .element,
             .tag = "div",
-            .style = try self.arena.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;overflow:hidden", .{ cr.rect.x - o.x, cr.rect.y - o.y, cr.rect.width, cr.rect.height, cr.radius }),
+            .style = try self.arena.print("position:absolute;left:{f};top:{f};width:{f};height:{f};border-radius:{f};overflow:hidden", .{ dom.rem(cr.rect.x - o.x), dom.rem(cr.rect.y - o.y), dom.rem(cr.rect.width), dom.rem(cr.rect.height), dom.rem(cr.radius) }),
         };
         _ = self.open(.{ .node = node, .origin = .{ .x = cr.rect.x, .y = cr.rect.y } }, "clip region nesting exceeded max_region_depth, region skipped");
     }
@@ -332,7 +332,7 @@ pub fn build(arena: std.mem.Allocator, list: display_list.DisplayList, viewport:
     b.stack[0] = .{ .node = .{
         .kind = .element,
         .tag = "div",
-        .style = try arena.print("position:relative;width:{d}px;height:{d}px;background:rgb({d},{d},{d})", .{ viewport.width, viewport.height, dom.ch(bg.r), dom.ch(bg.g), dom.ch(bg.b) }),
+        .style = try arena.print("position:relative;width:{f};height:{f};background:rgb({d},{d},{d})", .{ dom.rem(viewport.width), dom.rem(viewport.height), dom.ch(bg.r), dom.ch(bg.g), dom.ch(bg.b) }),
     } };
 
     for (list.primitives.items) |p| switch (p) {
@@ -368,7 +368,7 @@ test "vdom: the root is the container sized to the viewport with the background"
     const list: display_list.DisplayList = .{};
     const tree = try build(arena_state.allocator(), list, .{ .width = 300, .height = 150 }, geometry.Color.rgb(1, 0, 0), null);
     try std.testing.expectEqualStrings("div", tree.root.tag);
-    try std.testing.expectEqualStrings("position:relative;width:300px;height:150px;background:rgb(255,0,0)", tree.root.style);
+    try std.testing.expectEqualStrings("position:relative;width:18.75rem;height:9.375rem;background:rgb(255,0,0)", tree.root.style);
     try std.testing.expectEqual(@as(usize, 0), tree.root.children.len);
     try std.testing.expectEqual(@as(usize, 1), tree.count);
 }
@@ -383,7 +383,7 @@ test "vdom: a plain rrect is one div with no class and adds no rule" {
     const tree = try testBuild(arena_state.allocator(), list);
     try std.testing.expectEqual(@as(usize, 1), tree.root.children.len);
     const node = tree.root.children[0];
-    try std.testing.expectEqualStrings("position:absolute;left:10px;top:20px;width:30px;height:40px;border-radius:4px;background:rgba(255,0,0,1)", node.style);
+    try std.testing.expectEqualStrings("position:absolute;left:0.625rem;top:1.25rem;width:1.875rem;height:2.5rem;border-radius:0.25rem;background:rgba(255,0,0,1)", node.style);
     try std.testing.expectEqual(@as(usize, 0), node.attrs.len);
     try std.testing.expectEqual(@as(usize, 0), tree.rules.len);
 }
@@ -437,7 +437,7 @@ test "vdom: a scroll region is an outer node with its key and one inner node hol
 
     try std.testing.expectEqual(@as(usize, 2), tree.root.children.len);
     const outer = tree.root.children[0];
-    try std.testing.expectEqualStrings("position:absolute;left:10px;top:20px;width:100px;height:50px;overflow:scroll", outer.style);
+    try std.testing.expectEqualStrings("position:absolute;left:0.625rem;top:1.25rem;width:6.25rem;height:3.125rem;overflow:scroll", outer.style);
     try std.testing.expectEqual(@as(?*const anyopaque, &handlers), outer.key);
     try std.testing.expectEqual(@as(u32, 3), outer.scroll.?.moved);
     try std.testing.expectEqual(@as(f32, 7), outer.scroll.?.offset.y);
@@ -446,12 +446,12 @@ test "vdom: a scroll region is an outer node with its key and one inner node hol
     try std.testing.expectEqualStrings("0", outer.attrs[0].value);
     try std.testing.expectEqual(@as(usize, 1), outer.children.len);
     const inner = outer.children[0];
-    try std.testing.expectEqualStrings("position:relative;width:100px;height:300px", inner.style);
+    try std.testing.expectEqualStrings("position:relative;width:6.25rem;height:18.75rem", inner.style);
     try std.testing.expectEqual(@as(?Scroll, null), inner.scroll);
     try std.testing.expectEqual(@as(usize, 0), inner.attrs.len);
-    try std.testing.expectEqualStrings("position:absolute;left:0px;top:100px;width:80px;height:20px;border-radius:0px;background:rgba(255,0,0,1)", inner.children[0].style);
+    try std.testing.expectEqualStrings("position:absolute;left:0;top:6.25rem;width:5rem;height:1.25rem;border-radius:0;background:rgba(255,0,0,1)", inner.children[0].style);
     // After the pop the next rrect is back in the container's space.
-    try std.testing.expect(std.mem.startsWith(u8, tree.root.children[1].style, "position:absolute;left:1px;top:2px;"));
+    try std.testing.expect(std.mem.startsWith(u8, tree.root.children[1].style, "position:absolute;left:0.0625rem;top:0.125rem;"));
     try std.testing.expectEqual(countNodes(tree.root), tree.count);
 }
 
@@ -476,8 +476,8 @@ test "vdom: a clip nested in a scroll is placed in the scroll's space and holds 
     try std.testing.expectEqual(@as(?*const anyopaque, null), outer.key);
     try std.testing.expect(outer.scroll != null);
     const clip = outer.children[0].children[0];
-    try std.testing.expectEqualStrings("position:absolute;left:20px;top:30px;width:40px;height:40px;border-radius:6px;overflow:hidden", clip.style);
-    try std.testing.expect(std.mem.startsWith(u8, clip.children[0].style, "position:absolute;left:5px;top:5px;"));
+    try std.testing.expectEqualStrings("position:absolute;left:1.25rem;top:1.875rem;width:2.5rem;height:2.5rem;border-radius:0.375rem;overflow:hidden", clip.style);
+    try std.testing.expect(std.mem.startsWith(u8, clip.children[0].style, "position:absolute;left:0.3125rem;top:0.3125rem;"));
     try std.testing.expectEqual(@as(usize, 5), tree.count);
 }
 
@@ -499,11 +499,10 @@ test "vdom: an icon is an svg holding a title and a stroked path" {
     const svg = tree.root.children[0];
     try std.testing.expectEqual(Kind.element_svg, svg.kind);
     try std.testing.expectEqualStrings("svg", svg.tag);
-    try std.testing.expectEqualStrings("position:absolute;left:6px;top:9px", svg.style);
+    try std.testing.expectEqualStrings("position:absolute;left:0.375rem;top:0.5625rem;width:2.5rem;height:2rem", svg.style);
     try std.testing.expectEqualStrings("0 0 24 24", svg.attrs[0].value);
     try std.testing.expectEqualStrings("none", svg.attrs[1].value);
-    try std.testing.expectEqualStrings("40", svg.attrs[2].value);
-    try std.testing.expectEqualStrings("32", svg.attrs[3].value);
+    try std.testing.expectEqual(@as(usize, 2), svg.attrs.len);
     try std.testing.expectEqual(@as(usize, 2), svg.children.len);
     try std.testing.expectEqualStrings("title", svg.children[0].tag);
     try std.testing.expectEqualStrings("Gate", svg.children[0].text);
@@ -534,7 +533,7 @@ test "vdom: a text run is a div holding its text, and an empty run makes no node
     try std.testing.expectEqualStrings("  hi", node.text);
     var fam: [family_len]u8 = undefined;
     var want: [256]u8 = undefined;
-    const style = try std.fmt.bufPrint(&want, "position:absolute;left:5px;top:8px;white-space:pre;font-family:{s};font-size:16px;color:rgba(255,255,255,1);text-decoration:underline", .{fontFamily(&fam, &font)});
+    const style = try std.fmt.bufPrint(&want, "position:absolute;left:0.3125rem;top:0.5rem;white-space:pre;font-family:{s};font-size:1rem;color:rgba(255,255,255,1);text-decoration:underline", .{fontFamily(&fam, &font)});
     try std.testing.expectEqualStrings(style, node.style);
 }
 
@@ -597,7 +596,7 @@ test "vdom: an image with encoded bytes is an img with a data url, and one witho
     try std.testing.expectEqual(@as(usize, 1), tree.root.children.len);
     const node = tree.root.children[0];
     try std.testing.expectEqualStrings("img", node.tag);
-    try std.testing.expectEqualStrings("position:absolute;left:5px;top:15px;width:64px;height:32px", node.style);
+    try std.testing.expectEqualStrings("position:absolute;left:0.3125rem;top:0.9375rem;width:4rem;height:2rem", node.style);
     try std.testing.expectEqualStrings("src", node.attrs[0].name);
     try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgoAAQ==", node.attrs[0].value);
 }
