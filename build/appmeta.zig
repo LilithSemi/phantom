@@ -79,7 +79,8 @@ pub const AppOptions = struct {
     /// "/docs/intro". Each page holds the first frame of that route at
     /// `default_size`, so a static host shows it before the wasm boots and
     /// answers a refresh with 200. A route other than "/" needs the `.path`
-    /// strategy. The root page is a plain shell when "/" is not listed.
+    /// strategy. The root page is a plain shell when "/" is not listed. Not
+    /// usable with `imports` yet.
     prerender_routes: []const []const u8 = &.{},
     /// The size in phantom px that prerendered pages are laid out at.
     default_size: Size = .{ .width = 1280, .height = 800 },
@@ -92,12 +93,15 @@ pub const AppOptions = struct {
 
 pub const Size = struct { width: u32, height: u32 };
 
-pub const PrerenderError = error{ HashRoute, InvalidRoute };
+pub const PrerenderError = error{ HashRoute, InvalidRoute, Imports };
 
 /// Check the routes to prerender. A `.hash` route lives after the '#', which a
 /// host never sees, so only "/" is allowed with `.hash`. A route starts with
-/// '/' and has no query, fragment or ".." segment.
-pub fn checkPrerender(strategy: UrlStrategy, routes: []const []const u8) PrerenderError!void {
+/// '/' and has no query, fragment or ".." segment. The host build that
+/// renders the routes cannot use `imports` yet: those modules are built for
+/// the web target and import its phantom module.
+pub fn checkPrerender(strategy: UrlStrategy, routes: []const []const u8, has_imports: bool) PrerenderError!void {
+    if (routes.len > 0 and has_imports) return error.Imports;
     for (routes) |route| {
         if (route.len == 0 or route[0] != '/') return error.InvalidRoute;
         if (std.mem.indexOfAny(u8, route, "?#\\") != null) return error.InvalidRoute;
@@ -116,12 +120,16 @@ pub fn pageDir(route: []const u8) []const u8 {
 }
 
 /// Check a `base_path`: it must start and end with '/', so a relative asset
-/// URL always resolves from the site root. A caller passes a bad value only
-/// by mistake, so build.zig turns this into a loud build failure rather than
-/// installing a subtly broken site.
+/// URL always resolves from the site root. It must have no `"`, `<`, `>`, `\`
+/// or control character, because the page prints it into html and css. A
+/// caller passes a bad value only by mistake, so build.zig turns this into a
+/// loud build failure rather than installing a subtly broken site.
 pub fn validateBasePath(base_path: []const u8) error{InvalidBasePath}!void {
     if (base_path.len == 0) return error.InvalidBasePath;
     if (base_path[0] != '/' or base_path[base_path.len - 1] != '/') return error.InvalidBasePath;
+    for (base_path) |c| {
+        if (c == '"' or c == '<' or c == '>' or c == '\\' or c < 0x20) return error.InvalidBasePath;
+    }
 }
 
 /// The binary name for an app. Borrows both arguments and returns a slice into
@@ -454,6 +462,10 @@ test "validateBasePath rejects a base missing a leading or trailing slash" {
     try std.testing.expectError(error.InvalidBasePath, validateBasePath(""));
     try std.testing.expectError(error.InvalidBasePath, validateBasePath("docs/"));
     try std.testing.expectError(error.InvalidBasePath, validateBasePath("/docs"));
+    try std.testing.expectError(error.InvalidBasePath, validateBasePath("/a\"b/"));
+    try std.testing.expectError(error.InvalidBasePath, validateBasePath("/a<b>/"));
+    try std.testing.expectError(error.InvalidBasePath, validateBasePath("/a\\b/"));
+    try std.testing.expectError(error.InvalidBasePath, validateBasePath("/a\nb/"));
 }
 
 test "resolveExecName rejects an id with a trailing dot rather than returning empty" {
@@ -463,21 +475,26 @@ test "resolveExecName rejects an id with a trailing dot rather than returning em
 }
 
 test "checkPrerender allows only the root route with the hash strategy" {
-    try checkPrerender(.hash, &.{"/"});
-    try checkPrerender(.path, &.{ "/", "/text", "/docs/intro/" });
-    try std.testing.expectError(error.HashRoute, checkPrerender(.hash, &.{ "/", "/text" }));
+    try checkPrerender(.hash, &.{"/"}, false);
+    try checkPrerender(.path, &.{ "/", "/text", "/docs/intro/" }, false);
+    try std.testing.expectError(error.HashRoute, checkPrerender(.hash, &.{ "/", "/text" }, false));
 }
 
 test "checkPrerender rejects a route that leaves the dist root or is no path" {
-    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"text"}));
-    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{""}));
-    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"/a/../../b"}));
-    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"/a?b"}));
-    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"/a#b"}));
+    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"text"}, false));
+    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{""}, false));
+    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"/a/../../b"}, false));
+    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"/a?b"}, false));
+    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"/a#b"}, false));
 }
 
 test "pageDir puts the root page at the dist root" {
     try std.testing.expectEqualStrings("", pageDir("/"));
     try std.testing.expectEqualStrings("text", pageDir("/text"));
     try std.testing.expectEqualStrings("docs/intro", pageDir("/docs/intro/"));
+}
+
+test "checkPrerender refuses app imports, which the host build cannot use" {
+    try std.testing.expectError(error.Imports, checkPrerender(.path, &.{"/"}, true));
+    try checkPrerender(.path, &.{}, true);
 }

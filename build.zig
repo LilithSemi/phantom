@@ -152,7 +152,7 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
     // install a page whose assets resolve to the wrong place.
     appmeta.validateBasePath(opts.base_path) catch {
         dist.step.dependOn(&b.addFail(b.fmt(
-            "phantom.addApp: base_path must start and end with '/', got \"{s}\"",
+            "phantom.addApp: base_path must start and end with '/' and have no '\"', '<', '>', '\\' or control character, got \"{s}\"",
             .{opts.base_path},
         )).step);
         return .{ .dir = dist.getDirectory(), .files = &.{} };
@@ -318,10 +318,11 @@ fn addPrerender(
     dist: *std.Build.Step.WriteFile,
     files: *std.ArrayList([]const u8),
 ) void {
-    appmeta.checkPrerender(opts.url_strategy, opts.prerender_routes) catch |err| {
+    appmeta.checkPrerender(opts.url_strategy, opts.prerender_routes, opts.imports.len > 0) catch |err| {
         const why = switch (err) {
             error.HashRoute => "a .hash route lives after the '#', which a host never receives, so only \"/\" can be prerendered. Use url_strategy .path",
             error.InvalidRoute => "each route must start with '/' and have no query, fragment, '\\' or \".\" or \"..\" segment",
+            error.Imports => "the routes render in a host build, but the modules in `imports` are built for the web target and import its phantom module. Remove imports or prerender_routes",
         };
         dist.step.dependOn(&b.addFail(b.fmt("phantom.addApp: prerender_routes: {s}", .{why})).step);
         return;
