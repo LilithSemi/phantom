@@ -77,8 +77,9 @@ pub const WebApp = struct {
         self.mono_ns = @intFromFloat(mono_ms * std.time.ns_per_ms);
         self.owner.scheduler.tick(self.mono_ns);
         // An unconditional render would rebuild the whole DOM 60 times a
-        // second, so repaint only when a callback marked something dirty.
-        if (self.owner.dirty.items.len > 0) self.render();
+        // second, so repaint only when a callback marked something dirty or
+        // moved a scroll offset.
+        if (self.owner.dirty.items.len > 0 or self.owner.repaint) self.render();
     }
 
     /// Called by the page with one event of the stream `id`. An id that names
@@ -181,6 +182,7 @@ pub const WebApp = struct {
     }
 
     pub fn render(self: *WebApp) void {
+        self.owner.repaint = false;
         // One BuildContext per render for flushDirty + layout + paint.
         var bctx = phantom.BuildContext{ .arena = self.arena.allocator(), .owner = self.owner };
         self.owner.flushDirty(&bctx);
@@ -1269,6 +1271,109 @@ test "a scroll the browser reports far down a ListView builds the rows there" {
     app.tick(0, 16);
     try std.testing.expectEqual(@as(f32, 50_000), scroll_ctl.offset().?.y);
     try std.testing.expect(list_rows_highest >= 2510);
+    try std.testing.expect(app.sink.ok());
+}
+
+fn writtenOffset(rec: *const phantom.backend.dom_calls.Recorder, from: usize, node: u32, y: f32) bool {
+    var buf: [64]u8 = undefined;
+    const want = std.fmt.bufPrint(&buf, "writeScrollOffset({d},0,{d})", .{ node, y }) catch return false;
+    for (rec.log.items[from..]) |line| {
+        if (std.mem.eql(u8, line, want)) return true;
+    }
+    return false;
+}
+
+test "a jumpTo alone makes the next frame move the browser's div" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    scroll_ctl = .{};
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(tallScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    // The browser is at 300 and phantom knows it.
+    rec.setScrollOffset(app.scroll_mem.handles[0], .{ .x = 0, .y = 300 });
+    app.scrollChanged(0, 0, 300);
+
+    try std.testing.expect(scroll_ctl.jumpTo(.{ .x = 0, .y = 1500 }));
+    const before = rec.log.items.len;
+    app.tick(0, 16);
+    try std.testing.expect(writtenOffset(&rec, before, app.scroll_mem.handles[0], 1500));
+
+    // The browser reports the scroll that the write caused. Phantom is
+    // already there, so nothing moves and nothing renders.
+    const lines = rec.log.items.len;
+    app.scrollChanged(0, 0, 1500);
+    app.tick(0, 32);
+    try std.testing.expectEqual(@as(f32, 1500), scroll_ctl.offset().?.y);
+    try std.testing.expectEqual(lines, rec.log.items.len);
+    try std.testing.expect(app.sink.ok());
+}
+
+test "a rebuild with no phantom move keeps the browser's offset" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    scroll_ctl = .{};
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(tallScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    // The browser scrolled, and its event has not reached phantom yet.
+    rec.setScrollOffset(app.scroll_mem.handles[0], .{ .x = 0, .y = 300 });
+    var before = rec.log.items.len;
+    app.render();
+    try std.testing.expect(writtenOffset(&rec, before, app.scroll_mem.handles[0], 300));
+
+    // A phantom move wins once. After that the browser's offset wins again.
+    try std.testing.expect(scroll_ctl.jumpTo(.{ .x = 0, .y = 1500 }));
+    app.render();
+    rec.setScrollOffset(app.scroll_mem.handles[0], .{ .x = 0, .y = 400 });
+    before = rec.log.items.len;
+    app.render();
+    try std.testing.expect(writtenOffset(&rec, before, app.scroll_mem.handles[0], 400));
+    try std.testing.expect(app.sink.ok());
+}
+
+fn focusScrollRoot(b: *phantom.BuildContext) phantom.Widget {
+    const box = b.new(phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) });
+    const tall = b.new(phantom.SizedBox{ .height = 2000, .child = box.widget() });
+    return b.new(phantom.ScrollView{ .controller = &scroll_ctl, .id = "page", .child = tall.widget() }).widget();
+}
+
+test "a keyboard scroll reaches the browser's div" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    scroll_ctl = .{};
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(focusScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    try std.testing.expect(app.focus.focusById("page"));
+    const before = rec.log.items.len;
+    try std.testing.expect(app.dispatchKey(.{ .keysym = .end }));
+    try std.testing.expectEqual(@as(f32, 1800), scroll_ctl.offset().?.y);
+    try std.testing.expect(writtenOffset(&rec, before, app.scroll_mem.handles[0], 1800));
+    try std.testing.expect(app.sink.ok());
+}
+
+test "a jumpTo to the end of a ListView builds the end rows and moves the div there" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    scroll_ctl = .{};
+    list_rows_highest = 0;
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(listRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    const end = scroll_ctl.maxOffset().?.y;
+    try std.testing.expectEqual(@as(f32, 199_800), end);
+    try std.testing.expect(scroll_ctl.jumpTo(.{ .x = 0, .y = end }));
+    const before = rec.log.items.len;
+    app.tick(0, 16);
+    app.tick(0, 32);
+    try std.testing.expectEqual(@as(usize, 9999), list_rows_highest);
+    try std.testing.expectEqual(end, scroll_ctl.offset().?.y);
+    try std.testing.expect(writtenOffset(&rec, before, app.scroll_mem.handles[0], end));
     try std.testing.expect(app.sink.ok());
 }
 

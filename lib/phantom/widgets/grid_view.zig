@@ -84,6 +84,8 @@ const RenderGridView = struct {
     id: phantom.focus.OwnedId = .{},
     /// The controller this grid is attached to, kept so `destroyFn` can detach.
     controller: ?*scroll_view.ScrollController = null,
+    moved: u32 = 0,
+    owner: ?*phantom.BuildOwner = null,
 
     fn reportOom(self: *RenderGridView, msg: []const u8) void {
         if (self.sink) |s| s.report(.oom, msg);
@@ -146,6 +148,7 @@ const RenderGridView = struct {
             .offset = self.offset,
             .content = self.content,
             .handlers = &self.handlers,
+            .moved = self.moved,
         });
         // Iterate by offsets length so a short offsets list (OOM during layout)
         // never indexes out of bounds; tiles beyond it are skipped this frame.
@@ -164,11 +167,17 @@ const RenderGridView = struct {
         if (self.controller == controller) return;
         self.detach();
         self.controller = controller;
-        if (controller) |c| c.view = .{
+        if (controller) |c| c.view = self.scrollable();
+    }
+
+    fn scrollable(self: *RenderGridView) scroll_view.Scrollable {
+        return .{
             .node = &self.base,
             .offset = &self.offset,
             .content = &self.content,
             .viewport = &self.viewport,
+            .moved = &self.moved,
+            .owner = self.owner,
         };
     }
 
@@ -196,7 +205,7 @@ const RenderGridView = struct {
 
     fn scrollThunk(ctx: *anyopaque, dx: f32, dy: f32) bool {
         const self: *RenderGridView = @ptrCast(@alignCast(ctx));
-        return scrollToThunk(self, self.offset.x + dx, self.offset.y + dy);
+        return self.scrollable().set(.{ .x = self.offset.x + dx, .y = self.offset.y + dy });
     }
 
     fn scrollToThunk(ctx: *anyopaque, x: f32, y: f32) bool {
@@ -269,6 +278,7 @@ pub const GridView = struct {
             },
             .gpa = gpa,
             .sink = bctx.owner.sink,
+            .owner = bctx.owner,
             .columns = self.columns,
             .spacing = self.spacing,
             .aspect_ratio = self.aspect_ratio,

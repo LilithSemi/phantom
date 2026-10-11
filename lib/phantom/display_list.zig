@@ -53,6 +53,11 @@ pub const ScrollRegion = struct {
     /// The handlers of the render object that scrolls this region. A backend
     /// that scrolls by itself uses them to send the new offset back.
     handlers: ?*pointer.PointerHandlers = null,
+    /// Counts the offset changes the render object made itself. A backend
+    /// where the host owns the scroll position writes `offset` to the host
+    /// when this changed since its last frame, and keeps the host's own
+    /// offset when it did not.
+    moved: u32 = 0,
 };
 
 /// A rounded rectangle that bounds everything drawn until the matching

@@ -91,6 +91,24 @@ pub const Scrollable = struct {
     offset: *geom.PhysicalOffset,
     content: *const geom.PhysicalSize,
     viewport: *const geom.PhysicalSize,
+    /// Goes up by one on each offset change made through `set`. Copied into
+    /// `ScrollRegion.moved`.
+    moved: *u32,
+    /// Told to repaint when `set` moves the offset. Null in a test that has
+    /// no owner.
+    owner: ?*phantom.BuildOwner,
+
+    /// Clamp `to` and make it the offset. Returns true when the offset changed.
+    /// A backend that reports where the host scrolled to sets the offset
+    /// directly instead, because that change is already on screen.
+    pub fn set(self: Scrollable, to: geom.PhysicalOffset) bool {
+        const next = clampOffset(to, self.content.*, self.viewport.*);
+        if (next.x == self.offset.x and next.y == self.offset.y) return false;
+        self.offset.* = next;
+        self.moved.* +%= 1;
+        if (self.owner) |o| o.repaint = true;
+        return true;
+    }
 };
 
 /// The handle an application holds to reach a mounted scrolling widget. The scroll
@@ -129,7 +147,7 @@ pub const ScrollController = struct {
     /// false while detached.
     pub fn jumpTo(self: *ScrollController, to: geom.PhysicalOffset) bool {
         const v = self.view orelse return false;
-        v.offset.* = clampOffset(to, v.content.*, v.viewport.*);
+        _ = v.set(to);
         return true;
     }
 
@@ -137,12 +155,7 @@ pub const ScrollController = struct {
     /// detached.
     pub fn scrollBy(self: *ScrollController, dx: f32, dy: f32) bool {
         const v = self.view orelse return false;
-        // The same clamp both scrolling render objects apply to a wheel event.
-        v.offset.* = clampOffset(
-            .{ .x = v.offset.x + dx, .y = v.offset.y + dy },
-            v.content.*,
-            v.viewport.*,
-        );
+        _ = v.set(.{ .x = v.offset.x + dx, .y = v.offset.y + dy });
         return true;
     }
 
@@ -151,7 +164,7 @@ pub const ScrollController = struct {
     /// while detached.
     pub fn scrollIntoView(self: *ScrollController, rect: geom.PhysicalRect) bool {
         const v = self.view orelse return false;
-        v.offset.* = clampOffset(offsetToShow(v.offset.*, rect, v.viewport.*), v.content.*, v.viewport.*);
+        _ = v.set(offsetToShow(v.offset.*, rect, v.viewport.*));
         return true;
     }
 
@@ -192,6 +205,8 @@ const RenderScrollView = struct {
     /// The controller this view is attached to, kept so `destroyFn` can detach.
     controller: ?*ScrollController = null,
     axis: ScrollView.Axis = .vertical,
+    moved: u32 = 0,
+    owner: ?*phantom.BuildOwner = null,
 
     fn layoutFn(base: *RenderObject, c: layout.BoxConstraints) geom.PhysicalSize {
         const self: *RenderScrollView = @fieldParentPtr("base", base);
@@ -239,6 +254,7 @@ const RenderScrollView = struct {
             .offset = self.offset,
             .content = self.content,
             .handlers = &self.handlers,
+            .moved = self.moved,
         });
         if (self.child) |ch| try ch.paint(cv, offset);
         try cv.popScroll();
@@ -257,11 +273,17 @@ const RenderScrollView = struct {
         if (self.controller == controller) return;
         self.detach();
         self.controller = controller;
-        if (controller) |c| c.view = .{
+        if (controller) |c| c.view = self.scrollable();
+    }
+
+    fn scrollable(self: *RenderScrollView) Scrollable {
+        return .{
             .node = &self.base,
             .offset = &self.offset,
             .content = &self.content,
             .viewport = &self.viewport,
+            .moved = &self.moved,
+            .owner = self.owner,
         };
     }
 
@@ -283,7 +305,7 @@ const RenderScrollView = struct {
 
     fn scrollThunk(ctx: *anyopaque, dx: f32, dy: f32) bool {
         const self: *RenderScrollView = @ptrCast(@alignCast(ctx));
-        return scrollToThunk(self, self.offset.x + dx, self.offset.y + dy);
+        return self.scrollable().set(.{ .x = self.offset.x + dx, .y = self.offset.y + dy });
     }
 
     fn scrollToThunk(ctx: *anyopaque, x: f32, y: f32) bool {
@@ -350,6 +372,7 @@ pub const ScrollView = struct {
             .gpa = gpa,
             .handlers = .{ .ctx = ro },
             .axis = self.axis,
+            .owner = bctx.owner,
         };
         ro.id.set(gpa, self.id) catch |e| {
             gpa.destroy(ro);

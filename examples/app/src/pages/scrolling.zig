@@ -41,10 +41,25 @@ fn verticalList(b: *phantom.BuildContext) phantom.Widget {
     return bounded(b, 320, 240, b.new(phantom.ScrollView{ .child = column.widget() }).widget());
 }
 
+var lazy_controller: phantom.ScrollController = .{};
+
 /// Ten thousand rows of three heights. Only the rows near the view are built.
 fn lazyList(b: *phantom.BuildContext) phantom.Widget {
-    const list = b.new(phantom.ListView{ .count = 10_000, .builder = lazyRow });
-    return bounded(b, 320, 240, list.widget());
+    const jump = b.new(phantom.Button{
+        .variant = .secondary,
+        .on_tap = jumpToEnd,
+        .child = b.new(phantom.Padding{
+            .insets = .symmetric(16, 8),
+            .child = gallery.text(b, "Jump to end", .{ .size = 18 }),
+        }).widget(),
+    });
+    const list = b.new(phantom.ListView{ .count = 10_000, .builder = lazyRow, .controller = &lazy_controller });
+    return gallery.spacedColumn(b, 12, &.{ jump.widget(), bounded(b, 320, 240, list.widget()) });
+}
+
+fn jumpToEnd(_: *anyopaque) void {
+    const end = lazy_controller.maxOffset() orelse return;
+    _ = lazy_controller.jumpTo(end);
 }
 
 fn lazyRow(_: *anyopaque, b: *phantom.BuildContext, index: usize) phantom.Widget {

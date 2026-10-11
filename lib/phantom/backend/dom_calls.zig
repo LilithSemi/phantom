@@ -274,6 +274,8 @@ pub const ScrollMemory = struct {
     /// The scroll handlers of the render object behind each region, at the
     /// same index. Valid until the tree next rebuilds.
     targets: [max_scroll_regions]?*pointer.PointerHandlers = undefined,
+    /// The `ScrollRegion.moved` of each region, at the same index.
+    moved: [max_scroll_regions]u32 = undefined,
     count: usize = 0,
 };
 
@@ -305,7 +307,10 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
     // when the host cannot read scroll position at all.
     var saved: [max_scroll_regions]geometry.PhysicalOffset = undefined;
     var saved_count: usize = 0;
+    // A navigation forgets the old regions, so none of them can match below.
+    var prev_count: usize = 0;
     if (mem) |m| {
+        if (!reset_scroll) prev_count = m.count;
         if (!reset_scroll and ops.read_scroll_offset != null) {
             for (m.handles[0..m.count]) |h| {
                 saved[saved_count] = ops.readScrollOffset(h) orelse break;
@@ -562,15 +567,25 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 // Must come after `inner` is attached: `outer` has nothing to
                 // scroll to before that, so a browser clamps any offset back
                 // to zero rather than holding it for content not there yet.
+                // The browser's offset wins, because the visitor can be in the
+                // middle of a scroll. The exception is a region that phantom
+                // moved itself since the last frame.
                 if (mem) |m| {
                     if (m.count < max_scroll_regions) {
-                        if (m.count < saved_count) ops.writeScrollOffset(outer, saved[m.count]);
+                        const i = m.count;
+                        const same = sr.handlers != null and i < prev_count and m.targets[i] == sr.handlers;
+                        if (same and m.moved[i] != sr.moved) {
+                            ops.writeScrollOffset(outer, sr.offset);
+                        } else if (i < saved_count) {
+                            ops.writeScrollOffset(outer, saved[i]);
+                        }
                         // The page reports a scroll on this div by this index.
                         var index_buf: [20]u8 = undefined;
                         const index = try std.fmt.bufPrint(&index_buf, "{d}", .{m.count});
                         ops.setAttribute(outer, "data-phantom-scroll", index);
                         m.handles[m.count] = outer;
                         m.targets[m.count] = sr.handlers;
+                        m.moved[m.count] = sr.moved;
                         m.count += 1;
                     } else if (sink) |s| {
                         s.report(.region_overflow, "scroll region count exceeded max_scroll_regions, offset not tracked");
@@ -1480,6 +1495,40 @@ test "dom_calls: a scroll region's offset survives a second render at the same o
     // The new region was handed back the offset the old one held.
     try std.testing.expect(contains(rec.log.items, "writeScrollOffset(105,0,77)"));
     try std.testing.expectEqual(@as(u32, 105), mem.handles[0]);
+}
+
+test "dom_calls: a region that phantom moved gets phantom's offset, once" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var mem = ScrollMemory{};
+    var target: u8 = 0;
+    var handlers = pointer.PointerHandlers{ .ctx = &target };
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .push_scroll = .{
+        .viewport = geometry.PhysicalRect{ .x = 0, .y = 0, .width = 100, .height = 50 },
+        .offset = geometry.PhysicalOffset{ .x = 0, .y = 0 },
+        .content = geometry.PhysicalSize{ .width = 100, .height = 300 },
+        .handlers = &handlers,
+    } });
+    try list.append(gpa, .{ .pop_scroll = {} });
+
+    // Container 101, outer 102. The browser then scrolls to 77.
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
+
+    // Phantom moves the region to 120. Container 104, outer 105.
+    list.primitives.items[0].push_scroll.offset.y = 120;
+    list.primitives.items[0].push_scroll.moved = 1;
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(105,0,120)"));
+
+    // No new phantom move, so the browser's offset wins. Container 107, outer 108.
+    rec.setScrollOffset(105, .{ .x = 0, .y = 90 });
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(108,0,90)"));
 }
 
 test "dom_calls: a navigation clears a scroll region's offset instead of carrying it to the new page" {

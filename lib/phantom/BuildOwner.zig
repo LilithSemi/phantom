@@ -80,6 +80,11 @@ text_metrics: mono.TextMetrics = .proportional,
 /// reads this once per render and clears it, so only the render right after
 /// a navigation drops the carried offsets.
 route_changed: bool = false,
+/// True when a render object changed what it draws without a rebuild, for
+/// example a scroll offset set through a `ScrollController`. The web draws a
+/// frame only on request, so it renders when this is set and then clears it.
+/// Backends that draw every frame ignore it.
+repaint: bool = false,
 /// Made on the first `http` call on a backend with no client of its own.
 std_http: if (http_mod.std_available) ?StdHttp else void = if (http_mod.std_available) null else {},
 
