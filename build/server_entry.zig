@@ -1,5 +1,6 @@
-//! The server binary `addApp` installs for a web app. It serves the dist
-//! directory of the app and renders each page request with the app root.
+//! The server binary of a web app, built by `zig build <exec>-server`. It
+//! serves the dist directory of the app and renders each page request with
+//! the app root.
 //!
 //! PHANTOM_SERVE_DIR is the dist directory (default "."), PHANTOM_SERVE_HOST
 //! the address to bind (default every interface) and PHANTOM_SERVE_PORT the

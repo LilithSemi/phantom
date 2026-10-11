@@ -82,7 +82,8 @@ pub const AppOptions = struct {
     /// strategy. The root page is a plain shell when "/" is not listed. Not
     /// usable with `imports` yet.
     prerender_routes: []const []const u8 = &.{},
-    /// The size in phantom px that prerendered pages are laid out at.
+    /// The size in phantom px that prerendered pages are laid out at, and
+    /// that the server lays out a page at when the browser sends no width.
     default_size: Size = .{ .width = 1280, .height = 800 },
     /// The site path that the page is served at. Every url the page holds goes
     /// under it as a root-absolute url, so a nested route boots without a
@@ -91,6 +92,11 @@ pub const AppOptions = struct {
     /// "/docs/intro" the url "events" is "/docs/events". Must start and end
     /// with '/'. Validate with `validateBasePath`.
     base_path: []const u8 = "/",
+    /// The machine `zig build <exec>-server` builds the server binary for.
+    /// Null is the build machine. Set it to deploy the server elsewhere, for
+    /// example to a Linux host from a Mac. `serve-<exec>-ssr` always runs a
+    /// build for the build machine.
+    server_target: ?std.Build.ResolvedTarget = null,
 };
 
 pub const Size = struct { width: u32, height: u32 };

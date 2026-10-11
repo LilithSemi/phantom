@@ -146,8 +146,10 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     return step;
 }
 
-/// Install `<exec>-server`, a host binary that serves the dist directory and
-/// renders page requests, and add `zig build serve-<exec>-ssr` to run it.
+/// Add the server of a web app, which serves the dist directory and renders
+/// page requests. Nothing builds it unless asked: `zig build <exec>-server`
+/// installs it for `opts.server_target`, and `zig build serve-<exec>-ssr`
+/// runs a build for the build machine in the dist directory.
 fn addServer(
     b: *std.Build,
     phantom_dep: *std.Build.Dependency,
@@ -156,23 +158,36 @@ fn addServer(
     app_step: *std.Build.Step,
 ) void {
     const name = execName(b, opts.id, opts.exec_name);
+    const install = b.step(b.fmt("{s}-server", .{name}), b.fmt("Install the {s} server binary", .{name}));
     const serve = b.step(b.fmt("serve-{s}-ssr", .{name}), b.fmt("Serve {s} with server rendering (dev)", .{name}));
     if (opts.imports.len > 0) {
-        serve.dependOn(&b.addFail("phantom.addApp: the server renders in a host build, but the modules in `imports` are built for the web target and import its phantom module. Remove imports to get a server").step);
+        const fail = b.addFail("phantom.addApp: the server renders in a host build, but the modules in `imports` are built for the web target and import its phantom module. Remove imports to get a server");
+        install.dependOn(&fail.step);
+        serve.dependOn(&fail.step);
         return;
     }
 
-    const entry_options = b.addOptions();
-    entry_options.addOption([]const u8, "shell", shellHtml(b, opts));
-    entry_options.addOption(bool, "strategy_is_hash", opts.url_strategy == .hash);
-    const exe = addHostExe(b, phantom_dep, opts, "server", entry_options);
-    app_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    const host_exe = addServerExe(b, phantom_dep, opts, b.graph.host);
+    const target_exe = if (opts.server_target) |target| addServerExe(b, phantom_dep, opts, target) else host_exe;
+    install.dependOn(&b.addInstallArtifact(target_exe, .{}).step);
 
-    const run = b.addRunArtifact(exe);
+    const run = b.addRunArtifact(host_exe);
     run.setCwd(dist);
     run.setEnvironmentVariable("PHANTOM_SERVE_DIR", ".");
     run.step.dependOn(app_step);
     serve.dependOn(&run.step);
+}
+
+fn addServerExe(
+    b: *std.Build,
+    phantom_dep: *std.Build.Dependency,
+    opts: appmeta.AppOptions,
+    target: std.Build.ResolvedTarget,
+) *std.Build.Step.Compile {
+    const entry_options = b.addOptions();
+    entry_options.addOption([]const u8, "shell", shellHtml(b, opts));
+    entry_options.addOption(bool, "strategy_is_hash", opts.url_strategy == .hash);
+    return addHostExe(b, phantom_dep, opts, target, "server", entry_options);
 }
 
 /// Build the web page of an app without installing it, for a consumer that
@@ -356,7 +371,7 @@ fn addPrerender(
         return null;
     };
 
-    const exe = addHostExe(b, phantom_dep, opts, "prerender", b.addOptions());
+    const exe = addHostExe(b, phantom_dep, opts, b.graph.host, "prerender", b.addOptions());
     const run = b.addRunArtifact(exe);
     run.addFileArg(b.addWriteFiles().add("shell.html", shell));
     const pages = run.addOutputDirectoryArg("pages");
@@ -375,17 +390,17 @@ fn addPrerender(
     return manifest;
 }
 
-/// Build `build/<kind>_entry.zig` for the build machine, with the app root
-/// as `app_root` and `entry_options` plus the base path and default size as
+/// Build `build/<kind>_entry.zig` for `host`, with the app root as
+/// `app_root` and `entry_options` plus the base path and default size as
 /// `build_options`. The exe is named `<exec>-<kind>`.
 fn addHostExe(
     b: *std.Build,
     phantom_dep: *std.Build.Dependency,
     opts: appmeta.AppOptions,
+    host: std.Build.ResolvedTarget,
     kind: []const u8,
     entry_options: *std.Build.Step.Options,
 ) *std.Build.Step.Compile {
-    const host = b.graph.host;
     const phantom_host = b.createModule(.{
         .root_source_file = phantom_dep.builder.path("lib/phantom.zig"),
         .target = host,
