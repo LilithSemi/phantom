@@ -3,6 +3,8 @@ const geom = @import("geometry.zig");
 pub const PointerPhase = enum { down, up, move, enter, leave };
 
 pub const PointerEvent = struct {
+    /// The point in the space of the target's origin. This is the window
+    /// point, moved by the scroll offsets above the target.
     position: geom.PhysicalOffset,
     phase: PointerPhase,
 };

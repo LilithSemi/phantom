@@ -1396,9 +1396,7 @@ test "a SizedBox of fixed width around a Column of open height is as wide as the
 }
 
 // Depth-first search for the first render object with an on_up handler, the
-// way a real hit test would find a tap target. A plain pointer != null match
-// would also catch the ScrollView itself, which installs a scroll handler
-// but no tap handler.
+// way a real hit test would find a tap target.
 fn findTappable(el: *Element) ?*RenderObject {
     if (el.renderObject()) |ro| {
         // A scroll view takes presses for its scrollbars, so it is skipped.

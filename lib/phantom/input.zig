@@ -14,8 +14,9 @@ pub const Target = struct {
 };
 
 /// Walk the element tree (pre-order) and return the DEEPEST render object's
-/// pointer handlers whose absolute bounds [origin, origin+size] contain the
-/// point. Deepest means a child listener wins over a parent listener. Overlapping
+/// pointer handlers whose bounds [origin, origin+size] contain the point. The
+/// point moves by the scroll offsets above each render object before the test.
+/// Deepest means a child listener wins over a parent listener. Overlapping
 /// siblings are not disambiguated (z-order deferred); the last match wins.
 pub fn hitTest(root: *Element, point: geom.PhysicalOffset) ?*pointer.PointerHandlers {
     const t = hitTarget(root, point) orelse return null;
@@ -70,7 +71,7 @@ fn contains(origin: geom.PhysicalOffset, size: geom.PhysicalSize, p: geom.Physic
 }
 
 /// Walk the element tree (pre-order) and return the DEEPEST render object's pointer
-/// handlers whose on_scroll is set AND whose absolute bounds contain the point.
+/// handlers whose on_scroll is set and whose bounds contain the scrolled point.
 /// This finds the innermost scrollable container (skips non-scrollable handlers).
 pub fn hitTestScroll(root: *Element, point: geom.PhysicalOffset) ?*pointer.PointerHandlers {
     var found: ?*pointer.PointerHandlers = null;
@@ -85,7 +86,7 @@ pub fn hitTestScroll(root: *Element, point: geom.PhysicalOffset) ?*pointer.Point
 }
 
 /// Walk the element tree (pre-order) and return the DEEPEST render object's focus
-/// handlers whose absolute bounds contain the point, or null when the point is on
+/// handlers whose bounds contain the scrolled point, or null when the point is on
 /// nothing that takes the keyboard.
 ///
 /// The pointer walk above cannot answer this. A `Focus` installs no pointer

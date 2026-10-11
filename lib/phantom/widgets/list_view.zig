@@ -75,8 +75,9 @@ pub const ListView = struct {
             s.count = config.count;
             s.builder = config.builder;
             s.ctx = config.ctx;
-            // A size that is not a positive number cannot place a row, so a bad
-            // fixed extent falls back to measured rows and a bad estimate to 1.
+            // A size that is not a positive number cannot place a row. A bad
+            // fixed extent falls back to rows of their own height, and a bad
+            // estimate falls back to 1.
             s.item_extent = if (config.item_extent) |e| (if (usable(e)) e else null) else null;
             s.estimated_extent = if (usable(config.estimated_extent)) config.estimated_extent else 1;
             s.controller = config.controller;
@@ -282,7 +283,12 @@ const ListWindow = struct {
         }
         // Every slot holds a live element at each step below, so a failure can
         // drop them all and leave an empty window that matches `ro.first`.
-        errdefer clear(kids, gpa);
+        // The state then has no rows, so the next paint asks for them again.
+        errdefer {
+            clear(kids, gpa);
+            ro.state.first = 0;
+            ro.state.last = 0;
+        }
 
         const kept = kids.items.len;
         const head = if (kept == 0) rows.len else keep_first - first;
