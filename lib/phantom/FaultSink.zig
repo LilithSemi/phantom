@@ -31,8 +31,8 @@ pub const FaultCode = enum {
     /// region past the limit is not opened, so content painted inside it lands
     /// in its parent's space instead of a silently wrong one. Also used when
     /// one frame opens more scroll regions than the backend can remember
-    /// offsets for: the region past that limit still opens, it just resets to
-    /// the top on every rebuild instead of keeping its scroll position.
+    /// offsets for. The region past that limit still opens and keeps its div,
+    /// but its view and its div do not sync their offsets in either direction.
     region_overflow,
 };
 

@@ -74,11 +74,11 @@ scheduler: Scheduler = .{},
 /// `RenderText` holds, so a change reaches every mounted text node with no rebuild.
 text_metrics: mono.TextMetrics = .proportional,
 /// True after `Router.State.push` or `.replace` changes the route, until the
-/// next render consumes it. A web render carries scroll position across a
-/// rebuild by creation order, which is right for a tap and wrong for a
-/// navigation: a visitor on a new route expects its top. `web.WebApp.render`
-/// reads this once per render and clears it, so only the render right after
-/// a navigation drops the carried offsets.
+/// next render consumes it. A web render keeps each scroll div that stays on
+/// the page, and the div keeps its offset. That is right for a tap and wrong
+/// for a navigation, because a visitor on a new route expects its top.
+/// `web.WebApp.render` reads this once per render and clears it, so only the
+/// render right after a navigation moves the kept divs to the top.
 route_changed: bool = false,
 /// True when a render object changed what it draws without a rebuild, for
 /// example a scroll offset set through a `ScrollController`. The web draws a

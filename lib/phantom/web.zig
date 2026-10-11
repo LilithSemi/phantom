@@ -46,8 +46,8 @@ pub const WebApp = struct {
     /// count as registered on the next.
     fonts_seen: [max_fonts]*const phantom.text.Font = undefined,
     fonts_seen_len: usize = 0,
-    /// The scroll regions of the last frame. Lives for the whole page, not per
-    /// render: `scrollChanged` finds the view of a region here.
+    /// The scroll regions of the last frame. Lives for the whole page.
+    /// `scrollChanged` finds the view of a region here.
     scroll_mem: phantom.backend.dom_calls.ScrollMemory = .{},
     /// The last tree, its node handles and the interactive rules that `render`
     /// keeps between frames.
@@ -78,9 +78,9 @@ pub const WebApp = struct {
         self.wall_ns = @as(i96, @intFromFloat(wall_ms)) * std.time.ns_per_ms;
         self.mono_ns = @intFromFloat(mono_ms * std.time.ns_per_ms);
         self.owner.scheduler.tick(self.mono_ns);
-        // An unconditional render would rebuild the whole DOM 60 times a
-        // second, so repaint only when a callback marked something dirty or
-        // moved a scroll offset.
+        // An unconditional render would build, lay out, paint and diff the
+        // tree 60 times a second, so repaint only when a callback marked
+        // something dirty or moved a scroll offset.
         if (self.owner.dirty.items.len > 0 or self.owner.repaint) self.render();
     }
 

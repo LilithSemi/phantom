@@ -184,7 +184,7 @@ pub const DomOps = struct {
     }
     /// Null when the host has no read hook, so a caller cannot tell "no host
     /// support" from "the offset is zero" and must treat both the same way:
-    /// nothing to carry across the rebuild.
+    /// there is no offset to keep.
     pub fn readScrollOffset(self: DomOps, node: u32) ?geometry.PhysicalOffset {
         const f = self.read_scroll_offset orelse return null;
         return f(self.ctx, node);
@@ -265,10 +265,10 @@ pub fn fontFaceCss(gpa: std.mem.Allocator, fonts: []const *text.Font) ![]u8 {
 pub const max_region_depth = vdom.max_region_depth;
 
 /// How many scroll regions `render` tracks in one frame. Unlike
-/// `max_region_depth`, this counts every open region in one frame, not only
-/// how deep they nest, because sibling regions do not nest at all. A page past
-/// the limit still renders. The regions past it get no offset sync, and a
-/// fault is reported rather than writing past a fixed array.
+/// `max_region_depth`, this counts every open region in one frame, also
+/// sibling regions that do not nest. A page past the limit still renders.
+/// The regions past it get no offset sync, and a fault is reported rather
+/// than writing past a fixed array.
 pub const max_scroll_regions = 32;
 
 /// The scroll regions of the last frame, by the index the page reports a
@@ -564,7 +564,11 @@ const Patch = struct {
 /// rule is added only for a new class. Pass the same `gpa` on every call.
 ///
 /// Every step that can fail runs before the first DOM call. A render that
-/// returns an error leaves the page, `page` and `mem` as they were.
+/// returns an error leaves the page, `page` and `mem` as they were. The
+/// handlers in `mem` can then point at freed views, so the caller must drop
+/// them. The error return covers Zig errors only. A JS exception in the middle
+/// of a patch leaves the retained tree behind the DOM. That can occur only
+/// when code outside phantom edits the body.
 ///
 /// `mem`, if given, keeps the scroll regions in step with their views. See
 /// `Patch.finish` for which offset wins. `reset_scroll` is true exactly once,
