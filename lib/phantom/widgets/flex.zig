@@ -686,6 +686,64 @@ test "a .min Column end-aligned on its main axis still packs its children at the
     try std.testing.expectEqual(@as(f32, 20), rf.offsets.items[1].y);
 }
 
+test "a .min Column under a tight constraint reports the tight size, not its children's total, and centers them in the real slack" {
+    const gpa = std.testing.allocator;
+    var a = FixedBox.make(30, 20);
+    var b = FixedBox.make(30, 40);
+    var rf = RenderFlex{
+        .base = .{ .layoutFn = RenderFlex.layoutFn, .paintFn = RenderFlex.paintFn, .destroyFn = RenderFlex.destroyFn },
+        .gpa = gpa,
+        .direction = .vertical,
+        .main = .center,
+        .cross = .start,
+        .main_size = .min,
+    };
+    defer {
+        rf.children.deinit(gpa);
+        rf.offsets.deinit(gpa);
+    }
+    try rf.children.append(gpa, &a.base);
+    try rf.children.append(gpa, &b.base);
+
+    // A tight constraint fixes both bounds to 300, far past the children's 60.
+    const size = rf.base.layout(layout.BoxConstraints.tight(.{ .width = 100, .height = 300 }));
+    try std.testing.expectEqual(@as(f32, 300), size.height); // the tight size, not 60
+    try std.testing.expectEqual(@as(f32, 100), size.width);
+    // 300 - 60 = 240 of real slack, split by center: 120 leads the first child.
+    try std.testing.expectEqual(@as(f32, 120), rf.offsets.items[0].y);
+    try std.testing.expectEqual(@as(f32, 140), rf.offsets.items[1].y); // 120 + 20
+}
+
+test "a .min Column with an Expanded child that overflows a tight constraint reports the tight size and gives main alignment negative free space" {
+    const gpa = std.testing.allocator;
+    var fixed = FixedBox.make(30, 60);
+    var inner = NaturalBox.make(30, 10);
+    var expanded = makeFlexible(&inner.base, 1, .tight);
+    var rf = RenderFlex{
+        .base = .{ .layoutFn = RenderFlex.layoutFn, .paintFn = RenderFlex.paintFn, .destroyFn = RenderFlex.destroyFn },
+        .gpa = gpa,
+        .direction = .vertical,
+        .main = .center,
+        .cross = .start,
+        .main_size = .min,
+    };
+    defer {
+        rf.children.deinit(gpa);
+        rf.offsets.deinit(gpa);
+    }
+    try rf.children.append(gpa, &fixed.base);
+    try rf.children.append(gpa, &expanded.base);
+
+    // A .min flex leaves the Expanded child no share to claim, so the fixed
+    // child's 60 is the children's total, past the tight height of 20.
+    const size = rf.base.layout(layout.BoxConstraints.tight(.{ .width = 90, .height = 20 }));
+    try std.testing.expectEqual(@as(f32, 20), size.height); // the tight size, not 60
+    try std.testing.expectEqual(@as(f32, 90), size.width);
+    // 20 - 60 = -40 of overflow, split by center like a .max flex would.
+    try std.testing.expectEqual(@as(f32, -20), rf.offsets.items[0].y);
+    try std.testing.expectEqual(@as(f32, 40), rf.offsets.items[1].y); // -20 + 60
+}
+
 test "Flex widget mounts children, syncs render objects, stacks two Texts vertically" {
     const gpa = std.testing.allocator;
     var sink = phantom.FaultSink{};
