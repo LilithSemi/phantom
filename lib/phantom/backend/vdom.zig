@@ -1,6 +1,6 @@
 //! The web backend's frame as a small tree of DOM nodes. `build` turns a
 //! display list into this tree. `dom_calls.render` patches the DOM to match it and
-//! `dom.renderToString` prints it as HTML, so both give the same markup.
+//! `dom.renderPage` prints it as HTML and CSS, so both give the same markup.
 
 const std = @import("std");
 const display_list = @import("../display_list.zig");
@@ -65,6 +65,11 @@ pub const Tree = struct {
     rules: []const Rule,
     /// The number of nodes in `root`, `root` included.
     count: usize,
+    /// The fonts the text uses, one for each `text.Font.id`, in the order the
+    /// frame first uses them.
+    fonts: []const *text.Font,
+    /// The page background behind the container.
+    background: geometry.Color,
 };
 
 /// The CSS family name for a font, from `text.Font.id`. The page declares each
@@ -109,6 +114,7 @@ const Builder = struct {
     /// never recorded.
     skipped: usize = 0,
     rules: std.ArrayList(Rule) = .empty,
+    fonts: std.ArrayList(*text.Font) = .empty,
     count: usize = 1,
     /// The scroll regions opened so far. The page reports a scroll by this
     /// index.
@@ -287,6 +293,10 @@ const Builder = struct {
             if (run.underline) ";text-decoration:underline" else "",
         });
         try self.add(.{ .kind = .element, .tag = "div", .style = style, .text = try self.arena.dupe(u8, run.text) });
+        for (self.fonts.items) |seen| {
+            if (seen.id == font_ptr.id) return;
+        }
+        try self.fonts.append(self.arena, font_ptr);
     }
 
     fn pushScroll(self: *Builder, sr: display_list.ScrollRegion) !void {
@@ -351,7 +361,7 @@ pub fn build(arena: std.mem.Allocator, list: display_list.DisplayList, viewport:
 
     var root = b.stack[0].node;
     root.children = b.stack[0].children.items;
-    return .{ .root = root, .rules = b.rules.items, .count = b.count };
+    return .{ .root = root, .rules = b.rules.items, .count = b.count, .fonts = b.fonts.items, .background = bg };
 }
 
 fn countNodes(node: Node) usize {

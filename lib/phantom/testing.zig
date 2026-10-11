@@ -186,11 +186,16 @@ pub const Harness = struct {
         try std.testing.expectApproxEqAbs(h, ro.size.height, 0.01);
     }
 
+    /// Pass when `needle` is in the web page markup or in its stylesheet.
     pub fn expectHtml(self: *Harness, needle: []const u8) !void {
         const physical = self.viewport.toPhysical(self.dpr);
-        const html = try phantom.backend.dom.renderToString(self.gpa, self.canvas.list, physical, phantom.Color.rgb(0, 0, 0));
-        defer self.gpa.free(html);
-        try std.testing.expect(std.mem.indexOf(u8, html, needle) != null);
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const tree = try phantom.backend.vdom.build(arena_state.allocator(), self.canvas.list, physical, phantom.Color.rgb(0, 0, 0), null);
+        var page = try phantom.backend.dom.renderPage(self.gpa, tree);
+        defer page.deinit(self.gpa);
+        const found = std.mem.indexOf(u8, page.html, needle) != null or std.mem.indexOf(u8, page.css, needle) != null;
+        try std.testing.expect(found);
     }
 
     pub fn expectNoFaults(self: *Harness) !void {

@@ -13,8 +13,9 @@ pub const px_per_rem = 16;
 pub const Rem = struct {
     px: f32,
 
-    /// Four decimals. One unit is 1/625 px, so whole and half px print
-    /// exactly, and the same value always prints the same text.
+    /// Four decimals. One unit is 1/625 px, so whole px print exactly and
+    /// other values round to the nearest unit. The same value always prints
+    /// the same text.
     pub fn format(self: Rem, w: *std.Io.Writer) std.Io.Writer.Error!void {
         // A layout never gets near this size. The clamp keeps the cast below
         // in range when a value is not finite.
@@ -94,69 +95,129 @@ fn appendEscaped(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8)
     }
 }
 
-/// Print `node` and its subtree. Recursion is bounded by
-/// `vdom.max_tree_depth`.
-fn appendNode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, node: vdom.Node, depth: usize) !void {
-    std.debug.assert(depth < vdom.max_tree_depth);
-    try buf.print(gpa, "<{s}", .{node.tag});
-    for (node.attrs) |attr| {
-        try buf.print(gpa, " {s}=\"", .{attr.name});
-        try appendEscaped(buf, gpa, attr.value);
-        try buf.append(gpa, '"');
+/// A page that a server can send under `style-src 'self'` and
+/// `font-src 'self'`.
+pub const Page = struct {
+    /// The container element and its subtree. Each element has a class and
+    /// no inline style.
+    html: []u8,
+    /// The stylesheet the page links: the page background, one `@font-face`
+    /// for each font, one rule for each element with a style, and the hover
+    /// rules.
+    css: []u8,
+    /// The fonts with no `text.Font.url`. The stylesheet gets each one from
+    /// its `path`, so the server must serve the bytes there.
+    fonts: []FontFile,
+
+    pub fn deinit(self: *Page, gpa: std.mem.Allocator) void {
+        for (self.fonts) |file| gpa.free(file.path);
+        gpa.free(self.fonts);
+        gpa.free(self.css);
+        gpa.free(self.html);
+        self.* = undefined;
     }
-    if (node.style.len > 0) {
-        try buf.appendSlice(gpa, " style=\"");
-        try appendEscaped(buf, gpa, node.style);
-        try buf.append(gpa, '"');
+};
+
+pub const FontFile = struct {
+    /// Relative to the page, like `text.Font.url`. The name is the font
+    /// family, so it follows the font bytes.
+    path: []u8,
+    /// Borrowed from the font.
+    bytes: []const u8,
+};
+
+/// Where a page puts the fonts that have no url.
+pub const font_dir = "fonts/";
+
+const PageWriter = struct {
+    gpa: std.mem.Allocator,
+    html: std.ArrayList(u8) = .empty,
+    css: std.ArrayList(u8) = .empty,
+    /// The class number of the next element. Numbers go in tree order.
+    next: usize = 0,
+
+    /// Print `node` and its subtree. Recursion is bounded by
+    /// `vdom.max_tree_depth`.
+    fn node(self: *PageWriter, n: vdom.Node, depth: usize) !void {
+        std.debug.assert(depth < vdom.max_tree_depth);
+        const gpa = self.gpa;
+        const id = self.next;
+        self.next += 1;
+
+        try self.html.print(gpa, "<{s} class=\"p{d}", .{ n.tag, id });
+        for (n.attrs) |attr| {
+            if (!std.mem.eql(u8, attr.name, "class")) continue;
+            try self.html.append(gpa, ' ');
+            try appendEscaped(&self.html, gpa, attr.value);
+        }
+        try self.html.append(gpa, '"');
+        for (n.attrs) |attr| {
+            if (std.mem.eql(u8, attr.name, "class")) continue;
+            try self.html.print(gpa, " {s}=\"", .{attr.name});
+            try appendEscaped(&self.html, gpa, attr.value);
+            try self.html.append(gpa, '"');
+        }
+        if (n.style.len > 0) try self.css.print(gpa, ".p{d}{{{s}}}", .{ id, n.style });
+
+        if (std.mem.eql(u8, n.tag, "img")) return self.html.append(gpa, '>');
+        if (n.kind == .element_svg and n.children.len == 0 and n.text.len == 0) {
+            return self.html.appendSlice(gpa, "/>");
+        }
+        try self.html.append(gpa, '>');
+        try appendEscaped(&self.html, gpa, n.text);
+        for (n.children) |child| try self.node(child, depth + 1);
+        try self.html.print(gpa, "</{s}>", .{n.tag});
     }
-    if (std.mem.eql(u8, node.tag, "img")) return buf.append(gpa, '>');
-    if (node.kind == .element_svg and node.children.len == 0 and node.text.len == 0) {
-        return buf.appendSlice(gpa, "/>");
+};
+
+/// Print `tree` as a page. The same tree gives the same bytes on every target.
+/// `Page.fonts` borrows from the fonts in the tree.
+pub fn renderPage(gpa: std.mem.Allocator, tree: vdom.Tree) !Page {
+    var w: PageWriter = .{ .gpa = gpa };
+    defer w.html.deinit(gpa);
+    defer w.css.deinit(gpa);
+    var fonts: std.ArrayList(FontFile) = .empty;
+    defer {
+        for (fonts.items) |file| gpa.free(file.path);
+        fonts.deinit(gpa);
     }
-    try buf.append(gpa, '>');
-    try appendEscaped(buf, gpa, node.text);
-    for (node.children) |child| try appendNode(buf, gpa, child, depth + 1);
-    try buf.print(gpa, "</{s}>", .{node.tag});
+
+    // The background fills the window to its edges.
+    const bg = tree.background;
+    try w.css.print(gpa, "html,body{{margin:0;background:rgb({d},{d},{d})}}", .{ ch(bg.r), ch(bg.g), ch(bg.b) });
+    for (tree.fonts) |font_ptr| {
+        var fam: [vdom.family_len]u8 = undefined;
+        const family = vdom.fontFamily(&fam, font_ptr);
+        const url = font_ptr.url orelse url: {
+            try fonts.ensureUnusedCapacity(gpa, 1);
+            const path = try gpa.print(font_dir ++ "{s}.otf", .{family});
+            fonts.appendAssumeCapacity(.{ .path = path, .bytes = font_ptr.bytes });
+            break :url path;
+        };
+        try w.css.print(gpa, "@font-face{{font-family:{s};src:url(\"{s}\") format(\"opentype\")}}", .{ family, url });
+    }
+    try w.node(tree.root, 0);
+    for (tree.rules) |rule| try w.css.appendSlice(gpa, rule.css);
+
+    const html = try w.html.toOwnedSlice(gpa);
+    errdefer gpa.free(html);
+    const css = try w.css.toOwnedSlice(gpa);
+    errdefer gpa.free(css);
+    return .{ .html = html, .css = css, .fonts = try fonts.toOwnedSlice(gpa) };
 }
 
-pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: geom.PhysicalSize, bg: geom.Color) ![]u8 {
+/// The stylesheet and then the markup of the page for `list`, as one string
+/// for a test to search.
+fn testPage(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: geom.PhysicalSize) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const tree = try vdom.build(arena_state.allocator(), list, viewport, bg, null);
-
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(gpa);
-
-    // Fill the whole browser viewport with the theme background and drop the
-    // default body margin, so the background reaches the window edges.
-    try buf.print(gpa, "<style>html,body{{margin:0;background:rgb({d},{d},{d})}}</style>", .{ ch(bg.r), ch(bg.g), ch(bg.b) });
-
-    // One @font-face per distinct font, under the family the text asks for.
-    const fonts = try collectFonts(gpa, list);
-    defer gpa.free(fonts);
-    if (fonts.len > 0) {
-        try buf.appendSlice(gpa, "<style>");
-        for (fonts) |font_ptr| {
-            const enc = std.base64.standard.Encoder;
-            const b64_buf = try gpa.alloc(u8, enc.calcSize(font_ptr.bytes.len));
-            defer gpa.free(b64_buf);
-            _ = enc.encode(b64_buf, font_ptr.bytes);
-            var fam: [vdom.family_len]u8 = undefined;
-            try buf.print(gpa, "@font-face{{font-family:{s};src:url(data:font/otf;base64,{s}) format(\"opentype\")}}", .{ vdom.fontFamily(&fam, font_ptr), b64_buf });
-        }
-        try buf.appendSlice(gpa, "</style>");
-    }
-
-    try appendNode(&buf, gpa, tree.root, 0);
-    if (tree.rules.len > 0) {
-        try buf.appendSlice(gpa, "<style>");
-        for (tree.rules) |rule| try buf.appendSlice(gpa, rule.css);
-        try buf.appendSlice(gpa, "</style>");
-    }
-    return buf.toOwnedSlice(gpa);
+    const tree = try vdom.build(arena_state.allocator(), list, viewport, geom.Color.rgb(0, 0, 0), null);
+    var page = try renderPage(gpa, tree);
+    defer page.deinit(gpa);
+    return std.mem.concat(gpa, u8, &.{ page.css, page.html });
 }
 
-test "renderToString emits an @font-face and a positioned text div" {
+test "renderPage emits an @font-face and a positioned text div" {
     const gpa = std.testing.allocator;
     var font = try @import("../text.zig").Font.load(gpa, @import("../text.zig").builtin.neuropol_bytes);
     defer font.deinit(gpa);
@@ -164,21 +225,21 @@ test "renderToString emits an @font-face and a positioned text div" {
     defer list.deinit(gpa);
     const glyphs = [_]dl.PositionedGlyph{.{ .cp = 'H', .x = 0, .y = 0 }};
     try list.append(gpa, .{ .text = .{ .glyphs = &glyphs, .text = "Hello", .font = &font, .size = 24, .color = geom.Color.rgb(1, 1, 1), .origin = geom.PhysicalOffset{ .x = 12, .y = 34 } } });
-    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 200, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(gpa, list, geom.PhysicalSize{ .width = 200, .height = 100 });
     defer gpa.free(html);
     try std.testing.expect(std.mem.indexOf(u8, html, "@font-face") != null);
     var fam: [vdom.family_len]u8 = undefined;
     var want: [vdom.family_len + 32]u8 = undefined;
     try std.testing.expect(std.mem.indexOf(u8, html, try std.fmt.bufPrint(&want, "@font-face{{font-family:{s};", .{vdom.fontFamily(&fam, &font)})) != null);
     try std.testing.expect(std.mem.indexOf(u8, html, try std.fmt.bufPrint(&want, ";font-family:{s};", .{vdom.fontFamily(&fam, &font)})) != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "base64,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "data:") == null);
     try std.testing.expect(std.mem.indexOf(u8, html, ">Hello<") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "left:0.75rem") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "font-size:1.5rem") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "background:rgb(0,0,0)") != null);
 }
 
-test "renderToString emits a positioned div with border-radius" {
+test "renderPage emits a positioned div with border-radius" {
     var list = dl.DisplayList{};
     defer list.deinit(std.testing.allocator);
     try list.append(std.testing.allocator, .{ .rrect = .{
@@ -187,7 +248,7 @@ test "renderToString emits a positioned div with border-radius" {
         .color = geom.Color.rgb(0.15, 0.35, 0.85),
     } });
 
-    const html = try renderToString(std.testing.allocator, list, geom.PhysicalSize{ .width = 800, .height = 600 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(std.testing.allocator, list, geom.PhysicalSize{ .width = 800, .height = 600 });
     defer std.testing.allocator.free(html);
 
     try std.testing.expect(std.mem.indexOf(u8, html, "left:2.5rem") != null);
@@ -199,7 +260,7 @@ test "renderToString emits a positioned div with border-radius" {
     try std.testing.expect(std.mem.indexOf(u8, html, "background:rgb(0,0,0)") != null);
 }
 
-test "renderToString escapes special characters in text content" {
+test "renderPage escapes special characters in text content" {
     const gpa = std.testing.allocator;
     var font = try @import("../text.zig").Font.load(gpa, @import("../text.zig").builtin.neuropol_bytes);
     defer font.deinit(gpa);
@@ -207,7 +268,7 @@ test "renderToString escapes special characters in text content" {
     defer list.deinit(gpa);
     const glyphs = [_]dl.PositionedGlyph{.{ .cp = '<', .x = 0, .y = 0 }};
     try list.append(gpa, .{ .text = .{ .glyphs = &glyphs, .text = "<b>&", .font = &font, .size = 16, .color = geom.Color.rgb(1, 1, 1), .origin = geom.PhysicalOffset{ .x = 0, .y = 0 } } });
-    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 });
     defer gpa.free(html);
     // Escaped form must be present.
     try std.testing.expect(std.mem.indexOf(u8, html, "&lt;b&gt;&amp;") != null);
@@ -216,7 +277,7 @@ test "renderToString escapes special characters in text content" {
     try std.testing.expect(std.mem.indexOf(u8, html, "<script>") == null);
 }
 
-test "renderToString: filled rrect uses background and no border; stroked rrect uses border and transparent" {
+test "renderPage: filled rrect uses background and no border; stroked rrect uses border and transparent" {
     var list = dl.DisplayList{};
     defer list.deinit(std.testing.allocator);
     // Filled rrect: red at x=10,y=20,w=100,h=50,r=5
@@ -232,7 +293,7 @@ test "renderToString: filled rrect uses background and no border; stroked rrect 
         .color = geom.Color.rgb(0, 0.502, 0),
         .stroke_width = 3,
     } });
-    const html = try renderToString(std.testing.allocator, list, geom.PhysicalSize{ .width = 300, .height = 200 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(std.testing.allocator, list, geom.PhysicalSize{ .width = 300, .height = 200 });
     defer std.testing.allocator.free(html);
 
     // (a) Filled div: background present, no border property.
@@ -245,18 +306,12 @@ test "renderToString: filled rrect uses background and no border; stroked rrect 
     try std.testing.expect(std.mem.indexOf(u8, html, "background:transparent") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "left:3.75rem") != null);
 
-    // (c) Filled rrect regression: byte-for-byte match of the pre-change format.
-    // The filled div must be exactly this string with no border property.
-    const expected_filled = "<div style=\"position:absolute;left:0.625rem;top:1.25rem;width:6.25rem;height:3.125rem;border-radius:0.3125rem;background:rgba(255,0,0,1)\"></div>";
+    // (c) The whole rule of the filled div, so it has no border property.
+    const expected_filled = ".p1{position:absolute;left:0.625rem;top:1.25rem;width:6.25rem;height:3.125rem;border-radius:0.3125rem;background:rgba(255,0,0,1)}";
     try std.testing.expect(std.mem.indexOf(u8, html, expected_filled) != null);
-    // Filled rrect must NOT contain any border property.
-    // We check the filled div substring does not contain "border:".
-    const filled_start = std.mem.indexOf(u8, html, "left:0.625rem").?;
-    const filled_end = std.mem.indexOf(u8, html[filled_start..], "</div>").? + filled_start + 6;
-    try std.testing.expect(std.mem.indexOf(u8, html[filled_start..filled_end], "border:") == null);
 }
 
-test "renderToString: plain filled rrect is byte-identical (no class, no pb style)" {
+test "renderPage: plain filled rrect is byte-identical (no class, no pb style)" {
     var list = dl.DisplayList{};
     defer list.deinit(std.testing.allocator);
     try list.append(std.testing.allocator, .{ .rrect = .{
@@ -264,19 +319,17 @@ test "renderToString: plain filled rrect is byte-identical (no class, no pb styl
         .radius = 5,
         .color = geom.Color.rgb(1, 0, 0),
     } });
-    const html = try renderToString(std.testing.allocator, list, geom.PhysicalSize{ .width = 300, .height = 200 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(std.testing.allocator, list, geom.PhysicalSize{ .width = 300, .height = 200 });
     defer std.testing.allocator.free(html);
 
-    // (a) Byte-identical plain filled rrect: no class, no pb style.
-    const expected_filled = "<div style=\"position:absolute;left:0.625rem;top:1.25rem;width:6.25rem;height:3.125rem;border-radius:0.3125rem;background:rgba(255,0,0,1)\"></div>";
+    // A plain rrect has only its own class and its own rule.
+    const expected_filled = ".p1{position:absolute;left:0.625rem;top:1.25rem;width:6.25rem;height:3.125rem;border-radius:0.3125rem;background:rgba(255,0,0,1)}";
     try std.testing.expect(std.mem.indexOf(u8, html, expected_filled) != null);
-    // No class= attribute on this rrect.
-    try std.testing.expect(std.mem.indexOf(u8, html, "class=") == null);
-    // No pb rules <style> block emitted.
-    try std.testing.expect(std.mem.indexOf(u8, html, ".pb") == null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<div class=\"p1\"></div>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "pb-") == null);
 }
 
-test "renderToString: fillRRectStates emits class and hover/active style rules" {
+test "renderPage: fillRRectStates emits class and hover/active style rules" {
     var cv = @import("../canvas.zig").Canvas.init(std.testing.allocator);
     defer cv.deinit();
     try cv.fillRRectStates(
@@ -286,13 +339,13 @@ test "renderToString: fillRRectStates emits class and hover/active style rules" 
         geom.Color.rgb(0, 0, 0.9), // hover: slightly darker blue
         geom.Color.rgb(0, 0, 0.8), // active: darker blue
     );
-    const html = try renderToString(std.testing.allocator, cv.list, geom.PhysicalSize{ .width = 200, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(std.testing.allocator, cv.list, geom.PhysicalSize{ .width = 200, .height = 100 });
     defer std.testing.allocator.free(html);
 
-    // The div carries a class, and the rules after the wrapper name it.
+    // The div carries a class, and the stylesheet names it.
     const cls = classOf(html).?;
     try std.testing.expect(std.mem.startsWith(u8, cls, "pb-"));
-    try std.testing.expect(std.mem.indexOf(u8, html, "<style>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<style") == null);
     var want: [64]u8 = undefined;
     try std.testing.expect(std.mem.indexOf(u8, html, try std.fmt.bufPrint(&want, ".{s}:hover{{background:rgba(", .{cls})) != null);
     try std.testing.expect(std.mem.indexOf(u8, html, try std.fmt.bufPrint(&want, ".{s}:active{{background:rgba(", .{cls})) != null);
@@ -300,7 +353,7 @@ test "renderToString: fillRRectStates emits class and hover/active style rules" 
     try std.testing.expect(std.mem.indexOf(u8, html, "border-color") == null);
 }
 
-test "renderToString: strokeRRectStates emits border-color hover/active style rules" {
+test "renderPage: strokeRRectStates emits border-color hover/active style rules" {
     var cv = @import("../canvas.zig").Canvas.init(std.testing.allocator);
     defer cv.deinit();
     try cv.strokeRRectStates(
@@ -311,7 +364,7 @@ test "renderToString: strokeRRectStates emits border-color hover/active style ru
         geom.Color{ .r = 0.5, .g = 0.5, .b = 0.5, .a = 0.5 }, // hover
         geom.Color{ .r = 0.5, .g = 0.5, .b = 0.5, .a = 0.7 }, // active
     );
-    const html = try renderToString(std.testing.allocator, cv.list, geom.PhysicalSize{ .width = 200, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(std.testing.allocator, cv.list, geom.PhysicalSize{ .width = 200, .height = 100 });
     defer std.testing.allocator.free(html);
 
     const cls = classOf(html).?;
@@ -323,9 +376,9 @@ test "renderToString: strokeRRectStates emits border-color hover/active style ru
     try std.testing.expect(std.mem.indexOf(u8, html, ":hover{background") == null);
 }
 
-/// The value of the first `class` attribute in `html`.
+/// The first state class in a `class` attribute of `html`.
 fn classOf(html: []const u8) ?[]const u8 {
-    const start = (std.mem.indexOf(u8, html, "class=\"") orelse return null) + "class=\"".len;
+    const start = (std.mem.indexOf(u8, html, " pb-") orelse return null) + 1;
     const end = std.mem.indexOfScalarPos(u8, html, start, '"') orelse return null;
     return html[start..end];
 }
@@ -360,7 +413,7 @@ test "rem prints px over 16 with at most four decimals and no trailing zeros" {
     }
 }
 
-test "renderToString: fractional alpha is compact (no long float representation)" {
+test "renderPage: fractional alpha is compact (no long float representation)" {
     var list = dl.DisplayList{};
     defer list.deinit(std.testing.allocator);
     try list.append(std.testing.allocator, .{ .rrect = .{
@@ -368,13 +421,13 @@ test "renderToString: fractional alpha is compact (no long float representation)
         .radius = 0,
         .color = .{ .r = 0.5, .g = 0.5, .b = 0.5, .a = 0.3 },
     } });
-    const html = try renderToString(std.testing.allocator, list, geom.PhysicalSize{ .width = 50, .height = 50 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(std.testing.allocator, list, geom.PhysicalSize{ .width = 50, .height = 50 });
     defer std.testing.allocator.free(html);
     try std.testing.expect(std.mem.indexOf(u8, html, ",0.3)") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "0.30000") == null);
 }
 
-test "renderToString: image with encoded bytes emits <img> tag with data URL" {
+test "renderPage: image with encoded bytes emits <img> tag with data URL" {
     const gpa = std.testing.allocator;
     const png_bytes = &[_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01 };
     var img = image_mod.Image.fromBytes(png_bytes, 20, 10);
@@ -385,7 +438,7 @@ test "renderToString: image with encoded bytes emits <img> tag with data URL" {
         .rect = .{ .x = 8, .y = 16, .width = 20, .height = 10 },
         .opacity = 1,
     } });
-    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 200, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(gpa, list, geom.PhysicalSize{ .width = 200, .height = 100 });
     defer gpa.free(html);
     // Must contain an <img tag.
     try std.testing.expect(std.mem.indexOf(u8, html, "<img") != null);
@@ -398,7 +451,7 @@ test "renderToString: image with encoded bytes emits <img> tag with data URL" {
     try std.testing.expect(std.mem.indexOf(u8, html, "height:0.625rem") != null);
 }
 
-test "renderToString: image fromRgba (no encoded bytes) emits no img tag" {
+test "renderPage: image fromRgba (no encoded bytes) emits no img tag" {
     const gpa = std.testing.allocator;
     const rgba_pixels: [4 * 4 * 4]u8 = @splat(255);
     var img = image_mod.Image.fromRgba(&rgba_pixels, 4, 4);
@@ -409,13 +462,13 @@ test "renderToString: image fromRgba (no encoded bytes) emits no img tag" {
         .rect = .{ .x = 0, .y = 0, .width = 4, .height = 4 },
         .opacity = 1,
     } });
-    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 });
     defer gpa.free(html);
     // No img element should appear (fromRgba has no encoded bytes).
     try std.testing.expect(std.mem.indexOf(u8, html, "<img") == null);
 }
 
-test "renderToString: an icon emits an inline svg whose viewBox is the grid and whose size is the request" {
+test "renderPage: an icon emits an inline svg whose viewBox is the grid and whose size is the request" {
     const gpa = std.testing.allocator;
     var list = dl.DisplayList{};
     defer list.deinit(gpa);
@@ -425,7 +478,7 @@ test "renderToString: an icon emits an inline svg whose viewBox is the grid and 
         .color = geom.Color.rgb(1, 0, 0),
         .origin = .{ .x = 6, .y = 9 },
     } });
-    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 200, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(gpa, list, geom.PhysicalSize{ .width = 200, .height = 100 });
     defer gpa.free(html);
 
     // The two must differ: an svg sized at its viewBox would pass a test that
@@ -436,7 +489,7 @@ test "renderToString: an icon emits an inline svg whose viewBox is the grid and 
     try std.testing.expect(std.mem.indexOf(u8, html, "position:absolute;left:0.375rem;top:0.5625rem") != null);
 }
 
-test "renderToString: an icon is a stroked centreline, not a filled shape" {
+test "renderPage: an icon is a stroked centreline, not a filled shape" {
     const gpa = std.testing.allocator;
     var list = dl.DisplayList{};
     defer list.deinit(gpa);
@@ -446,7 +499,7 @@ test "renderToString: an icon is a stroked centreline, not a filled shape" {
         .color = geom.Color.rgb(0, 0.502, 1),
         .origin = .{ .x = 0, .y = 0 },
     } });
-    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 });
     defer gpa.free(html);
 
     // fill="none" is the whole difference between a torii and a blue blob.
@@ -462,7 +515,7 @@ test "renderToString: an icon is a stroked centreline, not a filled shape" {
     try std.testing.expect(std.mem.indexOf(u8, html, "d=\"M3.84 3.218Q12 4.887 20.16 3.218") != null);
 }
 
-test "renderToString: an icon at twice the size reuses one path at a larger width" {
+test "renderPage: an icon at twice the size reuses one path at a larger width" {
     // The point of handing the centreline to the browser: the geometry does not
     // change with size, only the box it is scaled into. A backend that baked the
     // size into the coordinates gives two different d strings here.
@@ -474,9 +527,9 @@ test "renderToString: an icon at twice the size reuses one path at a larger widt
     defer large.deinit(gpa);
     try large.append(gpa, .{ .icon = .{ .id = .torii, .size = .{ .width = 32, .height = 32 }, .color = geom.Color.rgb(1, 1, 1), .origin = .{ .x = 0, .y = 0 } } });
 
-    const a = try renderToString(gpa, small, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const a = try testPage(gpa, small, geom.PhysicalSize{ .width = 100, .height = 100 });
     defer gpa.free(a);
-    const b = try renderToString(gpa, large, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const b = try testPage(gpa, large, geom.PhysicalSize{ .width = 100, .height = 100 });
     defer gpa.free(b);
 
     const d_start = std.mem.indexOf(u8, a, "d=\"").? + 3;
@@ -486,7 +539,7 @@ test "renderToString: an icon at twice the size reuses one path at a larger widt
     try std.testing.expect(std.mem.indexOf(u8, b, "width:2rem") != null);
 }
 
-test "renderToString: a labelled icon carries an svg title, so it has an accessible name" {
+test "renderPage: a labelled icon carries an svg title, so it has an accessible name" {
     // A mark holds no text, so without a title a screen reader reads nothing
     // where an icon replaced a word. The title is the accessible name of inline
     // SVG, and it must come first, before the path.
@@ -500,16 +553,16 @@ test "renderToString: a labelled icon carries an svg title, so it has an accessi
         .origin = .{ .x = 0, .y = 0 },
         .label = "Genesis",
     } });
-    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 });
     defer gpa.free(html);
 
-    try std.testing.expect(std.mem.indexOf(u8, html, "<title>Genesis</title>") != null);
-    const title_at = std.mem.indexOf(u8, html, "<title>").?;
+    try std.testing.expect(std.mem.indexOf(u8, html, ">Genesis</title>") != null);
+    const title_at = std.mem.indexOf(u8, html, "<title ").?;
     const path_at = std.mem.indexOf(u8, html, "<path ").?;
     try std.testing.expect(title_at < path_at);
 }
 
-test "renderToString: a label with markup in it is escaped, not written through" {
+test "renderPage: a label with markup in it is escaped, not written through" {
     // The label comes from the app, so it is arbitrary text. Written raw, a
     // name holding a bracket closes the title early and injects an element.
     const gpa = std.testing.allocator;
@@ -522,12 +575,12 @@ test "renderToString: a label with markup in it is escaped, not written through"
         .origin = .{ .x = 0, .y = 0 },
         .label = "<b>&</b>",
     } });
-    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 });
     defer gpa.free(html);
-    try std.testing.expect(std.mem.indexOf(u8, html, "<title>&lt;b&gt;&amp;&lt;/b&gt;</title>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, ">&lt;b&gt;&amp;&lt;/b&gt;</title>") != null);
 }
 
-test "renderToString: an icon with no label emits no title element at all" {
+test "renderPage: an icon with no label emits no title element at all" {
     // An always-present title claims the accessible name and then announces an
     // empty string, which is worse than no title: with none, a reader falls back
     // on the surrounding text.
@@ -540,7 +593,7 @@ test "renderToString: an icon with no label emits no title element at all" {
         .color = geom.Color.rgb(1, 1, 1),
         .origin = .{ .x = 0, .y = 0 },
     } });
-    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 });
     defer gpa.free(html);
     try std.testing.expect(std.mem.indexOf(u8, html, "<title") == null);
     // The mark itself is still drawn: a backend that dropped the whole svg with
@@ -548,7 +601,7 @@ test "renderToString: an icon with no label emits no title element at all" {
     try std.testing.expect(std.mem.indexOf(u8, html, "<path ") != null);
 }
 
-test "renderToString: an icon inside a scroll region is placed relative to the region" {
+test "renderPage: an icon inside a scroll region is placed relative to the region" {
     const gpa = std.testing.allocator;
     var list = dl.DisplayList{};
     defer list.deinit(gpa);
@@ -564,13 +617,13 @@ test "renderToString: an icon inside a scroll region is placed relative to the r
         .origin = .{ .x = 30, .y = 60 },
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
-    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 300, .height = 200 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(gpa, list, geom.PhysicalSize{ .width = 300, .height = 200 });
     defer gpa.free(html);
     // 30-10 and 60-20, the same subtraction every other primitive makes.
     try std.testing.expect(std.mem.indexOf(u8, html, "left:1.25rem;top:2.5rem") != null);
 }
 
-test "renderToString: push_scroll emits overflow:scroll containers and adjusts child coords" {
+test "renderPage: push_scroll emits overflow:scroll containers and adjusts child coords" {
     var list = dl.DisplayList{};
     defer list.deinit(std.testing.allocator);
 
@@ -589,7 +642,7 @@ test "renderToString: push_scroll emits overflow:scroll containers and adjusts c
     } });
     try list.append(std.testing.allocator, .{ .pop_scroll = {} });
 
-    const html = try renderToString(std.testing.allocator, list, geom.PhysicalSize{ .width = 300, .height = 200 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(std.testing.allocator, list, geom.PhysicalSize{ .width = 300, .height = 200 });
     defer std.testing.allocator.free(html);
 
     // Outer scroll container at viewport position
@@ -603,7 +656,7 @@ test "renderToString: push_scroll emits overflow:scroll containers and adjusts c
     try std.testing.expect(std.mem.indexOf(u8, html, "</div></div>") != null);
 }
 
-test "renderToString: a mark in a box that is not square stretches instead of letterboxing" {
+test "renderPage: a mark in a box that is not square stretches instead of letterboxing" {
     // An svg keeps its viewBox aspect by default and centres it in the box,
     // which for a rule in a tall box redraws the short, gapped mark the box was
     // made tall to avoid. Only preserveAspectRatio="none" lets the two axes
@@ -618,7 +671,7 @@ test "renderToString: a mark in a box that is not square stretches instead of le
         .origin = .{ .x = 0, .y = 0 },
     } });
 
-    const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 }, geom.Color.rgb(0, 0, 0));
+    const html = try testPage(gpa, list, geom.PhysicalSize{ .width = 100, .height = 100 });
     defer gpa.free(html);
     try std.testing.expect(std.mem.indexOf(u8, html, "preserveAspectRatio=\"none\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "width:1rem") != null);
@@ -626,4 +679,83 @@ test "renderToString: a mark in a box that is not square stretches instead of le
     // The viewBox stays the authoring grid, so one centreline still serves
     // every size and the stroke width keeps its grid units.
     try std.testing.expect(std.mem.indexOf(u8, html, "viewBox=\"0 0 24 24\"") != null);
+}
+
+fn pageList(gpa: std.mem.Allocator, font: *text.Font) !dl.DisplayList {
+    var list = dl.DisplayList{};
+    errdefer list.deinit(gpa);
+    try list.append(gpa, .{ .rrect = .{ .rect = .{ .x = 0, .y = 0, .width = 32, .height = 16 }, .radius = 0, .color = geom.Color.rgb(1, 0, 0) } });
+    try list.append(gpa, .{ .rrect = .{ .rect = .{ .x = 0, .y = 16, .width = 32, .height = 16 }, .radius = 4, .color = geom.Color.rgb(0, 0, 1), .hover_color = geom.Color.rgb(0, 1, 0) } });
+    try list.append(gpa, .{ .text = .{ .glyphs = &.{}, .text = "a<b", .font = font, .size = 16, .color = geom.Color.rgb(1, 1, 1), .origin = .{ .x = 8, .y = 0 } } });
+    return list;
+}
+
+fn buildPage(gpa: std.mem.Allocator, list: dl.DisplayList) !Page {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const tree = try vdom.build(arena_state.allocator(), list, .{ .width = 64, .height = 32 }, geom.Color.rgb(0, 0, 0), null);
+    return renderPage(gpa, tree);
+}
+
+test "renderPage: a small tree gives this html and css, with no inline style" {
+    const gpa = std.testing.allocator;
+    var font = try text.builtin.neuropol(gpa);
+    defer font.deinit(gpa);
+    var list = try pageList(gpa, &font);
+    defer list.deinit(gpa);
+    var page = try buildPage(gpa, list);
+    defer page.deinit(gpa);
+
+    try std.testing.expect(std.mem.indexOf(u8, page.html, "style=") == null);
+    try std.testing.expectEqualStrings("<div class=\"p0\"><div class=\"p1\"></div><div class=\"p2 pb-788763ab9d2ec3be\"></div><div class=\"p3\">a&lt;b</div></div>", page.html);
+    try std.testing.expectEqualStrings("html,body{margin:0;background:rgb(0,0,0)}" ++
+        "@font-face{font-family:pf-0b107d216918b3e5;src:url(\"fonts/Neuropol.otf\") format(\"opentype\")}" ++
+        ".p0{position:relative;width:4rem;height:2rem;background:rgb(0,0,0)}" ++
+        ".p1{position:absolute;left:0;top:0;width:2rem;height:1rem;border-radius:0;background:rgba(255,0,0,1)}" ++
+        ".p2{position:absolute;left:0;top:1rem;width:2rem;height:1rem;border-radius:0.25rem;background:rgba(0,0,255,1)}" ++
+        ".p3{position:absolute;left:0.5rem;top:0;white-space:pre;font-family:pf-0b107d216918b3e5;font-size:1rem;color:rgba(255,255,255,1)}" ++
+        ".pb-788763ab9d2ec3be:hover{background:rgba(0,255,0,1)}.pb-788763ab9d2ec3be{cursor:pointer}", page.css);
+    try std.testing.expectEqual(@as(usize, 0), page.fonts.len);
+}
+
+test "renderPage: a font with no url is a file the page lists, never a data url" {
+    const gpa = std.testing.allocator;
+    var a = try text.Font.load(gpa, text.builtin.neuropol_bytes);
+    defer a.deinit(gpa);
+    var b = try text.Font.load(gpa, text.builtin.neuropol_bytes);
+    defer b.deinit(gpa);
+    var list = try pageList(gpa, &a);
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .text = .{ .glyphs = &.{}, .text = "c", .font = &b, .size = 16, .color = geom.Color.rgb(1, 1, 1), .origin = .{ .x = 0, .y = 0 } } });
+    var page = try buildPage(gpa, list);
+    defer page.deinit(gpa);
+
+    // Two loads of one file are one face.
+    try std.testing.expectEqual(@as(usize, 1), page.fonts.len);
+    try std.testing.expectEqualStrings("fonts/pf-0b107d216918b3e5.otf", page.fonts[0].path);
+    try std.testing.expectEqual(a.bytes.ptr, page.fonts[0].bytes.ptr);
+    try std.testing.expect(std.mem.indexOf(u8, page.css, "@font-face{font-family:pf-0b107d216918b3e5;src:url(\"fonts/pf-0b107d216918b3e5.otf\") format(\"opentype\")}") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, page.css, "@font-face"));
+    try std.testing.expect(std.mem.indexOf(u8, page.css, "data:") == null);
+}
+
+test "renderPage: one input gives the same bytes on every run" {
+    const gpa = std.testing.allocator;
+    var first_font = try text.builtin.neuropol(gpa);
+    defer first_font.deinit(gpa);
+    var first_list = try pageList(gpa, &first_font);
+    defer first_list.deinit(gpa);
+    var first = try buildPage(gpa, first_list);
+    defer first.deinit(gpa);
+
+    // A second font at a different address, so an address in the output shows.
+    var second_font = try text.builtin.neuropol(gpa);
+    defer second_font.deinit(gpa);
+    var second_list = try pageList(gpa, &second_font);
+    defer second_list.deinit(gpa);
+    var second = try buildPage(gpa, second_list);
+    defer second.deinit(gpa);
+
+    try std.testing.expectEqualStrings(first.html, second.html);
+    try std.testing.expectEqualStrings(first.css, second.css);
 }
