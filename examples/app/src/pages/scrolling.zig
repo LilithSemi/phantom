@@ -4,6 +4,7 @@ const gallery = @import("../app.zig");
 pub fn build(b: *phantom.BuildContext) phantom.Widget {
     return gallery.page(b, "Scrolling", &.{
         gallery.section(b, "A vertical ScrollView of 100 rows", verticalList(b)),
+        gallery.section(b, "A ListView of 10,000 rows that builds only what shows", lazyList(b)),
         gallery.section(b, "A horizontal ScrollView", horizontalStrip(b)),
         gallery.section(b, "A GridView of coloured tiles that scrolls on its own", grid(b)),
     });
@@ -38,6 +39,22 @@ fn verticalList(b: *phantom.BuildContext) phantom.Widget {
     }
     const column = b.new(phantom.Column(.{ .children = b.newSlice(phantom.Widget, &rows) }));
     return bounded(b, 320, 240, b.new(phantom.ScrollView{ .child = column.widget() }).widget());
+}
+
+/// Ten thousand rows of three heights. Only the rows near the view are built.
+fn lazyList(b: *phantom.BuildContext) phantom.Widget {
+    const list = b.new(phantom.ListView{ .count = 10_000, .builder = lazyRow });
+    return bounded(b, 320, 240, list.widget());
+}
+
+fn lazyRow(_: *anyopaque, b: *phantom.BuildContext, index: usize) phantom.Widget {
+    const theme = phantom.Theme.of(b);
+    const step: f32 = @floatFromInt(index % 3);
+    const color = if (index % 2 == 0) theme.colors.fg_primary else theme.colors.fg_muted;
+    return b.new(phantom.Padding{
+        .insets = .symmetric(12, 4 + step * 10),
+        .child = gallery.text(b, gallery.format(b, "Row {d}", .{index + 1}), .{ .size = 18, .color = color }),
+    }).widget();
 }
 
 fn horizontalStrip(b: *phantom.BuildContext) phantom.Widget {
