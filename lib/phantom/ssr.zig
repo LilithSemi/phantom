@@ -153,7 +153,9 @@ pub fn render(gpa: std.mem.Allocator, opts: Options) !Document {
     };
 }
 
-/// The paths `writePage` wrote, relative to its `out` directory, each once.
+/// The stylesheet and font files `writePage` wrote, each once, as url paths
+/// relative to its `out` directory. The page itself is not here: its path
+/// follows from the route.
 pub const Written = struct {
     paths: std.StringArrayHashMapUnmanaged(void) = .empty,
 
@@ -174,8 +176,8 @@ pub const Written = struct {
 /// Render `opts` and write the page, its stylesheet and its font files under
 /// `out`, each at the path the page uses for it under `opts.base`. The page of
 /// "/app/docs/intro" with base "/app/" goes to "docs/intro/index.html", and
-/// the page of the base itself to "index.html". Each path goes into `written`
-/// too. This is how `addApp` writes its prerendered routes.
+/// the page of the base itself to "index.html". The stylesheet and font paths
+/// go into `written` too. This is how `addApp` writes its prerendered routes.
 pub fn writePage(gpa: std.mem.Allocator, out: std.Io.Dir, shell: []const u8, opts: Options, written: *Written) !void {
     if (!dom.validBase(opts.base)) return error.InvalidBase;
     if (!std.mem.startsWith(u8, opts.path, opts.base) and !std.mem.eql(u8, opts.path, opts.base[0 .. opts.base.len - 1])) {
@@ -194,10 +196,9 @@ pub fn writePage(gpa: std.mem.Allocator, out: std.Io.Dir, shell: []const u8, opt
     defer page.deinit();
     try doc.writeHtml(&page.writer, shell);
 
-    const page_path = try std.fs.path.join(gpa, &.{ dir, "index.html" });
+    const page_path = if (dir.len == 0) try gpa.dupe(u8, "index.html") else try gpa.print("{s}/index.html", .{dir});
     defer gpa.free(page_path);
     try writeFile(opts.io, out, page_path, page.written());
-    try written.add(gpa, page_path);
     try writeFile(opts.io, out, doc.css_path, doc.css);
     try written.add(gpa, doc.css_path);
     for (doc.fonts) |font| {
@@ -717,8 +718,13 @@ test "writePage writes the font files the stylesheet names" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeAt(tmp.dir, phantom.Root.of(Fixture, Fixture.build, &fixture), "/", "/");
-    const font = try readAt(tmp.dir, "fonts/pf-0b107d216918b3e5.otf");
+    var written: Written = .{};
+    defer written.deinit(gpa);
+    const opts: Options = .{ .root = phantom.Root.of(Fixture, Fixture.build, &fixture), .path = "/", .viewport = test_size, .io = std.testing.io };
+    try writePage(gpa, tmp.dir, test_shell, opts, &written);
+    const font_path = written.paths.keys()[1];
+    try std.testing.expect(std.mem.startsWith(u8, font_path, "fonts/pf-"));
+    const font = try readAt(tmp.dir, font_path);
     defer gpa.free(font);
     try std.testing.expectEqualSlices(u8, phantom.text.builtin.neuropol_bytes, font);
 }
@@ -732,7 +738,7 @@ test "writePage refuses a path outside the base" {
     try std.testing.expectError(error.InvalidBase, writeAt(tmp.dir, root, "/", ""));
 }
 
-test "writePage lists each page, stylesheet and font file it writes, once" {
+test "writePage lists each stylesheet and font file it writes, once" {
     const gpa = std.testing.allocator;
     const Fixture = struct {
         font: phantom.text.Font,
@@ -753,11 +759,9 @@ test "writePage lists each page, stylesheet and font file it writes, once" {
         try writePage(gpa, tmp.dir, test_shell, .{ .root = root, .path = path, .viewport = test_size, .io = std.testing.io }, &written);
     }
     const paths = written.paths.keys();
-    try std.testing.expectEqual(@as(usize, 4), paths.len);
-    try std.testing.expectEqualStrings("index.html", paths[0]);
-    try std.testing.expect(std.mem.startsWith(u8, paths[1], "page-"));
-    try std.testing.expectEqualStrings("fonts/pf-0b107d216918b3e5.otf", paths[2]);
-    try std.testing.expectEqualStrings("about/index.html", paths[3]);
+    try std.testing.expectEqual(@as(usize, 2), paths.len);
+    try std.testing.expect(std.mem.startsWith(u8, paths[0], "page-"));
+    try std.testing.expect(std.mem.startsWith(u8, paths[1], "fonts/pf-"));
     for (paths) |path| {
         const bytes = try readAt(tmp.dir, path);
         gpa.free(bytes);

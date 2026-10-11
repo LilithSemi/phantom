@@ -114,11 +114,12 @@ fn addAppImports(app_mod: *std.Build.Module, phantom_mod: *std.Build.Module, imp
 pub const WebDist = struct {
     /// The directory that holds the page. Every path in `files` is relative to it.
     dir: std.Build.LazyPath,
-    /// Every file of the page, relative to `dir`, as the page refers to it,
-    /// except the files in `extra_files`.
+    /// Every file of the page, relative to `dir`, as the page refers to it.
+    /// This includes the prerendered pages.
     files: []const []const u8,
-    /// A text file that lists the prerendered pages, stylesheets and font
-    /// files, one path a line, relative to `dir`. Null with no
+    /// A text file that lists the files the prerender names at run time, in
+    /// addition to `files`: the stylesheets and font files of prerendered
+    /// pages. One url path a line, relative to `dir`. Null with no
     /// `prerender_routes`. The names are content hashes made when the build
     /// runs, so an embedder must read this file in its own make step, not at
     /// configure time.
@@ -304,21 +305,22 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
         addDistFile(b, &files, rel);
     }
 
-    const extra_files = if (opts.prerender_routes.len > 0) addPrerender(b, phantom_dep, opts, html, dist) else null;
+    const extra_files = if (opts.prerender_routes.len > 0) addPrerender(b, phantom_dep, opts, html, dist, &files) else null;
 
     return .{ .dir = dist.getDirectory(), .files = files.items, .extra_files = extra_files };
 }
 
 /// Render `opts.prerender_routes` to static pages in `dist`. A host program
 /// built for the build machine runs the app root once and writes each page,
-/// its stylesheet and its font files. Returns the list of those files, see
-/// `WebDist.extra_files`.
+/// its stylesheet and its font files. The pages go into `files`. Returns the
+/// list of the other files, see `WebDist.extra_files`.
 fn addPrerender(
     b: *std.Build,
     phantom_dep: *std.Build.Dependency,
     opts: appmeta.AppOptions,
     shell: []const u8,
     dist: *std.Build.Step.WriteFile,
+    files: *std.ArrayList([]const u8),
 ) ?std.Build.LazyPath {
     appmeta.checkPrerender(opts.url_strategy, opts.prerender_routes, opts.imports.len > 0) catch |err| {
         const why = switch (err) {
@@ -367,6 +369,15 @@ fn addPrerender(
     const manifest = run.addOutputFileArg("files.txt");
     run.addArgs(opts.prerender_routes);
     _ = dist.addCopyDirectory(pages, "", .{});
+
+    for (opts.prerender_routes, 0..) |route, i| {
+        const dir = appmeta.pageDir(route);
+        const seen = for (opts.prerender_routes[0..i]) |prev| {
+            if (std.mem.eql(u8, appmeta.pageDir(prev), dir)) break true;
+        } else false;
+        if (seen) continue;
+        addDistFile(b, files, if (dir.len == 0) "index.html" else b.fmt("{s}/index.html", .{dir}));
+    }
     return manifest;
 }
 

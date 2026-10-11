@@ -4,8 +4,9 @@
 //! source as `app_root`, and runs it once. The arguments are the shell page,
 //! the output directory, the manifest file, and then each route.
 //! `phantom.ssr.writePage` writes each page with its stylesheet and font
-//! files. The manifest lists every file written, one path a line, relative to
-//! the output directory.
+//! files. The manifest lists the stylesheet and font files, one url path a
+//! line, relative to the output directory. The pages are not in it, since
+//! their paths follow from the routes.
 
 const std = @import("std");
 const phantom = @import("phantom");

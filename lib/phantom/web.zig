@@ -453,7 +453,9 @@ fn readLocationThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
 
 /// A static host sends "/about" on to "/about/", the folder of its page. The
 /// route is "/about", so one trailing '/' goes, unless the path is the base.
+/// The base with no trailing '/' reads as the base.
 fn routePath(path: []const u8, base: []const u8) []const u8 {
+    if (path.len + 1 == base.len and std.mem.startsWith(u8, base, path)) return base;
     if (path.len <= 1 or path[path.len - 1] != '/') return path;
     if (std.mem.eql(u8, path, base)) return path;
     return path[0 .. path.len - 1];
@@ -2494,6 +2496,7 @@ test "a path route read with a trailing slash is the route without it" {
         .{ .base = "/", .at = "/about", .want = "/about" },
         .{ .base = "/", .at = "/", .want = "/" },
         .{ .base = "/app/", .at = "/app/", .want = "/app/" },
+        .{ .base = "/app/", .at = "/app", .want = "/app/" },
         .{ .base = "/app/", .at = "/app/docs/intro/", .want = "/app/docs/intro" },
     };
     for (cases) |case| {
