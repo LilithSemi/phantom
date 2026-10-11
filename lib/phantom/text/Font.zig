@@ -22,6 +22,9 @@ metrics: Metrics,
 format: Sfnt.OutlineFormat,
 cff: ?Cff,
 cache: GlyphCache,
+/// A hash of `bytes`. One font file gets one id on every target. The web
+/// backend names the font face from it.
+id: u64,
 /// Where this font can be fetched from, relative to the page, when it is served
 /// as a file. Null when it is not, which is every font an application loaded
 /// from its own bytes.
@@ -59,6 +62,7 @@ pub fn load(gpa: std.mem.Allocator, bytes: []const u8) !Font {
         .format = fmt,
         .cff = cff_val,
         .cache = .{},
+        .id = std.hash.Wyhash.hash(0, bytes),
     };
 }
 

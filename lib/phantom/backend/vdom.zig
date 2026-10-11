@@ -67,15 +67,17 @@ pub const Tree = struct {
     count: usize,
 };
 
-/// The CSS family name for a font, from the font's address. The page declares
-/// each face once, so a name from the font's position in one frame would name
-/// a different font in a frame that uses a different set.
+/// The CSS family name for a font, from `text.Font.id`. The page declares each
+/// face once, so a name from the font's position in one frame would name a
+/// different font in a frame that uses a different set. An address changes
+/// between runs and between targets.
 pub fn fontFamily(buf: []u8, font_ptr: *const text.Font) []const u8 {
-    return std.fmt.bufPrint(buf, "pf{x}", .{@intFromPtr(font_ptr)}) catch "pf0";
+    std.debug.assert(buf.len >= family_len);
+    return std.fmt.bufPrint(buf, "pf-{x:0>16}", .{font_ptr.id}) catch unreachable;
 }
 
-/// The buffer `fontFamily` needs: "pf" and a pointer in hex.
-pub const family_len = 2 + @sizeOf(usize) * 2;
+/// The buffer `fontFamily` needs: "pf-" and a u64 in hex.
+pub const family_len = 3 + 16;
 
 /// Room for "border-color:rgba(255,255,255," and an alpha from `dom.alpha`.
 const state_decl_len = 64;
@@ -647,4 +649,17 @@ test "vdom: the image hash follows the bytes, not the buffer that holds them" {
     b_bytes[9] = 0x02;
     const changed = try testBuild(arena_state.allocator(), list);
     try std.testing.expect(changed.root.children[0].src_hash != changed.root.children[1].src_hash);
+}
+
+test "vdom: a font family comes from the font bytes, so two loads of one file share it" {
+    const gpa = std.testing.allocator;
+    var a = try text.Font.load(gpa, text.builtin.neuropol_bytes);
+    defer a.deinit(gpa);
+    var b = try text.Font.load(gpa, text.builtin.neuropol_bytes);
+    defer b.deinit(gpa);
+    var fam_a: [family_len]u8 = undefined;
+    var fam_b: [family_len]u8 = undefined;
+    // A literal, so a change in the hash or a target that hashes differently fails here.
+    try std.testing.expectEqualStrings("pf-0b107d216918b3e5", fontFamily(&fam_a, &a));
+    try std.testing.expectEqualStrings(fontFamily(&fam_a, &a), fontFamily(&fam_b, &b));
 }
