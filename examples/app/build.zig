@@ -22,6 +22,8 @@ pub fn build(b: *std.Build) void {
         .icons = &.{},
         .target = target,
         .optimize = optimize,
+        .url_strategy = .path,
+        .prerender_routes = &.{ "/", "/text", "/input", "/actions", "/layout", "/decoration", "/media", "/scrolling" },
     });
 
     b.getInstallStep().dependOn(app);
