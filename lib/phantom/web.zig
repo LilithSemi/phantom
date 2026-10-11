@@ -212,8 +212,7 @@ pub const WebApp = struct {
         canvas.sink = self.sink;
         defer canvas.deinit();
         if (!self.paint(&canvas)) {
-            // The rebuild above can have freed the render objects these point at.
-            for (self.scroll_mem.targets[0..self.scroll_mem.count]) |*t| t.* = null;
+            self.dropScrollTargets();
             return;
         }
         // Before the frame reaches the DOM, so a face exists by the time any
@@ -226,9 +225,19 @@ pub const WebApp = struct {
         self.owner.route_changed = false;
         phantom.backend.dom_calls.render(self.gpa, self.ops, canvas.list, physical, phantom.ColorScheme.tokyoNight().bg, self.sink, &self.scroll_mem, &self.page, reset_scroll) catch |err| {
             self.sink.report(.render_failed, @errorName(err));
+            self.dropScrollTargets();
+            // The page still shows the old route, so the next render resets it.
+            if (reset_scroll) self.owner.route_changed = true;
         };
         if (self.scroll_mem.synced) self.paintOffsets();
         _ = self.arena.reset(.retain_capacity);
+    }
+
+    /// The rebuild in `render` can free the render objects that the scroll
+    /// targets of the last frame point at.
+    fn dropScrollTargets(self: *WebApp) void {
+        for (self.scroll_mem.targets[0..self.scroll_mem.count]) |*t| t.* = null;
+        self.scroll_mem.synced = false;
     }
 
     pub fn dispatchTap(self: *WebApp, x: f32, y: f32) void {
@@ -1256,6 +1265,59 @@ test "a scroll the browser reports moves the ScrollView of that region" {
     app.scrollChanged(7, 0, 100);
     try std.testing.expectEqual(@as(f32, 500), scroll_ctl.offset().?.y);
     try std.testing.expect(app.sink.ok());
+}
+
+test "a render that fails drops the scroll targets and keeps the navigation reset" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    scroll_ctl = .{};
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(tallScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+    const div = app.scroll_mem.handles[0];
+
+    var dom_fail: ?usize = null;
+    var fail_index: usize = 0;
+    while (fail_index < 256) : (fail_index += 1) {
+        // An empty arena makes the DOM render allocate again.
+        const next = 1 - app.page.live;
+        app.page.arenas[next].promote(gpa).deinit();
+        app.page.arenas[next] = .init;
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        app.gpa = failing.allocator();
+        app.owner.route_changed = true;
+        const start = rec.log.items.len;
+        app.render();
+        app.gpa = gpa;
+        if (app.owner.route_changed) {
+            // The page did not change, so no region may point at a view.
+            dom_fail = fail_index;
+            for (app.scroll_mem.targets[0..app.scroll_mem.count]) |t| try std.testing.expectEqual(@as(?*phantom.PointerHandlers, null), t);
+            continue;
+        }
+        try std.testing.expect(writtenOffset(&rec, start, div, 0));
+        if (!failing.has_induced_failure) break;
+    }
+    try std.testing.expect(fail_index < 256);
+    const fail_at = dom_fail orelse return error.TestNoDomFailure;
+
+    // The next good render takes the reset that the failed render kept.
+    rec.setScrollOffset(div, .{ .x = 0, .y = 300 });
+    app.owner.route_changed = true;
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+    const next = 1 - app.page.live;
+    app.page.arenas[next].promote(gpa).deinit();
+    app.page.arenas[next] = .init;
+    app.gpa = failing.allocator();
+    app.render();
+    app.gpa = gpa;
+    try std.testing.expect(app.owner.route_changed);
+    app.scrollChanged(0, 0, 300);
+    const start = rec.log.items.len;
+    app.render();
+    try std.testing.expect(writtenOffset(&rec, start, div, 0));
+    try std.testing.expect(!app.owner.route_changed);
+    try std.testing.expectEqual(@as(f32, 0), scroll_ctl.offset().?.y);
 }
 
 var list_rows_highest: usize = 0;
