@@ -1,5 +1,5 @@
 //! The web backend's frame as a small tree of DOM nodes. `build` turns a
-//! display list into this tree. `dom_calls.render` creates the DOM from it and
+//! display list into this tree. `dom_calls.render` patches the DOM to match it and
 //! `dom.renderToString` prints it as HTML, so both give the same markup.
 
 const std = @import("std");
@@ -8,6 +8,7 @@ const geometry = @import("../geometry.zig");
 const dom = @import("dom.zig");
 const text = @import("../text.zig");
 const image_mod = @import("../image/Image.zig");
+const pointer = @import("../pointer.zig");
 const icon_builtin = @import("../icon/builtin.zig");
 const svg_path = @import("../icon/svg_path.zig");
 const FaultSink = @import("../FaultSink.zig");
@@ -21,9 +22,21 @@ pub const max_region_depth = 32;
 /// and an svg holding a path.
 pub const max_tree_depth = 1 + 2 * max_region_depth + 2;
 
-pub const Kind = enum { element, element_svg, text };
+pub const Kind = enum { element, element_svg };
 
 pub const Attr = struct { name: []const u8, value: []const u8 };
+
+/// The scroll state of a region in one frame, as values that stay valid after
+/// the display list is gone.
+pub const Scroll = struct {
+    offset: geometry.PhysicalOffset,
+    /// `ScrollRegion.moved`. A change from the last frame means phantom moved
+    /// the region.
+    moved: u32,
+    /// Called only in the frame that built this value. After that it is only
+    /// compared.
+    handlers: ?*pointer.PointerHandlers,
+};
 
 pub const Node = struct {
     kind: Kind,
@@ -36,7 +49,10 @@ pub const Node = struct {
     key: ?*const anyopaque = null,
     /// Set on the outer node of a scroll region. Its only child is the inner
     /// node that holds the content.
-    scroll: ?*const display_list.ScrollRegion = null,
+    scroll: ?Scroll = null,
+    /// For an img, a hash of the encoded bytes. A diff compares this in place
+    /// of the long data url in `src`.
+    src_hash: u64 = 0,
 };
 
 /// The `:hover`, `:active` and cursor rules of one interactive class. `hash`
@@ -92,6 +108,9 @@ const Builder = struct {
     skipped: usize = 0,
     rules: std.ArrayList(Rule) = .empty,
     count: usize = 1,
+    /// The scroll regions opened so far. The page reports a scroll by this
+    /// index.
+    regions: usize = 0,
 
     fn top(self: *Builder) *Frame {
         return &self.stack[self.depth];
@@ -195,7 +214,10 @@ const Builder = struct {
         _ = enc.encode(src[prefix.len..], im.bytes);
         const attrs = try self.arena.alloc(Attr, 1);
         attrs[0] = .{ .name = "src", .value = src };
-        try self.add(.{ .kind = .element, .tag = "img", .style = style, .attrs = attrs });
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(prefix);
+        hasher.update(im.bytes);
+        try self.add(.{ .kind = .element, .tag = "img", .style = style, .attrs = attrs, .src_hash = hasher.final() });
     }
 
     fn icon(self: *Builder, ic: display_list.IconPrimitive) !void {
@@ -267,23 +289,26 @@ const Builder = struct {
 
     fn pushScroll(self: *Builder, sr: display_list.ScrollRegion) !void {
         const o = self.offset();
-        const region = try self.arena.create(display_list.ScrollRegion);
-        region.* = sr;
+        const attrs = try self.arena.alloc(Attr, 1);
+        attrs[0] = .{ .name = "data-phantom-scroll", .value = try self.arena.print("{d}", .{self.regions}) };
         // The outer div is the scrolling window. The inner div is the full
         // content area that scrolls inside it.
         const outer: Node = .{
             .kind = .element,
             .tag = "div",
             .style = try self.arena.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll", .{ sr.viewport.x - o.x, sr.viewport.y - o.y, sr.viewport.width, sr.viewport.height }),
+            .attrs = attrs,
             .key = sr.handlers,
-            .scroll = region,
+            .scroll = .{ .offset = sr.offset, .moved = sr.moved, .handlers = sr.handlers },
         };
         const inner: Node = .{
             .kind = .element,
             .tag = "div",
             .style = try self.arena.print("position:relative;width:{d}px;height:{d}px", .{ sr.content.width, sr.content.height }),
         };
-        _ = self.open(.{ .node = inner, .outer = outer, .origin = .{ .x = sr.viewport.x, .y = sr.viewport.y } }, "scroll region nesting exceeded max_region_depth, region skipped");
+        if (self.open(.{ .node = inner, .outer = outer, .origin = .{ .x = sr.viewport.x, .y = sr.viewport.y } }, "scroll region nesting exceeded max_region_depth, region skipped")) {
+            self.regions += 1;
+        }
     }
 
     fn pushClip(self: *Builder, cr: display_list.ClipRegion) !void {
@@ -395,7 +420,7 @@ test "vdom: a scroll region is an outer node with its key and one inner node hol
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     var target: u8 = 0;
-    var handlers = @import("../pointer.zig").PointerHandlers{ .ctx = &target };
+    var handlers = pointer.PointerHandlers{ .ctx = &target };
     var list: display_list.DisplayList = .{};
     defer list.deinit(gpa);
     try list.append(gpa, .{ .push_scroll = .{
@@ -416,10 +441,14 @@ test "vdom: a scroll region is an outer node with its key and one inner node hol
     try std.testing.expectEqual(@as(?*const anyopaque, &handlers), outer.key);
     try std.testing.expectEqual(@as(u32, 3), outer.scroll.?.moved);
     try std.testing.expectEqual(@as(f32, 7), outer.scroll.?.offset.y);
+    try std.testing.expectEqual(@as(?*pointer.PointerHandlers, &handlers), outer.scroll.?.handlers);
+    try std.testing.expectEqualStrings("data-phantom-scroll", outer.attrs[0].name);
+    try std.testing.expectEqualStrings("0", outer.attrs[0].value);
     try std.testing.expectEqual(@as(usize, 1), outer.children.len);
     const inner = outer.children[0];
     try std.testing.expectEqualStrings("position:relative;width:100px;height:300px", inner.style);
-    try std.testing.expectEqual(@as(?*const display_list.ScrollRegion, null), inner.scroll);
+    try std.testing.expectEqual(@as(?Scroll, null), inner.scroll);
+    try std.testing.expectEqual(@as(usize, 0), inner.attrs.len);
     try std.testing.expectEqualStrings("position:absolute;left:0px;top:100px;width:80px;height:20px;border-radius:0px;background:rgba(255,0,0,1)", inner.children[0].style);
     // After the pop the next rrect is back in the container's space.
     try std.testing.expect(std.mem.startsWith(u8, tree.root.children[1].style, "position:absolute;left:1px;top:2px;"));
@@ -571,4 +600,52 @@ test "vdom: an image with encoded bytes is an img with a data url, and one witho
     try std.testing.expectEqualStrings("position:absolute;left:5px;top:15px;width:64px;height:32px", node.style);
     try std.testing.expectEqualStrings("src", node.attrs[0].name);
     try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgoAAQ==", node.attrs[0].value);
+}
+
+test "vdom: scroll regions are numbered in the order they open, nested ones included" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const region: display_list.Primitive = .{ .push_scroll = .{
+        .viewport = .{ .x = 0, .y = 0, .width = 50, .height = 50 },
+        .offset = .zero,
+        .content = .{ .width = 50, .height = 200 },
+    } };
+    var list: display_list.DisplayList = .{};
+    defer list.deinit(gpa);
+    try list.append(gpa, region);
+    try list.append(gpa, region);
+    try list.append(gpa, .{ .pop_scroll = {} });
+    try list.append(gpa, .{ .pop_scroll = {} });
+    try list.append(gpa, region);
+    try list.append(gpa, .{ .pop_scroll = {} });
+    const tree = try testBuild(arena_state.allocator(), list);
+
+    const first = tree.root.children[0];
+    const nested = first.children[0].children[0];
+    const last = tree.root.children[1];
+    try std.testing.expectEqualStrings("0", first.attrs[0].value);
+    try std.testing.expectEqualStrings("1", nested.attrs[0].value);
+    try std.testing.expectEqualStrings("2", last.attrs[0].value);
+}
+
+test "vdom: the image hash follows the bytes, not the buffer that holds them" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var a_bytes = [_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01 };
+    var b_bytes = a_bytes;
+    var a = image_mod.Image.fromBytes(&a_bytes, 10, 10);
+    var b = image_mod.Image.fromBytes(&b_bytes, 10, 10);
+    var list: display_list.DisplayList = .{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .image = .{ .image = &a, .rect = .{ .x = 0, .y = 0, .width = 2, .height = 2 } } });
+    try list.append(gpa, .{ .image = .{ .image = &b, .rect = .{ .x = 0, .y = 0, .width = 2, .height = 2 } } });
+    const same = try testBuild(arena_state.allocator(), list);
+    try std.testing.expect(same.root.children[0].src_hash != 0);
+    try std.testing.expectEqual(same.root.children[0].src_hash, same.root.children[1].src_hash);
+
+    b_bytes[9] = 0x02;
+    const changed = try testBuild(arena_state.allocator(), list);
+    try std.testing.expect(changed.root.children[0].src_hash != changed.root.children[1].src_hash);
 }

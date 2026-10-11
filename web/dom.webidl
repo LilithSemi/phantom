@@ -1,5 +1,7 @@
 interface Node {
   Node appendChild(Node node);
+  Node insertBefore(Node node, Node? child);
+  Node removeChild(Node child);
 };
 
 interface Element {
@@ -8,6 +10,7 @@ interface Element {
   attribute double scrollLeft;
   attribute double scrollTop;
   undefined setAttribute(DOMString name, DOMString value);
+  undefined removeAttribute(DOMString name);
   Node appendChild(Node node);
 };
 

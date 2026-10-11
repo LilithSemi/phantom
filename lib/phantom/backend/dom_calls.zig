@@ -60,6 +60,8 @@ pub const DomOps = struct {
     /// running any script at all, so the CSSOM adds no way in. Same result, same
     /// declaration, and a policy nobody has to loosen.
     ///
+    /// The declaration replaces the one the node had before.
+    ///
     /// Null falls back to `set_attribute`, which keeps a host written before this
     /// existed working, at the cost of needing `'unsafe-inline'`.
     set_style: ?*const fn (ctx: *anyopaque, node: u32, decl: []const u8) void = null,
@@ -111,17 +113,24 @@ pub const DomOps = struct {
     /// Puts `path` in the address bar without loading a new page, in `mode`.
     write_location: ?*const fn (ctx: *anyopaque, path: []const u8, mode: platform.WriteMode) void = null,
     /// Reads a scroll region's current offset (scrollLeft/scrollTop) from the
-    /// host. Null on a host that cannot read it back; `render` then carries no
-    /// offset across a rebuild, which is today's behaviour: a tap resets every
-    /// open region to the top.
+    /// host. Null on a host that cannot read it back. A view then does not
+    /// learn an offset that the browser scrolled to before its event came.
     read_scroll_offset: ?*const fn (ctx: *anyopaque, node: u32) geometry.PhysicalOffset = null,
     /// Sets a scroll region's offset on the host. Null on a host that cannot
-    /// write it; `render` then leaves a rebuilt region wherever a fresh
-    /// element starts, which is today's behaviour.
+    /// write it. A region then stays where the browser has it.
     write_scroll_offset: ?*const fn (ctx: *anyopaque, node: u32, offset: geometry.PhysicalOffset) void = null,
     /// Drops the host's reference to a node handle. The node stays in the
     /// document. Null on a host that keeps no handle table.
     release: ?*const fn (ctx: *anyopaque, node: u32) void = null,
+    /// Takes `child` out of `parent`. The handle stays valid until it is
+    /// released. Null, or a null `insert_before`, makes `render` build the
+    /// whole body again on each frame.
+    remove_child: ?*const fn (ctx: *anyopaque, parent: u32, child: u32) void = null,
+    /// Puts `child` into `parent` just before `ref`, and moves it there when
+    /// it is already in the document.
+    insert_before: ?*const fn (ctx: *anyopaque, parent: u32, child: u32, ref: u32) void = null,
+    /// Null falls back to setting the attribute to an empty value.
+    remove_attribute: ?*const fn (ctx: *anyopaque, node: u32, name: []const u8) void = null,
 
     pub fn createElement(self: DomOps, tag: []const u8) u32 {
         return self.create_element(self.ctx, tag);
@@ -147,8 +156,8 @@ pub const DomOps = struct {
     /// permits, and falls back to a `<style>` element, which it does not. See
     /// `add_rule`.
     ///
-    /// The fallback element goes in the head, because `render` clears the body
-    /// and a rule is added only once for the page.
+    /// The fallback element goes in the head, because `render` can clear the
+    /// body and a rule is added only once for the page.
     pub fn addRule(self: DomOps, css: []const u8) void {
         if (self.add_rule) |f| return f(self.ctx, css);
         const node = self.createElement("style");
@@ -187,6 +196,18 @@ pub const DomOps = struct {
     pub fn releaseNode(self: DomOps, node: u32) void {
         const f = self.release orelse return;
         f(self.ctx, node);
+    }
+    pub fn removeChild(self: DomOps, parent: u32, child: u32) void {
+        const f = self.remove_child orelse return;
+        f(self.ctx, parent, child);
+    }
+    pub fn insertBefore(self: DomOps, parent: u32, child: u32, ref: u32) void {
+        const f = self.insert_before orelse return self.appendChild(parent, child);
+        f(self.ctx, parent, child, ref);
+    }
+    pub fn removeAttribute(self: DomOps, node: u32, name: []const u8) void {
+        const f = self.remove_attribute orelse return self.setAttribute(node, name, "");
+        f(self.ctx, node, name);
     }
 };
 
@@ -243,30 +264,23 @@ pub fn fontFaceCss(gpa: std.mem.Allocator, fonts: []const *text.Font) ![]u8 {
 
 pub const max_region_depth = vdom.max_region_depth;
 
-/// How many scroll regions `render` remembers offsets for across a rebuild.
-/// Unlike `max_region_depth`, this counts every open region in one frame, not
-/// only how deep they nest, because sibling regions do not nest at all. Same
-/// bound style as `max_region_depth`: a page past the limit still renders,
-/// the regions past it just fall back to today's behaviour (reset to the
-/// top), and a fault is reported rather than writing past a fixed array.
+/// How many scroll regions `render` tracks in one frame. Unlike
+/// `max_region_depth`, this counts every open region in one frame, not only
+/// how deep they nest, because sibling regions do not nest at all. A page past
+/// the limit still renders. The regions past it get no offset sync, and a
+/// fault is reported rather than writing past a fixed array.
 pub const max_scroll_regions = 32;
 
-/// Scroll offsets carried across a rebuild. A tap rebuilds the whole DOM
-/// (see `render`), which would otherwise hand the scroll position of every
-/// open region back to the browser's default of zero. A region is matched to
-/// last frame's region by its handlers, so an offset stays with its render
-/// object when a region is added before it. A caller (`WebApp`) owns one
-/// instance for the life of the page and passes a pointer to every `render`
-/// call. A null pointer turns off the carried scroll state.
+/// The scroll regions of the last frame, by the index the page reports a
+/// scroll with. A caller (`WebApp`) owns one instance for the life of the page
+/// and passes a pointer to every `render` call. A null pointer turns off the
+/// scroll offset sync.
 pub const ScrollMemory = struct {
-    /// The outer div handle of each scroll region `render` created last
-    /// frame, in creation order.
+    /// The outer div handle of each region.
     handles: [max_scroll_regions]u32 = undefined,
     /// The scroll handlers of the render object behind each region, at the
     /// same index. Valid until the tree next rebuilds.
     targets: [max_scroll_regions]?*pointer.PointerHandlers = undefined,
-    /// The `ScrollRegion.moved` of each region, at the same index.
-    moved: [max_scroll_regions]u32 = undefined,
     count: usize = 0,
     /// True when the last `render` moved a view to the offset that its div
     /// shows. The caller then paints again, so that a list can ask for the
@@ -274,219 +288,343 @@ pub const ScrollMemory = struct {
     synced: bool = false,
 };
 
+/// The DOM handle of each node of a tree, in the same shape as the tree.
+const Handles = struct {
+    handle: u32 = 0,
+    children: []Handles = &.{},
+    /// Diff state on a node of the last tree: it has a match in the new
+    /// tree, and it is already at its new place among its siblings.
+    matched: bool = false,
+    placed: bool = false,
+    /// Diff state on a node of the new tree: the index of the last tree
+    /// sibling it matched.
+    from: ?usize = null,
+};
+
+/// One `Handles` for each node of `root`, all in one allocation.
+fn allocHandles(arena: std.mem.Allocator, root: vdom.Node, count: usize) !*Handles {
+    const flat = try arena.alloc(Handles, count);
+    var next: usize = 1;
+    shapeHandles(flat, &next, &flat[0], root, 0);
+    std.debug.assert(next == count);
+    return &flat[0];
+}
+
+fn shapeHandles(flat: []Handles, next: *usize, h: *Handles, node: vdom.Node, depth: usize) void {
+    std.debug.assert(depth < vdom.max_tree_depth);
+    h.* = .{ .children = flat[next.*..][0..node.children.len] };
+    next.* += node.children.len;
+    for (node.children, h.children) |child, *ch| shapeHandles(flat, next, ch, child, depth + 1);
+}
+
+/// The last tree that `render` put on the page, and the handle of each node.
+const Retained = struct { root: vdom.Node, handles: *Handles };
+
 /// Host state that `render` keeps between frames. A caller (`WebApp`) owns one
-/// for the life of the page and passes it to every `render` call. A null
-/// pointer turns off handle release and rule reuse.
+/// for the life of the page and passes it to every `render` call with the
+/// same allocator. A null pointer turns off the diff: each render then
+/// clears the body and builds it again, and keeps no handle to release.
 pub const PageState = struct {
-    /// The node handles that the last `render` created.
-    nodes: std.ArrayList(u32) = .empty,
     /// The hashes of the interactive rules the page sheet already holds.
     rules: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// One arena holds the last tree. The next render builds into the other.
+    arenas: [2]std.heap.ArenaAllocator.State = .{ .init, .init },
+    /// The index of the arena that holds `last`.
+    live: u1 = 0,
+    last: ?Retained = null,
 
     pub fn deinit(self: *PageState, gpa: std.mem.Allocator) void {
-        self.nodes.deinit(gpa);
         self.rules.deinit(gpa);
+        for (self.arenas) |state| state.promote(gpa).deinit();
     }
 };
 
-/// Records each handle `render` creates, when the caller keeps them.
-const Made = struct {
-    nodes: ?*std.ArrayList(u32),
-
-    fn add(self: Made, node: u32) u32 {
-        if (self.nodes) |n| n.appendAssumeCapacity(node);
-        return node;
-    }
-};
-
-/// The index of last frame's region with the handlers `h`. A region with no
-/// handlers can only match the region at its own index.
-fn previousRegion(targets: []const ?*pointer.PointerHandlers, index: usize, h: ?*pointer.PointerHandlers) ?usize {
-    if (h == null) return if (index < targets.len and targets[index] == null) index else null;
-    for (targets, 0..) |t, j| {
-        if (t == h) return j;
+fn findAttr(attrs: []const vdom.Attr, name: []const u8) ?[]const u8 {
+    for (attrs) |attr| {
+        if (std.mem.eql(u8, attr.name, name)) return attr.value;
     }
     return null;
 }
 
-/// Last frame's scroll state, which `render` reads before it clears the body.
-const ScrollPass = struct {
+fn sameElement(a: vdom.Node, b: vdom.Node) bool {
+    return a.kind == b.kind and std.mem.eql(u8, a.tag, b.tag);
+}
+
+/// Pairs the children of one parent. A keyed node matches the last node with
+/// the same key wherever it was. The other nodes match in order, skipping the
+/// keyed ones, and only when kind and tag agree.
+fn matchChildren(old: []const vdom.Node, old_h: []Handles, new: []const vdom.Node, new_h: []Handles) void {
+    var next_unkeyed: usize = 0;
+    for (new, new_h) |node, *h| {
+        h.from = null;
+        if (node.key) |key| {
+            for (old, old_h, 0..) |o, *oh, j| {
+                const old_key = o.key orelse continue;
+                if (oh.matched or old_key != key or !sameElement(o, node)) continue;
+                oh.matched = true;
+                h.from = j;
+                break;
+            }
+            continue;
+        }
+        while (next_unkeyed < old.len and old[next_unkeyed].key != null) next_unkeyed += 1;
+        if (next_unkeyed == old.len) continue;
+        if (sameElement(old[next_unkeyed], node)) {
+            old_h[next_unkeyed].matched = true;
+            h.from = next_unkeyed;
+        }
+        next_unkeyed += 1;
+    }
+}
+
+/// A scroll region found in this frame. `old` is null for a new div.
+const Step = struct { outer: u32, old: ?vdom.Scroll, new: vdom.Scroll };
+
+/// The DOM work of one render. It does no allocation, so once it starts the
+/// render cannot fail.
+const Patch = struct {
+    ops: DomOps,
     mem: ?*ScrollMemory,
     sink: ?*FaultSink,
-    reset_scroll: bool,
-    saved: [max_scroll_regions]geometry.PhysicalOffset = undefined,
-    saved_count: usize = 0,
-    prev_targets: [max_scroll_regions]?*pointer.PointerHandlers = undefined,
-    prev_moved: [max_scroll_regions]u32 = undefined,
-    prev_count: usize = 0,
+    steps: [max_scroll_regions]Step = undefined,
 
-    /// Gives a new scroll region its offset and records it in `mem`. `outer`
-    /// must already hold its inner div: before that it has nothing to scroll
-    /// to, and a browser clamps any offset back to zero. The browser's offset
-    /// wins, because the visitor can be in the middle of a scroll. Phantom's
-    /// offset wins for a region that phantom moved since the last frame, and
-    /// for a region that is new to the page. After a navigation every other
-    /// region goes to the top.
-    fn place(self: *ScrollPass, ops: DomOps, outer: u32, sr: *const display_list.ScrollRegion) !void {
+    fn begin(self: *Patch) void {
+        const m = self.mem orelse return;
+        m.count = 0;
+        m.synced = false;
+    }
+
+    /// Records a region in the order regions open, which is the index the
+    /// page reports a scroll with.
+    fn region(self: *Patch, outer: u32, old: ?vdom.Scroll, new: vdom.Scroll) void {
         const m = self.mem orelse return;
         if (m.count >= max_scroll_regions) {
             if (self.sink) |s| s.report(.region_overflow, "scroll region count exceeded max_scroll_regions, offset not tracked");
             return;
         }
-        const i = m.count;
-        const prev = previousRegion(self.prev_targets[0..self.prev_count], i, sr.handlers);
-        var shown: ?geometry.PhysicalOffset = null;
-        if (prev != null and sr.handlers != null and self.prev_moved[prev.?] != sr.moved) {
-            ops.writeScrollOffset(outer, sr.offset);
-            shown = sr.offset;
-        } else if (self.reset_scroll) {
-            shown = geometry.PhysicalOffset.zero;
-        } else if (prev) |j| {
-            if (j < self.saved_count) {
-                ops.writeScrollOffset(outer, self.saved[j]);
-                shown = self.saved[j];
-            }
-        } else if (sr.offset.x != 0 or sr.offset.y != 0) {
-            ops.writeScrollOffset(outer, sr.offset);
-        }
-        // The view takes the offset that the div shows.
-        if (shown) |to| {
-            if (sr.handlers) |h| {
-                if (h.on_scroll_to) |scroll_to| {
-                    if (scroll_to(h.ctx, to.x, to.y)) m.synced = true;
-                }
-            }
-        }
-        // The page reports a scroll on this div by this index.
-        var index_buf: [20]u8 = undefined;
-        const index = try std.fmt.bufPrint(&index_buf, "{d}", .{m.count});
-        ops.setAttribute(outer, "data-phantom-scroll", index);
         m.handles[m.count] = outer;
-        m.targets[m.count] = sr.handlers;
-        m.moved[m.count] = sr.moved;
+        m.targets[m.count] = new.handlers;
+        self.steps[m.count] = .{ .outer = outer, .old = old, .new = new };
         m.count += 1;
+    }
+
+    /// Gives each region its offset, after the whole tree is in place. A div
+    /// that stays keeps the offset the browser has, because the visitor can
+    /// be in the middle of a scroll. Phantom's offset wins for a region that
+    /// phantom moved since the last frame, and for a new div. After a
+    /// navigation every other region goes to the top. The view then takes
+    /// the offset that the div shows.
+    fn finish(self: *Patch, reset_scroll: bool) void {
+        const m = self.mem orelse return;
+        for (self.steps[0..m.count]) |step| {
+            var shown: ?geometry.PhysicalOffset = null;
+            if (step.old) |old| {
+                if (step.new.handlers != null and old.moved != step.new.moved) {
+                    self.ops.writeScrollOffset(step.outer, step.new.offset);
+                    shown = step.new.offset;
+                } else if (reset_scroll) {
+                    self.ops.writeScrollOffset(step.outer, .zero);
+                    shown = .zero;
+                } else {
+                    shown = self.ops.readScrollOffset(step.outer);
+                }
+            } else if (reset_scroll) {
+                shown = .zero;
+            } else if (step.new.offset.x != 0 or step.new.offset.y != 0) {
+                self.ops.writeScrollOffset(step.outer, step.new.offset);
+            }
+            const to = shown orelse continue;
+            const h = step.new.handlers orelse continue;
+            const scroll_to = h.on_scroll_to orelse continue;
+            if (scroll_to(h.ctx, to.x, to.y)) m.synced = true;
+        }
+    }
+
+    fn insert(self: *Patch, parent: u32, child: u32, before: ?u32) void {
+        if (before) |ref| return self.ops.insertBefore(parent, child, ref);
+        self.ops.appendChild(parent, child);
+    }
+
+    /// Creates `node` and its subtree, parent first, and puts it in `parent`
+    /// before `before`. Each node goes into the page as soon as it exists, so
+    /// a scroll div has its size by the time `finish` writes its offset.
+    fn create(self: *Patch, node: vdom.Node, h: *Handles, parent: u32, before: ?u32, depth: usize) void {
+        std.debug.assert(depth < vdom.max_tree_depth);
+        h.handle = switch (node.kind) {
+            .element => self.ops.createElement(node.tag),
+            .element_svg => self.ops.createElementNs(svg_ns, node.tag),
+        };
+        for (node.attrs) |attr| self.ops.setAttribute(h.handle, attr.name, attr.value);
+        if (node.style.len > 0) self.ops.setStyle(h.handle, node.style);
+        if (node.text.len > 0) self.ops.setTextContent(h.handle, node.text);
+        self.insert(parent, h.handle, before);
+        if (node.scroll) |s| self.region(h.handle, null, s);
+        for (node.children, h.children) |child, *ch| self.create(child, ch, h.handle, null, depth + 1);
+    }
+
+    /// Sends only what differs between a node of the last tree and the node
+    /// of the new tree that matched it.
+    fn update(self: *Patch, old: vdom.Node, old_h: *const Handles, node: vdom.Node, h: *Handles, depth: usize) void {
+        std.debug.assert(depth < vdom.max_tree_depth);
+        h.handle = old_h.handle;
+        for (node.attrs) |attr| {
+            if (findAttr(old.attrs, attr.name)) |value| {
+                const same = if (node.src_hash != 0 and std.mem.eql(u8, attr.name, "src"))
+                    old.src_hash == node.src_hash
+                else
+                    std.mem.eql(u8, value, attr.value);
+                if (same) continue;
+            }
+            self.ops.setAttribute(h.handle, attr.name, attr.value);
+        }
+        for (old.attrs) |attr| {
+            if (findAttr(node.attrs, attr.name) == null) self.ops.removeAttribute(h.handle, attr.name);
+        }
+        if (!std.mem.eql(u8, old.style, node.style)) self.ops.setStyle(h.handle, node.style);
+        // Text replaces every child. So it is cleared before new children
+        // come in, and set after the old children went out.
+        const text_changed = !std.mem.eql(u8, old.text, node.text);
+        if (text_changed and node.text.len == 0) self.ops.setTextContent(h.handle, "");
+        if (node.scroll) |s| self.region(h.handle, old.scroll, s);
+        self.children(h.handle, old.children, old_h.children, node.children, h.children, depth + 1);
+        if (text_changed and node.text.len > 0) self.ops.setTextContent(h.handle, node.text);
+    }
+
+    /// Makes the children of `parent` match `new`. Unmatched old children go
+    /// first. Then each new child is either kept, moved, or created in place.
+    fn children(self: *Patch, parent: u32, old: []const vdom.Node, old_h: []Handles, new: []const vdom.Node, new_h: []Handles, depth: usize) void {
+        matchChildren(old, old_h, new, new_h);
+        for (old_h) |*oh| {
+            if (!oh.matched) self.remove(parent, oh);
+        }
+        // `at` is the first old child still in its old place. Every new
+        // child before it is already in order.
+        var at: usize = 0;
+        for (new, new_h) |node, *h| {
+            while (at < old_h.len and (!old_h[at].matched or old_h[at].placed)) at += 1;
+            const before: ?u32 = if (at < old_h.len) old_h[at].handle else null;
+            const j = h.from orelse {
+                self.create(node, h, parent, before, depth);
+                continue;
+            };
+            if (j != at) self.move(parent, old[j], old_h[j].handle, before);
+            old_h[j].placed = true;
+            self.update(old[j], &old_h[j], node, h, depth);
+        }
+    }
+
+    /// A browser can drop the scroll offset of an element that leaves the
+    /// document, so a moved scroll div gets its offset back.
+    fn move(self: *Patch, parent: u32, old: vdom.Node, handle: u32, before: ?u32) void {
+        const offset = if (old.scroll != null) self.ops.readScrollOffset(handle) else null;
+        self.insert(parent, handle, before);
+        const o = offset orelse return;
+        if (o.x != 0 or o.y != 0) self.ops.writeScrollOffset(handle, o);
+    }
+
+    fn remove(self: *Patch, parent: u32, h: *const Handles) void {
+        self.ops.removeChild(parent, h.handle);
+        self.release(h, 0);
+    }
+
+    fn release(self: *Patch, h: *const Handles, depth: usize) void {
+        std.debug.assert(depth < vdom.max_tree_depth);
+        for (h.children) |*ch| self.release(ch, depth + 1);
+        self.ops.releaseNode(h.handle);
     }
 };
 
-/// Creates one node with its attributes, style and text, and appends it to
-/// `parent`. Its children are left to the caller.
-fn createNode(ops: DomOps, made: Made, node: vdom.Node, parent: u32) u32 {
-    const handle = made.add(switch (node.kind) {
-        .element => ops.createElement(node.tag),
-        .element_svg => ops.createElementNs(svg_ns, node.tag),
-        .text => ops.createTextNode(node.text),
-    });
-    if (node.kind != .text) {
-        for (node.attrs) |attr| ops.setAttribute(handle, attr.name, attr.value);
-        if (node.style.len > 0) ops.setStyle(handle, node.style);
-        if (node.text.len > 0) ops.setTextContent(handle, node.text);
-    }
-    ops.appendChild(parent, handle);
-    return handle;
-}
-
-/// Creates `node` and its subtree under `parent`, parent first. A scroll
-/// region gets its offset after its inner div is attached and before its
-/// content, so regions are numbered in the order they open. Recursion is
-/// bounded by `vdom.max_tree_depth`.
-fn createTree(ops: DomOps, made: Made, pass: *ScrollPass, node: vdom.Node, parent: u32, depth: usize) !void {
-    std.debug.assert(depth < vdom.max_tree_depth);
-    const handle = createNode(ops, made, node, parent);
-    var content = node;
-    var content_handle = handle;
-    if (node.scroll) |sr| {
-        std.debug.assert(node.children.len == 1);
-        content = node.children[0];
-        content_handle = createNode(ops, made, content, handle);
-        try pass.place(ops, handle, sr);
-    }
-    for (content.children) |child| try createTree(ops, made, pass, child, content_handle, depth + 1);
-}
-
-/// Rebuild the whole document body's child tree from the display list. `sink`
-/// records a fault when the display list nests more clip/scroll regions than
-/// `max_region_depth`; pass null where no sink is wired up.
+/// Puts the display list on the page. `sink` records a fault when the display
+/// list nests more clip/scroll regions than `max_region_depth`. Pass null
+/// where no sink is wired up.
 ///
-/// `mem`, if given, carries scroll offsets across the rebuild: the region a
-/// tap would otherwise reset to the top instead keeps the position the
-/// browser already had it at. Pass null to opt out.
+/// `page`, if given, keeps the tree between frames. Then each render compares
+/// the new tree with the last one and sends only what changed. Nodes and
+/// scroll divs that stay keep their DOM element, and each removed node's
+/// handle is released. A host with no `insert_before` or `remove_child` gets
+/// the body built again. The page also keeps each interactive rule once, so a
+/// rule is added only for a new class. Pass the same `gpa` on every call.
 ///
-/// `reset_scroll` is true exactly once, on the render that follows a
-/// navigation: the caller is expected to clear it after that one call. A
-/// visitor arriving at a new route expects its top, not wherever the
-/// previous route happened to be scrolled to, so this render drops `mem`'s
-/// saved offsets instead of applying them and moves the views to the top.
-/// A region that phantom moved since the last render keeps phantom's offset,
-/// even on a navigation.
+/// Every step that can fail runs before the first DOM call. A render that
+/// returns an error leaves the page, `page` and `mem` as they were.
 ///
-/// When the host can read a region's offset back, a matched region then has
-/// the offset its div shows. A read that is missing or fails leaves that
-/// region, and every later region this call tracks, with no saved offset to
-/// give them: `render` writes nothing for them and `mem` can fall behind what
-/// their divs show. A view that `render` had to move sets `mem.synced`.
-///
-/// `page`, if given, gets the handles this frame creates. The next call
-/// releases them before it clears the body. It also keeps each interactive
-/// rule in the page sheet once, so a rule is added only for a new class.
+/// `mem`, if given, keeps the scroll regions in step with their views. See
+/// `Patch.finish` for which offset wins. `reset_scroll` is true exactly once,
+/// on the render that follows a navigation: the caller is expected to clear it
+/// after that one call. A visitor arriving at a new route expects its top, not
+/// wherever the previous route happened to be scrolled to. A view that
+/// `render` had to move sets `mem.synced`.
 pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink, mem: ?*ScrollMemory, page: ?*PageState, reset_scroll: bool) !void {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const tree = try vdom.build(arena_state.allocator(), list, viewport, bg, sink);
+    const pg = page orelse return renderAll(gpa, ops, list, viewport, bg, sink, mem, reset_scroll);
+    const next: u1 = 1 - pg.live;
+    var arena_state = pg.arenas[next].promote(gpa);
+    defer pg.arenas[next] = arena_state.state;
+    errdefer _ = arena_state.reset(.retain_capacity);
+    const arena = arena_state.allocator();
 
-    // Read every remembered region's live offset before its div is destroyed
-    // below. Skipped on a navigation (the new page starts at the top) and
-    // when the host cannot read scroll position at all.
-    var pass: ScrollPass = .{ .mem = mem, .sink = sink, .reset_scroll = reset_scroll };
-    if (mem) |m| {
-        m.synced = false;
-        pass.prev_count = m.count;
-        @memcpy(pass.prev_targets[0..m.count], m.targets[0..m.count]);
-        @memcpy(pass.prev_moved[0..m.count], m.moved[0..m.count]);
-        if (!reset_scroll and ops.read_scroll_offset != null) {
-            for (m.handles[0..m.count]) |h| {
-                pass.saved[pass.saved_count] = ops.readScrollOffset(h) orelse break;
-                pass.saved_count += 1;
-            }
-        }
-        // This frame's regions are recorded fresh as they are created.
-        m.count = 0;
-    }
-
-    // After the offset reads above, which use last frame's handles. Room for
-    // every handle of this frame is reserved first, so recording one cannot
-    // fail in the middle of the build.
-    var made: Made = .{ .nodes = null };
-    if (page) |pg| {
-        for (pg.nodes.items) |h| ops.releaseNode(h);
-        pg.nodes.clearRetainingCapacity();
-        try pg.nodes.ensureTotalCapacity(gpa, tree.count);
-        made.nodes = &pg.nodes;
-    }
-
-    ops.clearChildren(ops.body);
-    try createTree(ops, made, &pass, tree.root, ops.body, 0);
-
+    const tree = try vdom.build(arena, list, viewport, bg, sink);
+    const handles = try allocHandles(arena, tree.root, tree.count);
     // The rules of classes new to the page go to a sheet with no element. A
     // strict policy refuses a `<style>` element even while it is empty. See
     // `DomOps.add_rule`.
     var css: std.ArrayList(u8) = .empty;
-    defer css.deinit(gpa);
     var fresh: usize = 0;
     for (tree.rules) |rule| {
-        if (page) |pg| {
-            if (pg.rules.contains(rule.hash)) continue;
-        }
-        try css.appendSlice(gpa, rule.css);
+        if (pg.rules.contains(rule.hash)) continue;
+        try css.appendSlice(arena, rule.css);
         fresh += 1;
     }
+    var remember = true;
+    pg.rules.ensureUnusedCapacity(gpa, @intCast(fresh)) catch {
+        if (sink) |s| s.report(.oom, "interactive rules were not remembered, so the next frame adds them again");
+        remember = false;
+    };
+
+    var patch: Patch = .{ .ops = ops, .mem = mem, .sink = sink };
+    patch.begin();
+    const new_root = [1]vdom.Node{tree.root};
+    if (pg.last) |last| {
+        if (ops.insert_before != null and ops.remove_child != null) {
+            const old_root = [1]vdom.Node{last.root};
+            patch.children(ops.body, &old_root, last.handles[0..1], &new_root, handles[0..1], 0);
+        } else {
+            patch.release(last.handles, 0);
+            ops.clearChildren(ops.body);
+            patch.create(tree.root, handles, ops.body, null, 0);
+        }
+    } else {
+        ops.clearChildren(ops.body);
+        patch.create(tree.root, handles, ops.body, null, 0);
+    }
     if (css.items.len > 0) ops.addRule(css.items);
-    if (page) |pg| {
-        pg.rules.ensureUnusedCapacity(gpa, @intCast(fresh)) catch {
-            if (sink) |s| s.report(.oom, "interactive rules were not remembered, so the next frame adds them again");
-            return;
-        };
+    if (remember) {
         for (tree.rules) |rule| pg.rules.putAssumeCapacity(rule.hash, {});
     }
+    patch.finish(reset_scroll);
+
+    pg.last = .{ .root = tree.root, .handles = handles };
+    var old_arena = pg.arenas[pg.live].promote(gpa);
+    _ = old_arena.reset(.retain_capacity);
+    pg.arenas[pg.live] = old_arena.state;
+    pg.live = next;
+}
+
+/// Clears the body and builds it again, with no state kept between frames.
+fn renderAll(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink, mem: ?*ScrollMemory, reset_scroll: bool) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tree = try vdom.build(arena, list, viewport, bg, sink);
+    const handles = try allocHandles(arena, tree.root, tree.count);
+    var css: std.ArrayList(u8) = .empty;
+    for (tree.rules) |rule| try css.appendSlice(arena, rule.css);
+
+    var patch: Patch = .{ .ops = ops, .mem = mem, .sink = sink };
+    patch.begin();
+    ops.clearChildren(ops.body);
+    patch.create(tree.root, handles, ops.body, null, 0);
+    if (css.items.len > 0) ops.addRule(css.items);
+    patch.finish(reset_scroll);
 }
 
 // Recording mock for tests. No global mutable state: each fn casts ctx to *Recorder.
@@ -514,6 +652,10 @@ pub const Recorder = struct {
     /// the rest of this mock; a test needs at most a handful of regions.
     scroll_offsets: [scroll_offsets_cap]ScrollEntry = undefined,
     scroll_offsets_len: usize = 0,
+    /// The handles released so far, and how many calls used a handle after
+    /// its release or released it again. A test expects zero.
+    released: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    misuse: usize = 0,
 
     /// Comfortably past `router.max_path`, so a test can park a location here
     /// that is too long for the router's own buffer without touching this
@@ -600,6 +742,7 @@ pub const Recorder = struct {
 
     fn readScrollOffset(ctx: *anyopaque, node: u32) geometry.PhysicalOffset {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
         var off = geometry.PhysicalOffset.zero;
         for (self.scroll_offsets[0..self.scroll_offsets_len]) |e| {
             if (e.node == node) {
@@ -613,6 +756,7 @@ pub const Recorder = struct {
 
     fn writeScrollOffset(ctx: *anyopaque, node: u32, offset: geometry.PhysicalOffset) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
         self.rec("writeScrollOffset({d},{d},{d})", .{ node, offset.x, offset.y });
         self.setScrollOffset(node, offset);
     }
@@ -643,6 +787,11 @@ pub const Recorder = struct {
     pub fn deinit(self: *Recorder) void {
         for (self.log.items) |l| self.gpa.free(l);
         self.log.deinit(self.gpa);
+        self.released.deinit(self.gpa);
+    }
+
+    fn use(self: *Recorder, node: u32) void {
+        if (self.released.contains(node)) self.misuse += 1;
     }
 
     fn createElement(ctx: *anyopaque, tag: []const u8) u32 {
@@ -668,6 +817,7 @@ pub const Recorder = struct {
 
     fn setAttribute(ctx: *anyopaque, node: u32, name: []const u8, value: []const u8) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
         self.rec("setAttribute({d},{s},{s})", .{ node, name, value });
     }
 
@@ -676,6 +826,7 @@ pub const Recorder = struct {
     /// Content Security Policy refuses and the other is not.
     fn setStyle(ctx: *anyopaque, node: u32, decl: []const u8) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
         self.rec("setStyle({d},{s})", .{ node, decl });
     }
 
@@ -691,21 +842,48 @@ pub const Recorder = struct {
 
     fn setTextContent(ctx: *anyopaque, node: u32, textv: []const u8) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
         self.rec("setTextContent({d},{s})", .{ node, textv });
     }
 
     fn appendChild(ctx: *anyopaque, parent: u32, child: u32) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(parent);
+        self.use(child);
         self.rec("appendChild({d},{d})", .{ parent, child });
+    }
+
+    fn insertBefore(ctx: *anyopaque, parent: u32, child: u32, ref: u32) void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(parent);
+        self.use(child);
+        self.use(ref);
+        self.rec("insertBefore({d},{d},{d})", .{ parent, child, ref });
+    }
+
+    fn removeChild(ctx: *anyopaque, parent: u32, child: u32) void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(parent);
+        self.use(child);
+        self.rec("removeChild({d},{d})", .{ parent, child });
+    }
+
+    fn removeAttribute(ctx: *anyopaque, node: u32, name: []const u8) void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
+        self.rec("removeAttribute({d},{s})", .{ node, name });
     }
 
     fn clearChildren(ctx: *anyopaque, node: u32) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
         self.rec("clearChildren({d})", .{node});
     }
 
     fn release(ctx: *anyopaque, node: u32) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.use(node);
+        self.released.put(self.gpa, node, {}) catch {};
         self.rec("release({d})", .{node});
     }
 
@@ -735,6 +913,9 @@ pub const Recorder = struct {
             .open_event_source = openEventSource,
             .close_event_source = closeEventSource,
             .release = release,
+            .remove_child = removeChild,
+            .insert_before = insertBefore,
+            .remove_attribute = removeAttribute,
         };
     }
 };
@@ -1316,15 +1497,15 @@ test "a text run keeps its own spacing instead of letting the browser collapse i
     try std.testing.expect(contains(rec.log.items, "    indented"));
 }
 
-test "dom_calls: a scroll region's offset survives a second render at the same offset" {
-    // A tap rebuilds the whole DOM (see `render`'s doc comment), destroying
-    // the div the browser was scrolling and building a fresh one in its
-    // place. `mem` is what carries the old offset onto the new div, so a tap
-    // must never reset a region the visitor had scrolled.
+test "dom_calls: a scroll region's div and offset survive a second render" {
+    // A tap renders again. The div the browser was scrolling stays, so a tap
+    // never resets a region the visitor had scrolled.
     const gpa = std.testing.allocator;
     var rec = Recorder{ .gpa = gpa };
     defer rec.deinit();
     var mem = ScrollMemory{};
+    var page: PageState = .{};
+    defer page.deinit(gpa);
 
     var list = display_list.DisplayList{};
     defer list.deinit(gpa);
@@ -1336,7 +1517,7 @@ test "dom_calls: a scroll region's offset survives a second render at the same o
     try list.append(gpa, .{ .pop_scroll = {} });
 
     // First render: container=101, scroll outer=102, inner=103.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
     try std.testing.expectEqual(@as(usize, 1), mem.count);
     try std.testing.expectEqual(@as(u32, 102), mem.handles[0]);
 
@@ -1344,12 +1525,12 @@ test "dom_calls: a scroll region's offset survives a second render at the same o
     // the test moves it the same way the browser would: on the live node.
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
 
-    // A tap: the whole tree rebuilds again. New container=104, new outer=105.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
-
-    // The new region was handed back the offset the old one held.
-    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(105,0,77)"));
-    try std.testing.expectEqual(@as(u32, 105), mem.handles[0]);
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
+    try std.testing.expect(!contains(rec.log.items[start..], "createElement"));
+    try std.testing.expect(!contains(rec.log.items[start..], "writeScrollOffset("));
+    try std.testing.expectEqual(@as(u32, 102), mem.handles[0]);
+    try std.testing.expectEqual(@as(f32, 77), rec.ops().readScrollOffset(102).?.y);
 }
 
 test "dom_calls: a region that phantom moved gets phantom's offset, once" {
@@ -1370,20 +1551,25 @@ test "dom_calls: a region that phantom moved gets phantom's offset, once" {
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
 
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+
     // Container 101, outer 102. The browser then scrolls to 77.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
 
-    // Phantom moves the region to 120. Container 104, outer 105.
+    // Phantom moves the region to 120.
     list.primitives.items[0].push_scroll.offset.y = 120;
     list.primitives.items[0].push_scroll.moved = 1;
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
-    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(105,0,120)"));
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
+    try std.testing.expectEqual(@as(usize, 1), countLines(rec.log.items, "writeScrollOffset(102,0,120)"));
 
-    // No new phantom move, so the browser's offset wins. Container 107, outer 108.
-    rec.setScrollOffset(105, .{ .x = 0, .y = 90 });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
-    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(108,0,90)"));
+    // No new phantom move, so the browser's offset wins and stays.
+    rec.setScrollOffset(102, .{ .x = 0, .y = 90 });
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
+    try std.testing.expect(!contains(rec.log.items[start..], "writeScrollOffset("));
+    try std.testing.expectEqual(@as(f32, 90), rec.ops().readScrollOffset(102).?.y);
 }
 
 test "dom_calls: a phantom move in the same render as a navigation wins over the reset" {
@@ -1404,17 +1590,20 @@ test "dom_calls: a phantom move in the same render as a navigation wins over the
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
 
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+
     // Container 101, outer 102.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
 
     // Phantom moves the region to 120 in the same render as a navigation.
-    // Container 104, outer 105.
     list.primitives.items[0].push_scroll.offset.y = 120;
     list.primitives.items[0].push_scroll.moved = 1;
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, true);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &page, true);
 
     // The move wins: the div gets phantom's offset, not the navigation's zero.
-    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(105,0,120)"));
+    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(102,0,120)"));
+    try std.testing.expect(!contains(rec.log.items, "writeScrollOffset(102,0,0)"));
 }
 
 test "dom_calls: a navigation clears a scroll region's offset instead of carrying it to the new page" {
@@ -1435,18 +1624,39 @@ test "dom_calls: a navigation clears a scroll region's offset instead of carryin
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
 
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+
     // First render: outer=102. The visitor scrolls it.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
 
-    // A navigation to a new route: new outer=105, reset_scroll=true.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, true);
-
-    // The old offset is never read back and never written onto the new
-    // region: it is left at the browser's own default of zero for a freshly
-    // created element, exactly like following a link to any other page.
+    // A navigation that keeps the div: the old offset is never read back,
+    // and the div goes to the top, like following a link to any other page.
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &page, true);
     try std.testing.expect(!contains(rec.log.items, "readScrollOffset(102)"));
-    try std.testing.expect(!contains(rec.log.items, "writeScrollOffset(105"));
+    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(102,0,0)"));
+    try std.testing.expectEqual(@as(f32, 0), rec.ops().readScrollOffset(102).?.y);
+}
+
+test "dom_calls: a navigation leaves a new scroll div where a new element starts" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var mem = ScrollMemory{};
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var view = TestView{ .offset = .{ .x = 0, .y = 40 } };
+    view.init();
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, testRegion(&view));
+    try list.append(gpa, .{ .pop_scroll = {} });
+
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &page, true);
+    try std.testing.expect(!contains(rec.log.items, "writeScrollOffset("));
+    try std.testing.expectEqual(@as(f32, 0), view.offset.y);
+    try std.testing.expect(mem.synced);
 }
 
 /// A view for the tests below: it takes any offset that `render` gives it.
@@ -1490,25 +1700,30 @@ test "dom_calls: a region keeps its offset when a new region comes before it" {
     try list.append(gpa, testRegion(&page));
     try list.append(gpa, .{ .pop_scroll = {} });
 
+    var state: PageState = .{};
+    defer state.deinit(gpa);
+
     // Container 101, outer 102. The browser scrolls it and tells the view.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &state, false);
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
     page.offset.y = 77;
 
-    // Another region now comes first: container 104, outer 105 for it, then
-    // outer 107 for the page.
+    // Another region now comes first: outer 104 for it, before the page's
+    // div, which stays and takes index 1.
     list.primitives.clearRetainingCapacity();
     for ([_]*TestView{ &added, &page }) |v| {
         try list.append(gpa, testRegion(v));
         try list.append(gpa, .{ .pop_scroll = {} });
     }
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
-    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(107,0,77)"));
-    try std.testing.expect(!contains(rec.log.items, "writeScrollOffset(105"));
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &state, false);
+    try std.testing.expect(contains(rec.log.items, "insertBefore(101,104,102)"));
+    try std.testing.expect(contains(rec.log.items, "setAttribute(102,data-phantom-scroll,1)"));
+    try std.testing.expect(!contains(rec.log.items, "writeScrollOffset("));
     try std.testing.expectEqual(@as(f32, 77), page.offset.y);
     try std.testing.expectEqual(@as(f32, 0), added.offset.y);
     try std.testing.expect(!mem.synced);
     try std.testing.expectEqual(@as(?*pointer.PointerHandlers, &page.handlers), mem.targets[1]);
+    try std.testing.expectEqual(@as(u32, 102), mem.handles[1]);
 }
 
 test "dom_calls: a view that the browser scrolled before its event came takes the browser's offset" {
@@ -1524,9 +1739,12 @@ test "dom_calls: a view that the browser scrolled before its event came takes th
     try list.append(gpa, testRegion(&page));
     try list.append(gpa, .{ .pop_scroll = {} });
 
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
+    var state: PageState = .{};
+    defer state.deinit(gpa);
+
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &state, false);
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &state, false);
     try std.testing.expectEqual(@as(f32, 77), page.offset.y);
     try std.testing.expect(mem.synced);
 }
@@ -1544,13 +1762,17 @@ test "dom_calls: a navigation moves a view that stays on the page back to the to
     try list.append(gpa, testRegion(&page));
     try list.append(gpa, .{ .pop_scroll = {} });
 
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
+    var state: PageState = .{};
+    defer state.deinit(gpa);
+
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &state, false);
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
     page.offset.y = 77;
     list.primitives.items[0].push_scroll.offset.y = 77;
 
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, true);
-    try std.testing.expect(!contains(rec.log.items, "writeScrollOffset(105"));
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, &state, true);
+    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(102,0,0)"));
+    try std.testing.expectEqual(@as(f32, 0), rec.ops().readScrollOffset(102).?.y);
     try std.testing.expectEqual(@as(f32, 0), page.offset.y);
     try std.testing.expect(mem.synced);
 }
@@ -1751,14 +1973,10 @@ fn createdHandle(line: []const u8) ?u32 {
     return std.fmt.parseInt(u32, line[at + 2 ..], 10) catch null;
 }
 
-test "dom_calls: the next render releases every node of the last one once, and never the body or head" {
-    const gpa = std.testing.allocator;
-    var rec = Recorder{ .gpa = gpa };
-    defer rec.deinit();
-    var page: PageState = .{};
-    defer page.deinit(gpa);
-    var list = display_list.DisplayList{};
-    defer list.deinit(gpa);
+/// An interactive rrect, then a scroll region holding a clip that holds a
+/// labelled icon. On a first render the handles are: container 101, rrect
+/// 102, scroll outer 103 and inner 104, clip 105, svg 106, title 107, path 108.
+fn appendMixed(gpa: std.mem.Allocator, list: *display_list.DisplayList) !void {
     try list.append(gpa, .{ .rrect = .{
         .rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
         .radius = 0,
@@ -1780,40 +1998,288 @@ test "dom_calls: the next render releases every node of the last one once, and n
     } });
     try list.append(gpa, .{ .pop_clip = {} });
     try list.append(gpa, .{ .pop_scroll = {} });
+}
 
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
-    var first: [16]u32 = undefined;
-    var first_len: usize = 0;
-    for (rec.log.items) |l| {
-        const h = createdHandle(l) orelse continue;
-        first[first_len] = h;
-        first_len += 1;
+test "dom_calls: a second render of the same frame changes nothing in the page" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var mem = ScrollMemory{};
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try appendMixed(gpa, &list);
+    const size: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
+
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
+    try std.testing.expectEqual(@as(usize, 8), countLines(rec.log.items, "createElement"));
+
+    // Only the read of the scroll div's offset, which its view takes.
+    var start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
+    try std.testing.expectEqual(@as(usize, 1), rec.log.items.len - start);
+    try std.testing.expectEqualStrings("readScrollOffset(103)->0,0", rec.log.items[start]);
+
+    start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    try std.testing.expectEqual(start, rec.log.items.len);
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
+}
+
+test "dom_calls: a changed text run costs one setTextContent" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var font = try text.Font.load(gpa, text.builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    for ([_][]const u8{ "one", "two" }, 0..) |s, i| {
+        try list.append(gpa, .{ .text = .{
+            .glyphs = &.{},
+            .text = s,
+            .font = &font,
+            .size = 16,
+            .color = geometry.Color.rgb(1, 1, 1),
+            .origin = .{ .x = 0, .y = @floatFromInt(i * 20) },
+        } });
     }
-    // A container, the rrect, two scroll divs, the clip, and an svg, title and path.
-    try std.testing.expectEqual(@as(usize, 8), first_len);
+    const size: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
+    // Container 101, runs 102 and 103.
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+
+    list.primitives.items[1].text.text = "three";
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    try std.testing.expectEqual(@as(usize, 1), rec.log.items.len - start);
+    try std.testing.expectEqualStrings("setTextContent(103,three)", rec.log.items[start]);
+}
+
+test "dom_calls: a removed subtree leaves in one call and each of its nodes is released once" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try appendMixed(gpa, &list);
+    const size: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
     try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "release("));
 
-    const second_start = rec.log.items.len;
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
-    const after = rec.log.items[second_start..];
-    const clear = indexOfLine(after, "clearChildren(1)").?;
+    // Only the rrect stays.
+    list.primitives.shrinkRetainingCapacity(1);
+    var start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    var after = rec.log.items[start..];
+    try std.testing.expectEqual(@as(usize, 1), countLines(after, "removeChild("));
+    const removed = indexOfLine(after, "removeChild(101,103)").?;
     var buf: [32]u8 = undefined;
-    for (first[0..first_len]) |h| {
+    for (103..109) |h| {
         const line = try std.fmt.bufPrint(&buf, "release({d})", .{h});
-        var n: usize = 0;
-        for (after) |l| {
-            if (std.mem.eql(u8, l, line)) n += 1;
-        }
-        try std.testing.expectEqual(@as(usize, 1), n);
-        // Released before the clear removes the node from the page.
-        try std.testing.expect(indexOfLine(after, line).? < clear);
+        try std.testing.expectEqual(@as(usize, 1), countLines(after, line));
+        try std.testing.expect(indexOfLine(after, line).? > removed);
     }
-    try std.testing.expectEqual(first_len, countLines(after, "release("));
+    try std.testing.expectEqual(@as(usize, 6), countLines(after, "release("));
+    try std.testing.expectEqual(@as(usize, 0), countLines(after, "createElement"));
+
+    // The region comes back as new nodes, and nothing is released.
+    list.primitives.clearRetainingCapacity();
+    try appendMixed(gpa, &list);
+    start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    after = rec.log.items[start..];
+    try std.testing.expectEqual(@as(usize, 6), countLines(after, "createElement"));
+    try std.testing.expectEqual(@as(usize, 0), countLines(after, "release("));
+    try std.testing.expect(contains(after, "appendChild(101,109)"));
+
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
     for (rec.log.items) |l| {
         try std.testing.expect(!std.mem.eql(u8, l, "release(1)"));
         try std.testing.expect(!std.mem.eql(u8, l, "release(2)"));
     }
-    try std.testing.expectEqual(@as(usize, first_len), page.nodes.items.len);
+}
+
+test "dom_calls: a node whose tag changes is replaced at its place" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    const box: display_list.Primitive = .{ .rrect = .{ .rect = .{ .x = 0, .y = 0, .width = 5, .height = 5 }, .radius = 0, .color = geometry.Color.rgb(1, 0, 0) } };
+    try list.append(gpa, .{ .icon = .{ .id = .torii, .size = .{ .width = 16, .height = 16 }, .color = geometry.Color.rgb(1, 1, 1), .origin = .{ .x = 0, .y = 0 } } });
+    try list.append(gpa, box);
+    const size: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
+    // Container 101, svg 102, path 103, rrect 104.
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+
+    list.primitives.items[0] = box;
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    const after = rec.log.items[start..];
+    try std.testing.expect(contains(after, "removeChild(101,102)"));
+    try std.testing.expectEqual(@as(usize, 1), countLines(after, "release(102)"));
+    try std.testing.expectEqual(@as(usize, 1), countLines(after, "release(103)"));
+    try std.testing.expect(contains(after, "createElement(div)->105"));
+    try std.testing.expect(contains(after, "insertBefore(101,105,104)"));
+    try std.testing.expect(!contains(after, "release(104)"));
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
+}
+
+test "dom_calls: a text div that becomes a box loses its text, and a box that stops responding loses its class" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var font = try text.Font.load(gpa, text.builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .text = .{ .glyphs = &.{}, .text = "hi", .font = &font, .size = 16, .color = geometry.Color.rgb(1, 1, 1), .origin = .{ .x = 0, .y = 0 } } });
+    try list.append(gpa, .{ .rrect = .{
+        .rect = .{ .x = 0, .y = 20, .width = 10, .height = 10 },
+        .radius = 0,
+        .color = geometry.Color.rgb(0, 0, 1),
+        .hover_color = geometry.Color.rgb(0, 1, 0),
+    } });
+    const size: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
+    // Container 101, text 102, button 103.
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+
+    list.primitives.items[0] = .{ .rrect = .{ .rect = .{ .x = 0, .y = 0, .width = 5, .height = 5 }, .radius = 0, .color = geometry.Color.rgb(1, 0, 0) } };
+    list.primitives.items[1].rrect.hover_color = null;
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    const after = rec.log.items[start..];
+    try std.testing.expect(contains(after, "setTextContent(102,)"));
+    try std.testing.expect(contains(after, "removeAttribute(103,class)"));
+    try std.testing.expectEqual(@as(usize, 0), countLines(after, "createElement"));
+}
+
+test "dom_calls: an image is sent again only when its bytes change" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var bytes = [_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01 };
+    var img = image_mod.Image.fromBytes(&bytes, 10, 10);
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .image = .{ .image = &img, .rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 } } });
+    const size: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+
+    var start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    try std.testing.expectEqual(start, rec.log.items.len);
+
+    bytes[9] = 0x02;
+    start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    try std.testing.expectEqual(@as(usize, 1), rec.log.items.len - start);
+    try std.testing.expect(std.mem.startsWith(u8, rec.log.items[start], "setAttribute(102,src,data:image/png;base64,"));
+}
+
+test "dom_calls: a ListView window move keeps the scroll div and releases the rows that went" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var mem = ScrollMemory{};
+    var view = TestView{};
+    view.init();
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    const size: geometry.PhysicalSize = .{ .width = 200, .height = 100 };
+
+    // Rows 0 to 4 in the window. Container 101, outer 102, inner 103, rows 104 to 108.
+    try list.append(gpa, testRegion(&view));
+    for (0..5) |i| {
+        try list.append(gpa, .{ .rrect = .{ .rect = .{ .x = 0, .y = @floatFromInt(i * 20), .width = 100, .height = 20 }, .radius = 0, .color = geometry.Color.rgb(0, 0, 1) } });
+    }
+    try list.append(gpa, .{ .pop_scroll = {} });
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
+    const outer = mem.handles[0];
+    try std.testing.expectEqual(@as(u32, 102), outer);
+
+    // The browser scrolls, and the window is now rows 3 to 6.
+    rec.setScrollOffset(outer, .{ .x = 0, .y = 60 });
+    view.offset.y = 60;
+    list.primitives.clearRetainingCapacity();
+    try list.append(gpa, testRegion(&view));
+    for (3..7) |i| {
+        try list.append(gpa, .{ .rrect = .{ .rect = .{ .x = 0, .y = @floatFromInt(i * 20), .width = 100, .height = 20 }, .radius = 0, .color = geometry.Color.rgb(0, 0, 1) } });
+    }
+    try list.append(gpa, .{ .pop_scroll = {} });
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
+    const after = rec.log.items[start..];
+
+    try std.testing.expectEqual(outer, mem.handles[0]);
+    try std.testing.expectEqual(@as(usize, 0), countLines(after, "createElement"));
+    try std.testing.expect(!contains(after, "writeScrollOffset("));
+    try std.testing.expectEqual(@as(usize, 1), countLines(after, "removeChild(103,108)"));
+    try std.testing.expectEqual(@as(usize, 1), countLines(after, "release("));
+    try std.testing.expectEqual(@as(usize, 1), countLines(after, "release(108)"));
+    try std.testing.expectEqual(@as(f32, 60), view.offset.y);
+    try std.testing.expect(!mem.synced);
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
+}
+
+test "dom_calls: a keyed scroll region that moves keeps its div, its offset, and a new index" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var mem = ScrollMemory{};
+    var a = TestView{};
+    a.init();
+    var b = TestView{};
+    b.init();
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    const size: geometry.PhysicalSize = .{ .width = 200, .height = 100 };
+
+    // Container 101, a: outer 102 and inner 103, b: outer 104 and inner 105.
+    for ([_]*TestView{ &a, &b }) |v| {
+        try list.append(gpa, testRegion(v));
+        try list.append(gpa, .{ .pop_scroll = {} });
+    }
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
+    rec.setScrollOffset(104, .{ .x = 0, .y = 60 });
+    b.offset.y = 60;
+
+    list.primitives.clearRetainingCapacity();
+    for ([_]*TestView{ &b, &a }) |v| {
+        try list.append(gpa, testRegion(v));
+        try list.append(gpa, .{ .pop_scroll = {} });
+    }
+    const start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, size, geometry.Color.rgb(0, 0, 0), null, &mem, &page, false);
+    const after = rec.log.items[start..];
+
+    try std.testing.expectEqual(@as(usize, 0), countLines(after, "createElement"));
+    try std.testing.expectEqual(@as(usize, 0), countLines(after, "release("));
+    const moved = indexOfLine(after, "insertBefore(101,104,102)").?;
+    try std.testing.expect(indexOfLine(after, "readScrollOffset(104)").? < moved);
+    try std.testing.expect(indexOfLine(after, "writeScrollOffset(104,0,60)").? > moved);
+    try std.testing.expect(contains(after, "setAttribute(104,data-phantom-scroll,0)"));
+    try std.testing.expect(contains(after, "setAttribute(102,data-phantom-scroll,1)"));
+    try std.testing.expectEqual(@as(u32, 104), mem.handles[0]);
+    try std.testing.expectEqual(@as(u32, 102), mem.handles[1]);
+    try std.testing.expectEqual(@as(?*pointer.PointerHandlers, &b.handlers), mem.targets[0]);
+    try std.testing.expectEqual(@as(f32, 60), b.offset.y);
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
 }
 
 test "dom_calls: the same interactive colours add their rule once, and a new colour adds a second rule" {
@@ -1836,10 +2302,12 @@ test "dom_calls: the same interactive colours add their rule once, and a new col
     try list.append(gpa, button);
 
     try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    // A third button of that colour in a later frame reuses the rule.
+    try list.append(gpa, button);
     try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
     try std.testing.expectEqual(@as(usize, 1), countLines(rec.log.items, "addRule("));
     try std.testing.expectEqual(@as(usize, 1), countLines(rec.log.items, ":hover{"));
-    try std.testing.expectEqualStrings(classAt(rec.log.items, 0).?, classAt(rec.log.items, 3).?);
+    try std.testing.expectEqualStrings(classAt(rec.log.items, 0).?, classAt(rec.log.items, 2).?);
 
     var other = button;
     other.rrect.hover_color = geometry.Color.rgb(1, 0, 0);
@@ -1847,7 +2315,7 @@ test "dom_calls: the same interactive colours add their rule once, and a new col
     try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
     try std.testing.expectEqual(@as(usize, 2), countLines(rec.log.items, "addRule("));
     try std.testing.expectEqual(@as(usize, 2), countLines(rec.log.items, ":hover{"));
-    try std.testing.expect(!std.mem.eql(u8, classAt(rec.log.items, 0).?, classAt(rec.log.items, 6).?));
+    try std.testing.expect(!std.mem.eql(u8, classAt(rec.log.items, 0).?, classAt(rec.log.items, 3).?));
     try std.testing.expectEqual(@as(u32, 2), page.rules.count());
 }
 
@@ -1874,70 +2342,63 @@ test "dom_calls: a stroke and a fill with the same state colours get different c
 }
 
 /// The handles `createElement` lines in `log` returned, into `out`.
-fn createdHandles(log: []const []u8, out: []u32) []u32 {
+fn createdHandles(log: []const []u8, out: []u32) ![]u32 {
     var n: usize = 0;
     for (log) |l| {
-        out[n] = createdHandle(l) orelse continue;
+        const h = createdHandle(l) orelse continue;
+        if (n == out.len) return error.TooManyHandles;
+        out[n] = h;
         n += 1;
     }
     return out[0..n];
 }
 
-test "dom_calls: after a render fails partway, the next render releases exactly the handles it made" {
+test "dom_calls: a render that fails makes no DOM call and keeps the last tree" {
     const gpa = std.testing.allocator;
     var rec = Recorder{ .gpa = gpa };
     defer rec.deinit();
     var page: PageState = .{};
     defer page.deinit(gpa);
+    var mem = ScrollMemory{};
     var list = display_list.DisplayList{};
     defer list.deinit(gpa);
-    try list.append(gpa, .{ .push_clip = .{ .rect = .{ .x = 0, .y = 0, .width = 50, .height = 50 } } });
-    try list.append(gpa, .{ .rrect = .{
-        .rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
-        .radius = 0,
-        .color = geometry.Color.rgb(1, 0, 0),
-        .hover_color = geometry.Color.rgb(0, 1, 0),
-    } });
-    try list.append(gpa, .{ .pop_clip = {} });
+    try appendMixed(gpa, &list);
     const size: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
     const bg = geometry.Color.rgb(0, 0, 0);
+    try render(gpa, rec.ops(), list, size, bg, null, &mem, &page, false);
+    var first_buf: [16]u32 = undefined;
+    const first = try createdHandles(rec.log.items, &first_buf);
 
-    try render(gpa, rec.ops(), list, size, bg, null, null, &page, false);
-    var partway: usize = 0;
+    // The next frame has one more box, so a good render creates one node.
+    try list.append(gpa, .{ .rrect = .{ .rect = .{ .x = 0, .y = 80, .width = 5, .height = 5 }, .radius = 0, .color = geometry.Color.rgb(1, 0, 0) } });
+    var failed: usize = 0;
     var fail_index: usize = 0;
     while (fail_index < 256) : (fail_index += 1) {
-        // A rule new to the page makes the render allocate after it made
-        // its nodes, which is the failure this test is for.
-        page.rules.clearRetainingCapacity();
+        // An empty arena and a rule new to the page make the render allocate
+        // at each step.
+        const next = 1 - page.live;
+        page.arenas[next].promote(gpa).deinit();
+        page.arenas[next] = .init;
+        page.rules.clearAndFree(gpa);
         var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
-        const failed_start = rec.log.items.len;
-        render(failing.allocator(), rec.ops(), list, size, bg, null, null, &page, false) catch {
-            var made_buf: [8]u32 = undefined;
-            const made = createdHandles(rec.log.items[failed_start..], &made_buf);
-            const good_start = rec.log.items.len;
-            try render(gpa, rec.ops(), list, size, bg, null, null, &page, false);
-            if (made.len == 0) continue;
-            partway += 1;
-            const good = rec.log.items[good_start..];
-            try std.testing.expectEqual(made.len, countLines(good, "release("));
-            var buf: [32]u8 = undefined;
-            for (made) |h| {
-                try std.testing.expectEqual(@as(usize, 1), countLines(good, try std.fmt.bufPrint(&buf, "release({d})", .{h})));
-            }
+        const start = rec.log.items.len;
+        render(failing.allocator(), rec.ops(), list, size, bg, null, &mem, &page, false) catch {
+            failed += 1;
+            try std.testing.expectEqual(start, rec.log.items.len);
+            try std.testing.expectEqual(@as(usize, 1), mem.count);
             continue;
         };
         break;
     }
     try std.testing.expect(fail_index < 256);
-    try std.testing.expect(partway > 0);
+    try std.testing.expect(failed > 0);
 
-    // Every node of every frame but the last is released once.
-    var all_buf: [256]u32 = undefined;
-    const all = createdHandles(rec.log.items, &all_buf);
-    var buf: [32]u8 = undefined;
-    for (all) |h| {
-        const live = std.mem.indexOfScalar(u32, page.nodes.items, h) != null;
-        const want: usize = if (live) 0 else 1;
-        try std.testing.expectEqual(want, countLines(rec.log.items, try std.fmt.bufPrint(&buf, "release({d})", .{h})));
-    }
+    // The render that worked patched from the first tree: one new node, and
+    // every first node kept.
+    var all_buf: [16]u32 = undefined;
+    const all = try createdHandles(rec.log.items, &all_buf);
+    try std.testing.expectEqual(first.len + 1, all.len);
+    try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "release("));
+    try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "removeChild("));
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
 }

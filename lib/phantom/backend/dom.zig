@@ -64,7 +64,6 @@ fn appendEscaped(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8)
 /// `vdom.max_tree_depth`.
 fn appendNode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, node: vdom.Node, depth: usize) !void {
     std.debug.assert(depth < vdom.max_tree_depth);
-    if (node.kind == .text) return appendEscaped(buf, gpa, node.text);
     try buf.print(gpa, "<{s}", .{node.tag});
     for (node.attrs) |attr| {
         try buf.print(gpa, " {s}=\"", .{attr.name});

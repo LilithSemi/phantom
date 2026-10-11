@@ -234,6 +234,9 @@ const setStyle = (node, ptr, len) => {
     console.warn("phantom: no element for handle " + node + ", so its style was dropped");
     return;
   }
+  // A node is styled again when it changes, so the old declaration goes
+  // first. Otherwise a property that the new one leaves out stays.
+  el.style.cssText = "";
   for (const part of str(ptr, len).split(";")) {
     const i = part.indexOf(":");
     if (i <= 0) continue;
@@ -461,11 +464,12 @@ const drainEvents = async () => {
     await w.serverEvent(app, id, kind, ty[0], ty[1], da[0], da[1], li[0], li[1]);
   }
 };
-// Scroll regions. Each render builds new divs, so one listener on the
+// Scroll regions. A render can add and remove divs, so one listener on the
 // document catches them all. A scroll event does not bubble, so it has to
 // capture. Only the last offset of each element in a frame is sent. The
 // element is the key, not its index, because a render between the event
-// and the drain can give a different region the same index.
+// and the drain can give a different region the same index. The index is
+// read at the drain, so it is the one the last render gave.
 const scrolled = new Map();
 document.addEventListener("scroll", (e) => {
   if (e.target?.dataset?.phantomScroll === undefined) return;

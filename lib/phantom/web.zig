@@ -46,11 +46,11 @@ pub const WebApp = struct {
     /// count as registered on the next.
     fonts_seen: [max_fonts]*const phantom.text.Font = undefined,
     fonts_seen_len: usize = 0,
-    /// Scroll offsets carried across a rebuild. Lives for the whole page, not
-    /// per render: `render` reads last frame's regions out of it before it
-    /// clears the DOM, then repopulates it with this frame's regions.
+    /// The scroll regions of the last frame. Lives for the whole page, not per
+    /// render: `scrollChanged` finds the view of a region here.
     scroll_mem: phantom.backend.dom_calls.ScrollMemory = .{},
-    /// Node handles and interactive rules that `render` keeps between frames.
+    /// The last tree, its node handles and the interactive rules that `render`
+    /// keeps between frames.
     page: phantom.backend.dom_calls.PageState = .{},
     /// Nanoseconds since the Unix epoch, from the browser's `Date.now`. This is
     /// the settable clock: NTP and a timezone edit both move it, and it can move
@@ -1333,19 +1333,27 @@ test "a rebuild with no phantom move keeps the browser's offset" {
     const app = try init(gpa, rec.ops(), phantom.Root.plain(tallScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
     defer destroyWebApp(gpa, app);
 
-    // The browser scrolled, and its event has not reached phantom yet.
-    rec.setScrollOffset(app.scroll_mem.handles[0], .{ .x = 0, .y = 300 });
+    // The browser scrolled, and its event has not reached phantom yet. The
+    // div stays, so it keeps the offset and the view takes it.
+    const div = app.scroll_mem.handles[0];
+    rec.setScrollOffset(div, .{ .x = 0, .y = 300 });
     var before = rec.log.items.len;
     app.render();
-    try std.testing.expect(writtenOffset(&rec, before, app.scroll_mem.handles[0], 300));
+    try std.testing.expect(!writtenOffset(&rec, before, div, 300));
+    try std.testing.expectEqual(div, app.scroll_mem.handles[0]);
+    try std.testing.expectEqual(@as(f32, 300), scroll_ctl.offset().?.y);
 
     // A phantom move wins once. After that the browser's offset wins again.
     try std.testing.expect(scroll_ctl.jumpTo(.{ .x = 0, .y = 1500 }));
-    app.render();
-    rec.setScrollOffset(app.scroll_mem.handles[0], .{ .x = 0, .y = 400 });
     before = rec.log.items.len;
     app.render();
-    try std.testing.expect(writtenOffset(&rec, before, app.scroll_mem.handles[0], 400));
+    try std.testing.expect(writtenOffset(&rec, before, div, 1500));
+    rec.setScrollOffset(div, .{ .x = 0, .y = 400 });
+    before = rec.log.items.len;
+    app.render();
+    try std.testing.expect(!writtenOffset(&rec, before, div, 400));
+    try std.testing.expect(!writtenOffset(&rec, before, div, 1500));
+    try std.testing.expectEqual(@as(f32, 400), scroll_ctl.offset().?.y);
     try std.testing.expect(app.sink.ok());
 }
 

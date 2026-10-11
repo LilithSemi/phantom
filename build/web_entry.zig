@@ -109,7 +109,21 @@ fn createTextNode(ctx: *anyopaque, data: []const u8) u32 {
 }
 fn setAttribute(ctx: *anyopaque, node: u32, name: []const u8, value: []const u8) void {
     _ = ctx;
-    rt.release(callWithStrings(node, "setAttribute", 2, .{ name, value }));
+    _ = callWithStrings(node, "setAttribute", 2, .{ name, value });
+}
+fn removeAttribute(ctx: *anyopaque, node: u32, name: []const u8) void {
+    _ = ctx;
+    _ = callWithStrings(node, "removeAttribute", 1, .{name});
+}
+fn removeChild(ctx: *anyopaque, parent: u32, child: u32) void {
+    _ = ctx;
+    const p = dom.Node{ .handle = parent };
+    p.removeChild(.{ .handle = child }).unref();
+}
+fn insertBefore(ctx: *anyopaque, parent: u32, child: u32, ref: u32) void {
+    _ = ctx;
+    const p = dom.Node{ .handle = parent };
+    p.insertBefore(.{ .handle = child }, .{ .handle = ref }).unref();
 }
 fn setTextContent(ctx: *anyopaque, node: u32, textv: []const u8) void {
     _ = ctx;
@@ -141,7 +155,6 @@ extern "phantom" fn __phantom_add_font(fam_ptr: [*]const u8, fam_len: usize, src
 
 fn setStyle(ctx: *anyopaque, node: u32, decl: []const u8) void {
     _ = ctx;
-    if (decl.len == 0) return;
     __phantom_set_style(node, decl.ptr, decl.len);
 }
 
@@ -164,10 +177,8 @@ fn clearChildren(ctx: *anyopaque, node: u32) void {
     _ = ctx;
     setStringAttr(node, "innerHTML", "");
 }
-// A tap rebuilds the whole DOM (see phantom.backend.dom_calls.render), so
-// the browser-owned scroll position of an open region would reset to the
-// top on every tap unless it is read back before the old div is thrown
-// away and written onto the new one. These two hooks are that read/write.
+// The browser owns the scroll position of a region. These two hooks read it
+// for the view and write it when phantom moved the region.
 fn readScrollOffset(ctx: *anyopaque, node: u32) phantom.PhysicalOffset {
     _ = ctx;
     return .{ .x = @floatCast(getNumberAttr(node, "scrollLeft")), .y = @floatCast(getNumberAttr(node, "scrollTop")) };
@@ -424,6 +435,9 @@ export fn init(doc_handle: u32, body_handle: u32, window_handle: u32) usize {
         .open_event_source = openEventSource,
         .close_event_source = closeEventSource,
         .release = release,
+        .remove_child = removeChild,
+        .insert_before = insertBefore,
+        .remove_attribute = removeAttribute,
     };
     const strategy: phantom.UrlStrategy = if (strategy_is_hash) .hash else .path;
     const app = phantom.web.init(std.heap.wasm_allocator, ops, phantom.Root.plain(app_root.root), .{ .width = @floatFromInt(vw), .height = @floatFromInt(vh) }, @floatCast(dpr), strategy) catch return 0;
