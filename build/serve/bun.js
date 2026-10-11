@@ -24,7 +24,7 @@ const server = Bun.serve({
     if (file !== root && !file.startsWith(root + path.sep)) {
       return new Response('not found', { status: 404 });
     }
-    for (const name of route ? [file, path.join(root, 'index.html')] : [file]) {
+    for (const name of route ? [file, path.join(root, 'shell.html')] : [file]) {
       const f = Bun.file(name);
       if (await f.exists()) return new Response(f, { headers: { 'Content-Type': mime(name) } });
     }

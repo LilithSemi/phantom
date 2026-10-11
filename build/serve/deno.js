@@ -21,7 +21,7 @@ Deno.serve({ port: 8080, hostname: host }, async function(req) {
   if (file !== root && !file.startsWith(root + sep)) {
     return new Response('not found', { status: 404 });
   }
-  for (const f of route ? [file, join(root, 'index.html')] : [file]) {
+  for (const f of route ? [file, join(root, 'shell.html')] : [file]) {
     try {
       const data = await Deno.readFile(f);
       return new Response(data, { headers: { 'Content-Type': mime(f) } });

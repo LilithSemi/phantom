@@ -27,7 +27,7 @@ http.createServer(function(req, res) {
   }
   function send(f) {
     fs.readFile(f, function(err, data) {
-      if (err && route && f !== path.join(root, 'index.html')) return send(path.join(root, 'index.html'));
+      if (err && route && f !== path.join(root, 'shell.html')) return send(path.join(root, 'shell.html'));
       if (err) { res.writeHead(404); res.end('not found'); return; }
       res.writeHead(200, { 'Content-Type': mime(f) });
       res.end(data);

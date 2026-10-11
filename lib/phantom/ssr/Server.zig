@@ -39,7 +39,8 @@ refused: std.atomic.Value(u64) = .init(0),
 
 pub const Options = struct {
     root: phantom.Root,
-    /// The page shell `addApp` writes, with no prerendered content in it.
+    /// The page shell `addApp` writes as shell.html, with no prerendered
+    /// content in it. With "/" prerendered, index.html is a page and no shell.
     shell: []const u8,
     dist: Io.Dir,
     base: []const u8 = "/",

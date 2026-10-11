@@ -48,7 +48,8 @@ pub const Icon = struct { path: std.Build.LazyPath, size: u32 };
 
 /// How a route appears in the address bar. `.hash` works on any static host
 /// with no configuration. `.path` needs a host that serves the application
-/// for an unknown path, or the copies that `prerender_routes` writes.
+/// for an unknown path (shell.html in the dist), or the copies that
+/// `prerender_routes` writes.
 pub const UrlStrategy = enum { hash, path };
 
 pub const AppOptions = struct {
@@ -79,8 +80,11 @@ pub const AppOptions = struct {
     /// "/docs/intro". Each page holds the first frame of that route at
     /// `default_size`, so a static host shows it before the wasm boots and
     /// answers a refresh with 200. A route other than "/" needs the `.path`
-    /// strategy. The root page is a plain shell when "/" is not listed. Not
-    /// usable with `imports` yet.
+    /// strategy. The dist also holds the plain shell as shell.html, which a
+    /// host serves for a route with no page. A prerender has no query or
+    /// host, so a page whose first frame reads them changes when the wasm
+    /// boots: the client patches the page or builds it again. Not usable
+    /// with `imports` yet.
     prerender_routes: []const []const u8 = &.{},
     /// The size in phantom px that prerendered pages are laid out at, and
     /// that the server lays out a page at when the browser sends no width.

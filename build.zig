@@ -13,6 +13,9 @@ pub const AppOptions = appmeta.AppOptions;
 /// halves of that agreement live one constant apart.
 const phantom_font_dir = "fonts/";
 
+/// The plain page shell in every web dist. See `WebDist.shell`.
+const shell_file = "shell.html";
+
 pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.AppOptions) *std.Build.Step {
     const t = opts.target.result;
     const phantom_mod = phantom_dep.module("phantom");
@@ -115,8 +118,14 @@ pub const WebDist = struct {
     /// The directory that holds the page. Every path in `files` is relative to it.
     dir: std.Build.LazyPath,
     /// Every file of the page, relative to `dir`, as the page refers to it.
-    /// This includes the prerendered pages.
+    /// This includes the prerendered pages and the shell.
     files: []const []const u8,
+    /// The page shell with no prerendered content, "shell.html" in `dir`.
+    /// Serve it for a route that has no page of its own, and give its bytes
+    /// to `phantom.ssr.Server.Options.shell` or `ssr.Document.writeHtml`.
+    /// When "/" is prerendered, index.html is the page of "/" and not the
+    /// shell.
+    shell: std.Build.LazyPath,
     /// A text file that lists the files the prerender names at run time, in
     /// addition to `files`: the stylesheets and font files of prerendered
     /// pages. One url path a line, relative to `dir`. Null with no
@@ -206,7 +215,7 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
             "phantom.addApp: base_path must start and end with '/' and have no '\"', '<', '>', '\\' or control character, got \"{s}\"",
             .{opts.base_path},
         )).step);
-        return .{ .dir = dist.getDirectory(), .files = &.{} };
+        return .{ .dir = dist.getDirectory(), .files = &.{}, .shell = dist.getDirectory().path(b, shell_file) };
     };
 
     // wasm32-freestanding target: no prism/lattice imported so the pure-Zig web
@@ -303,6 +312,8 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
     const runtime_import = addRuntime(b, webidl_dep, dist, &files, opts.web_runtime);
 
     const html = shellHtml(b, opts);
+    _ = dist.add(shell_file, html);
+    addDistFile(b, &files, shell_file);
     const root_prerendered = for (opts.prerender_routes) |route| {
         if (appmeta.pageDir(route).len == 0) break true;
     } else false;
@@ -346,7 +357,12 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
 
     const extra_files = if (opts.prerender_routes.len > 0) addPrerender(b, phantom_dep, opts, html, dist, &files) else null;
 
-    return .{ .dir = dist.getDirectory(), .files = files.items, .extra_files = extra_files };
+    return .{
+        .dir = dist.getDirectory(),
+        .files = files.items,
+        .shell = dist.getDirectory().path(b, shell_file),
+        .extra_files = extra_files,
+    };
 }
 
 /// Render `opts.prerender_routes` to static pages in `dist`. A host program
@@ -449,7 +465,8 @@ fn addDistFile(b: *std.Build, files: *std.ArrayList([]const u8), rel: []const u8
 // application/octet-stream.
 // A path with no file extension is a route, not a file, so it maps to that
 // path's own index.html, the page addWebApp prerenders for it. A route with
-// no prerendered page gets the root index.html, so the app still opens there.
+// no prerendered page gets shell.html, so the app boots there with no content
+// from another route.
 // Each script resolves the request against the served root and refuses a
 // path that escapes it (a "../" walk answers 404), so a client cannot read
 // files elsewhere on the developer's disk.

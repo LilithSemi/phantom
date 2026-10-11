@@ -135,9 +135,10 @@ pub const Document = struct {
         self.* = undefined;
     }
 
-    /// Write the whole page. `shell` is the index.html of the application
-    /// that `addApp` writes. The page keeps the shell and its boot script, and
-    /// gets a link to the stylesheet, the body content first in the body, the
+    /// Write the whole page. `shell` is the plain shell of the application
+    /// that `addApp` writes as shell.html. The page keeps the shell and its
+    /// boot script, and gets a link to the stylesheet, the body content first
+    /// in the body, the
     /// layout size in `data-phantom-size` and the dpr in `data-phantom-dpr`.
     /// No `<base>` is added: a policy with `base-uri 'none'` refuses it, so the
     /// shell must use root-absolute urls to boot on a nested route. The
