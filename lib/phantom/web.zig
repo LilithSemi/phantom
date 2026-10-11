@@ -10,6 +10,9 @@ pub const max_fonts = 16;
 /// HTTP/1.1 allows six connections to one origin, so more than this is a leak.
 pub const max_event_sources = 16;
 
+/// The page background behind the container.
+pub const background = phantom.ColorScheme.tokyoNight().bg;
+
 /// The low byte of an `EventSource` id is its slot, the rest counts how often
 /// the slot was used. An event for a closed stream then cannot reach the next
 /// stream in the same slot.
@@ -151,10 +154,34 @@ pub const WebApp = struct {
         }
     }
 
+    /// The size of the container, in phantom px.
+    pub fn viewport(self: *const WebApp) phantom.PhysicalSize {
+        return self.view.metrics.size.toPhysical(self.view.metrics.text_scale);
+    }
+
+    /// Build what is dirty, then lay out and paint the tree into `canvas`. The
+    /// page and the server draw each frame through this. Returns false when the
+    /// tree has no render object to draw.
+    pub fn frame(self: *WebApp, canvas: *phantom.Canvas) bool {
+        var bctx = phantom.BuildContext{ .arena = self.arena.allocator(), .owner = self.owner };
+        self.owner.flushDirty(&bctx);
+        // A rebuild can add or remove focusable nodes, so the traversal order is
+        // rebuilt from the tree rather than kept incrementally. The terminal and
+        // window backends do this at the same point in their frame.
+        self.focus.collect(self.gpa, self.root) catch {
+            // What is left is a partial order, so Tab may not reach every node
+            // until a later build collects the whole tree. The frame still draws:
+            // a page that stops painting because it ran out of memory for one list
+            // is worse than a page whose Tab order is short.
+            self.sink.report(.oom, "the web focus order was not rebuilt");
+        };
+        return self.paint(canvas);
+    }
+
     /// Lay out and paint the tree into `canvas`. Returns false when the tree
     /// has no render object to draw.
     fn paint(self: *WebApp, canvas: *phantom.Canvas) bool {
-        const physical = self.view.metrics.size.toPhysical(self.view.metrics.text_scale);
+        const physical = self.viewport();
         const ro = self.root.renderObject() orelse return false;
         _ = ro.layout(phantom.BoxConstraints.tightScaled(physical, self.view.metrics.text_scale));
         // A dropped frame leaves the previous DOM on screen, which is
@@ -194,24 +221,10 @@ pub const WebApp = struct {
 
     pub fn render(self: *WebApp) void {
         self.owner.repaint = false;
-        // One BuildContext per render for flushDirty + layout + paint.
-        var bctx = phantom.BuildContext{ .arena = self.arena.allocator(), .owner = self.owner };
-        self.owner.flushDirty(&bctx);
-        // A rebuild can add or remove focusable nodes, so the traversal order is
-        // rebuilt from the tree rather than kept incrementally. The terminal and
-        // window backends do this at the same point in their frame.
-        self.focus.collect(self.gpa, self.root) catch {
-            // What is left is a partial order, so Tab may not reach every node
-            // until a later build collects the whole tree. The frame still draws:
-            // a page that stops painting because it ran out of memory for one list
-            // is worse than a page whose Tab order is short.
-            self.sink.report(.oom, "the web focus order was not rebuilt");
-        };
-        const physical = self.view.metrics.size.toPhysical(self.view.metrics.text_scale);
         var canvas = phantom.Canvas.init(self.gpa);
         canvas.sink = self.sink;
         defer canvas.deinit();
-        if (!self.paint(&canvas)) {
+        if (!self.frame(&canvas)) {
             self.dropScrollTargets();
             return;
         }
@@ -223,7 +236,7 @@ pub const WebApp = struct {
         // render it causes, and this render is the only one that reads it.
         const reset_scroll = self.owner.route_changed;
         self.owner.route_changed = false;
-        phantom.backend.dom_calls.render(self.gpa, self.ops, canvas.list, physical, phantom.ColorScheme.tokyoNight().bg, self.sink, &self.scroll_mem, &self.page, reset_scroll) catch |err| {
+        phantom.backend.dom_calls.render(self.gpa, self.ops, canvas.list, self.viewport(), background, self.sink, &self.scroll_mem, &self.page, reset_scroll) catch |err| {
             self.sink.report(.render_failed, @errorName(err));
             self.dropScrollTargets();
             // The page still shows the old route, so the next render resets it.
@@ -361,6 +374,24 @@ pub const WebApp = struct {
         var buf: [phantom.router.max_path]u8 = undefined;
         const path = self.owner.platform.readLocation(&buf) orelse return;
         self.navigate(path);
+    }
+
+    /// Frees everything `mount` allocates. A server or a test calls this. A
+    /// page does not, because its process ends with it.
+    pub fn deinit(self: *WebApp) void {
+        const gpa = self.gpa;
+        // The tree comes down before the focus manager: tearing it down walks every
+        // render object and calls back into the manager to forget its handlers.
+        self.root.deinit(gpa);
+        self.focus.deinit(gpa);
+        self.net.deinit();
+        self.page.deinit(gpa);
+        self.owner.deinit();
+        gpa.destroy(self.owner);
+        gpa.destroy(self.sink);
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+        gpa.destroy(self);
     }
 };
 
@@ -811,10 +842,10 @@ pub const CssScale = struct {
     }
 };
 
-/// Build the widget tree and keep owner/arena/view alive for the page lifetime.
-/// Returns a heap-allocated *WebApp; the caller (JS via wasm) must store the
-/// returned pointer and pass it to the dispatch entries. Never deinit: the page
-/// owns it.
+/// Build the widget tree, draw the first frame and keep owner/arena/view alive
+/// for the page lifetime. Returns a heap-allocated *WebApp; the caller (JS via
+/// wasm) must store the returned pointer and pass it to the dispatch entries.
+/// The page never calls `deinit`, because its process ends with it.
 ///
 /// logical_viewport: window inner size in phantom px (see `CssScale`).
 /// device_pixel_ratio: device pixels for one phantom px, stored in
@@ -828,12 +859,60 @@ pub fn init(
     device_pixel_ratio: f32,
     strategy: phantom.UrlStrategy,
 ) !*WebApp {
+    const app = try mount(gpa, ops, root, logical_viewport, device_pixel_ratio, strategy);
+    errdefer app.deinit();
+
+    // Reset the default body margin and paint the branded background to the
+    // window edges, ONCE. Applied to the body ELEMENT rather than through a
+    // stylesheet, and that choice is load bearing twice over.
+    //
+    // A browser gives `body` an 8px margin of its own, and the container this
+    // backend draws into is sized to the WHOLE viewport, so any margin at all
+    // pushes the whole page down and right: two strips of unthemed white at the
+    // top and left, and the same amount lost off the bottom and right, unseen.
+    //
+    // It goes through the element's own style because that is the path this
+    // backend already proves on every frame, for every node it positions. A rule
+    // in a sheet has one more thing that has to be true, a sheet to put it in,
+    // and this is the one declaration whose failure is not cosmetic: it takes
+    // the whole page off its origin. The rules that DO need a sheet are the ones
+    // that cannot be written any other way, hover and `@font-face`.
+    //
+    // Setting it on `body` also reaches `html`, because a browser propagates the
+    // body's background to the canvas when the root has none of its own.
+    {
+        const bg = background;
+        const decl = try gpa.print("margin:0;background:rgb({d},{d},{d})", .{ phantom.backend.dom.ch(bg.r), phantom.backend.dom.ch(bg.g), phantom.backend.dom.ch(bg.b) });
+        defer gpa.free(decl);
+        ops.setStyle(ops.body, decl);
+    }
+
+    app.render();
+    return app;
+}
+
+/// Build the widget tree with the platform hooks `ops` has, and draw nothing.
+/// `init` and the server both start an application through this. Free the
+/// result with `WebApp.deinit`.
+pub fn mount(
+    gpa: std.mem.Allocator,
+    ops: phantom.backend.dom_calls.DomOps,
+    root: phantom.Root,
+    logical_viewport: phantom.LogicalSize,
+    device_pixel_ratio: f32,
+    strategy: phantom.UrlStrategy,
+) !*WebApp {
     const arena = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
     const sink = try gpa.create(phantom.FaultSink);
+    errdefer gpa.destroy(sink);
     sink.* = .{};
     const owner = try gpa.create(phantom.BuildOwner);
+    errdefer gpa.destroy(owner);
     owner.* = .{ .gpa = gpa, .sink = sink };
+    errdefer owner.deinit();
     const view_id = try phantom.View.open(owner, .{
         .title = "web",
         .size = logical_viewport,
@@ -850,6 +929,7 @@ pub fn init(
     // clock would read the zero timestamp on every frame. `root` is the one field
     // mount produces, so it is the one field filled in afterwards.
     const app = try gpa.create(WebApp);
+    errdefer gpa.destroy(app);
     app.* = .{
         .gpa = gpa,
         .arena = arena,
@@ -862,6 +942,8 @@ pub fn init(
         // that asks for its data would otherwise find no network.
         .net = .{ .gpa = gpa, .hook = if (ops.http_send) |send| .{ .ctx = ops.ctx, .send = send } else null },
     };
+    errdefer app.net.deinit();
+    errdefer app.focus.deinit(gpa);
     // Wire the instance Dispatcher (heap-stable) so Element.deinit forgets the
     // handlers of any unmounted hovered/pressed render object.
     owner.dispatcher = &app.dispatcher;
@@ -903,33 +985,6 @@ pub fn init(
         break :eb try errbox.widget().mount(&bctx, null);
     };
     app.root = root_element;
-
-    // Reset the default body margin and paint the branded background to the
-    // window edges, ONCE. Applied to the body ELEMENT rather than through a
-    // stylesheet, and that choice is load bearing twice over.
-    //
-    // A browser gives `body` an 8px margin of its own, and the container this
-    // backend draws into is sized to the WHOLE viewport, so any margin at all
-    // pushes the whole page down and right: two strips of unthemed white at the
-    // top and left, and the same amount lost off the bottom and right, unseen.
-    //
-    // It goes through the element's own style because that is the path this
-    // backend already proves on every frame, for every node it positions. A rule
-    // in a sheet has one more thing that has to be true, a sheet to put it in,
-    // and this is the one declaration whose failure is not cosmetic: it takes
-    // the whole page off its origin. The rules that DO need a sheet are the ones
-    // that cannot be written any other way, hover and `@font-face`.
-    //
-    // Setting it on `body` also reaches `html`, because a browser propagates the
-    // body's background to the canvas when the root has none of its own.
-    {
-        const bg = phantom.ColorScheme.tokyoNight().bg;
-        const decl = try gpa.print("margin:0;background:rgb({d},{d},{d})", .{ phantom.backend.dom.ch(bg.r), phantom.backend.dom.ch(bg.g), phantom.backend.dom.ch(bg.b) });
-        defer gpa.free(decl);
-        ops.setStyle(ops.body, decl);
-    }
-
-    app.render();
     return app;
 }
 
@@ -1042,7 +1097,7 @@ test "the web std.Io fills randomness from the host instead of handing back zero
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var buf: [32]u8 = @splat(0);
     app.owner.io.vtable.random(app.owner.io.userdata, &buf);
@@ -1064,7 +1119,7 @@ test "a host with no random source reports entropy unavailable rather than succe
     var ops = rec.ops();
     ops.fill_random = null;
     const app = try init(gpa, ops, phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // The secure entry can say so. The plain one returns void and cannot, which
     // is why it panics instead; that path is not reachable from a test without
@@ -1214,31 +1269,12 @@ fn locFaultRoot(b: *phantom.BuildContext) phantom.Widget {
     return b.new(phantom.Router{ .routes = &loc_fault_routes, .initial = "/", .not_found = locFaultHome }).widget();
 }
 
-/// Frees everything `init` allocates. `init`'s own doc comment says "never
-/// deinit: the page owns it", which is right for the real page, whose
-/// process exits from under the app; a test has no such exit, so it tears
-/// down by hand instead of leaking under the testing allocator.
-fn destroyWebApp(gpa: std.mem.Allocator, app: *WebApp) void {
-    // The tree comes down before the focus manager: tearing it down walks every
-    // render object and calls back into the manager to forget its handlers.
-    app.root.deinit(gpa);
-    app.focus.deinit(gpa);
-    app.net.deinit();
-    app.page.deinit(gpa);
-    app.owner.deinit();
-    gpa.destroy(app.owner);
-    gpa.destroy(app.sink);
-    app.arena.deinit();
-    gpa.destroy(app.arena);
-    gpa.destroy(app);
-}
-
 test "web.init leaves the platform's open_url unset when the host has no open_url hook, so a tapped Link reports it is unsupported" {
     const gpa = std.testing.allocator;
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(linkRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     try std.testing.expect(!app.owner.platform.openUrl("https://example.com", .new_tab));
 
@@ -1256,7 +1292,7 @@ test "web.init leaves the platform's read_location unset when the host has no re
     var ops = rec.ops();
     ops.read_location = null;
     const app = try init(gpa, ops, phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var buf: [phantom.router.max_path]u8 = undefined;
     try std.testing.expectEqual(@as(?[]const u8, null), app.owner.platform.readLocation(&buf));
@@ -1269,7 +1305,7 @@ test "locationChanged does nothing when the host has no read_location hook, rath
     var ops = rec.ops();
     ops.read_location = null;
     const app = try init(gpa, ops, phantom.Root.plain(locFaultRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     app.locationChanged();
 
@@ -1294,7 +1330,7 @@ test "a scroll the browser reports moves the ScrollView of that region" {
     defer rec.deinit();
     scroll_ctl = .{};
     const app = try init(gpa, rec.ops(), phantom.Root.plain(tallScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // The browser already shows the offset, so the DOM is left alone.
     const lines = rec.log.items.len;
@@ -1316,7 +1352,7 @@ test "a render that fails drops the scroll targets and keeps the navigation rese
     defer rec.deinit();
     scroll_ctl = .{};
     const app = try init(gpa, rec.ops(), phantom.Root.plain(tallScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     const div = app.scroll_mem.handles[0];
 
     var dom_fail: ?usize = null;
@@ -1384,7 +1420,7 @@ test "a scroll the browser reports far down a ListView builds the rows there" {
     scroll_ctl = .{};
     list_rows_highest = 0;
     const app = try init(gpa, rec.ops(), phantom.Root.plain(listRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     try std.testing.expect(list_rows_highest < 40);
 
     rec.setScrollOffset(app.scroll_mem.handles[0], .{ .x = 0, .y = 50_000 });
@@ -1411,7 +1447,7 @@ test "a jumpTo alone makes the next frame move the browser's div" {
     defer rec.deinit();
     scroll_ctl = .{};
     const app = try init(gpa, rec.ops(), phantom.Root.plain(tallScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // The browser is at 300 and phantom knows it.
     rec.setScrollOffset(app.scroll_mem.handles[0], .{ .x = 0, .y = 300 });
@@ -1438,7 +1474,7 @@ test "a rebuild with no phantom move keeps the browser's offset" {
     defer rec.deinit();
     scroll_ctl = .{};
     const app = try init(gpa, rec.ops(), phantom.Root.plain(tallScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // The browser scrolled, and its event has not reached phantom yet. The
     // div stays, so it keeps the offset and the view takes it.
@@ -1483,7 +1519,7 @@ test "a server event handler reads a scroll report applied earlier in the frame"
     defer rec.deinit();
     scroll_ctl = .{};
     const app = try init(gpa, rec.ops(), phantom.Root.plain(tallScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var spy = ScrollReadSpy{};
     const source = app.owner.platform.openEventSource("/api/events", &.{"line"}, spy.sink()).?;
@@ -1508,7 +1544,7 @@ test "a keyboard scroll reaches the browser's div" {
     defer rec.deinit();
     scroll_ctl = .{};
     const app = try init(gpa, rec.ops(), phantom.Root.plain(focusScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     try std.testing.expect(app.focus.focusById("page"));
     const before = rec.log.items.len;
@@ -1525,7 +1561,7 @@ test "a jumpTo to the end of a ListView builds the end rows and moves the div th
     scroll_ctl = .{};
     list_rows_highest = 0;
     const app = try init(gpa, rec.ops(), phantom.Root.plain(listRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     const end = scroll_ctl.maxOffset().?.y;
     try std.testing.expectEqual(@as(f32, 199_800), end);
@@ -1577,7 +1613,7 @@ test "after a navigation the page offset and the browser's div agree, and a tap 
     row_tapped = null;
     rec.setLocation("/");
     const app = try init(gpa, rec.ops(), phantom.Root.plain(scrollRouterRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     rec.setScrollOffset(app.scroll_mem.handles[0], .{ .x = 0, .y = 500 });
     app.scrollChanged(0, 0, 500);
@@ -1688,7 +1724,7 @@ test "a tap on a text field gives it the keyboard, and the next key typed lands 
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try mountFieldApp(gpa, &rec);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     const p = try tapPoints(app);
     const state = try fieldState(app);
 
@@ -1709,7 +1745,7 @@ test "a tap away from a text field takes the keyboard off it, so the keys stop l
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try mountFieldApp(gpa, &rec);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     const p = try tapPoints(app);
     const state = try fieldState(app);
 
@@ -1727,7 +1763,7 @@ test "a pasted invite code lands in the field in one edit, not one edit per char
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try mountFieldApp(gpa, &rec);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     const p = try tapPoints(app);
     const state = try fieldState(app);
     app.dispatchTap(p.on_field.x, p.on_field.y);
@@ -1747,7 +1783,7 @@ test "an IME commit lands in the field whole, and one committed character is nam
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try mountFieldApp(gpa, &rec);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     const p = try tapPoints(app);
     const state = try fieldState(app);
     app.dispatchTap(p.on_field.x, p.on_field.y);
@@ -1773,7 +1809,7 @@ test "a held ctrl types no letter but still names the key it was held on" {
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try mountFieldApp(gpa, &rec);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     const p = try tapPoints(app);
     const state = try fieldState(app);
     app.dispatchTap(p.on_field.x, p.on_field.y);
@@ -1795,7 +1831,7 @@ test "the named editing keys reach the field, and a released key changes nothing
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try mountFieldApp(gpa, &rec);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     const p = try tapPoints(app);
     const state = try fieldState(app);
     app.dispatchTap(p.on_field.x, p.on_field.y);
@@ -1819,7 +1855,7 @@ test "tab moves the keyboard on, so a page with one field can be left by keyboar
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try mountFieldApp(gpa, &rec);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     const state = try fieldState(app);
 
     // Tab with nothing focused enters the tree at the first focusable node, which
@@ -1844,7 +1880,7 @@ test "an application reads the query string of the address it was opened on" {
     rec.setLocation("/dashboard");
     rec.setSearch("state=E55233CZ&error=access_denied");
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("state=E55233CZ&error=access_denied", app.owner.platform.readQuery(&buf).?);
@@ -1858,7 +1894,7 @@ test "an address with no query reads as an empty query, not as a query that coul
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var buf: [16]u8 = undefined;
     const q = app.owner.platform.readQuery(&buf) orelse return error.QueryUnreadable;
@@ -1872,7 +1908,7 @@ test "an over long query is refused and reported rather than truncated to a diff
     defer rec.deinit();
     rec.setSearch("state=" ++ &@as([64]u8, @splat('a')));
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // Half a state token looks like a whole one to whatever reads it next.
     var buf: [16]u8 = undefined;
@@ -1888,7 +1924,7 @@ test "web.init leaves the platform's read_query unset when the host has no read_
     var ops = rec.ops();
     ops.read_query = null;
     const app = try init(gpa, ops, phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var buf: [16]u8 = undefined;
     try std.testing.expectEqual(@as(?[]const u8, null), app.owner.platform.readQuery(&buf));
@@ -1952,7 +1988,7 @@ test "an unmodified std.http.Client gets its reply through sockets that are real
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var spy = FetchSpy{ .status = 200, .headers = "content-type: application/json\r\n", .reply = "{\"sites\":[\"a\"]}" };
     app.net.hook = spy.hook();
@@ -1983,7 +2019,7 @@ test "a POST carries its body and its status all the way back" {
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // 403 is a REPLY, not a failure. A dashboard shows what it says.
     var spy = FetchSpy{ .status = 403, .reply = "not allowed." };
@@ -2012,7 +2048,7 @@ test "a request that never arrives fails the client, rather than looking like an
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var spy = FetchSpy{ .fail = true };
     app.net.hook = spy.hook();
@@ -2033,7 +2069,7 @@ test "two requests on one client both reach the host" {
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var spy = FetchSpy{ .status = 200, .reply = "hi" };
     app.net.hook = spy.hook();
@@ -2060,7 +2096,7 @@ test "an application can find the host its page is served from" {
     defer rec.deinit();
     rec.setHost("sigil.example");
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // Without this an application has to hard code its own host to build a URL,
     // which works on the machine it was written on and nowhere else.
@@ -2074,7 +2110,7 @@ test "a host too long for the buffer is refused and reported, not truncated to a
     defer rec.deinit();
     rec.setHost("a-very-long-host-name.example");
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // A truncated host is a different machine, and this one is about to be put
     // in a URL that carries the page's credentials.
@@ -2091,7 +2127,7 @@ test "a host with no hook is null, so a native backend cannot be mistaken for a 
     var ops = rec.ops();
     ops.read_host = null;
     const app = try init(gpa, ops, phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var buf: [64]u8 = undefined;
     try std.testing.expectEqual(@as(?[]const u8, null), app.owner.platform.readHost(&buf));
@@ -2106,7 +2142,7 @@ test "a page drawn with the default theme embeds no font, so a strict font-src c
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(textRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // The default theme is what almost every page draws with, and it used to
     // reach `Font.load` on the raw bytes, which records no url and so embeds the
@@ -2128,7 +2164,7 @@ test "init resets the page margin, or the themed background sits inside the brow
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(textRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // The container is sized to the FULL viewport, so any body margin pushes it
     // down and right: the page shows two strips of unthemed white at the top and
@@ -2168,7 +2204,7 @@ test "a font that first appears on a later frame is still registered" {
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(textRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // The first frame drew with the body font, and that one is registered.
     try std.testing.expectEqual(@as(usize, 1), app.fonts_seen_len);
@@ -2195,7 +2231,7 @@ test "a font already registered is not registered again, however many frames dra
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(textRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     // A settled tree costs one walk of the display list per frame and no calls
     // at all, which is what makes registering on every frame affordable.
@@ -2239,7 +2275,7 @@ test "an event source opens through the host and its events reach the sink until
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var spy = EventSpy{};
     const source = app.owner.platform.openEventSource("/api/events", &.{ "line", "done" }, spy.sink()).?;
@@ -2265,7 +2301,7 @@ test "an event for a closed stream does not reach the stream that took its slot"
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var first = EventSpy{};
     var second = EventSpy{};
@@ -2288,12 +2324,12 @@ test "an event source is null when the host has no hook or every slot is in use"
     var ops = rec.ops();
     ops.open_event_source = null;
     const bare = try init(gpa, ops, phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, bare);
+    defer bare.deinit();
     var spy = EventSpy{};
     try std.testing.expectEqual(@as(?phantom.EventSource, null), bare.owner.platform.openEventSource("/a", &.{}, spy.sink()));
 
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     for (0..max_event_sources) |_| _ = app.owner.platform.openEventSource("/a", &.{}, spy.sink()).?;
     try std.testing.expectEqual(@as(?phantom.EventSource, null), app.owner.platform.openEventSource("/a", &.{}, spy.sink()));
 }
@@ -2308,7 +2344,7 @@ test "a page reached by an ip address requests its own origin like a page reache
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     var spy = FetchSpy{ .status = 200, .reply = "[]" };
     app.net.hook = spy.hook();
@@ -2369,7 +2405,7 @@ test "a request made while the tree first mounts reaches the host" {
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(startupFetchRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
 
     try std.testing.expect(app.sink.first == null);
     try std.testing.expect(logHas(rec.log.items, "httpSend(GET,sigil.example,80,/api/sites)"));
@@ -2380,7 +2416,7 @@ test "phantom.http on a page goes straight to the fetch hook" {
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     var spy = FetchSpy{ .status = 200, .reply = "{\"ok\":true}" };
     app.net.hook = spy.hook();
 
@@ -2410,7 +2446,7 @@ test "phantom.http on a page reports a missing network and a bad url" {
     var ops = rec.ops();
     ops.http_send = null;
     const app = try init(gpa, ops, phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     try std.testing.expectError(error.NetworkDown, app.owner.http().fetch(.{ .url = "http://sigil.example/" }));
     try std.testing.expectError(error.InvalidUrl, app.owner.http().fetch(.{ .url = "not a url" }));
 
@@ -2424,7 +2460,7 @@ test "phantom.http.Std runs the same call on std.http.Client" {
     var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
     defer rec.deinit();
     const app = try init(gpa, rec.ops(), phantom.Root.plain(plainRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
-    defer destroyWebApp(gpa, app);
+    defer app.deinit();
     var spy = FetchSpy{ .status = 201, .headers = "transfer-encoding: chunked\r\n", .reply = "made" };
     app.net.hook = spy.hook();
 
