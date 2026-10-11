@@ -87,6 +87,11 @@ route_changed: bool = false,
 repaint: bool = false,
 /// Made on the first `http` call on a backend with no client of its own.
 std_http: if (http_mod.std_available) ?StdHttp else void = if (http_mod.std_available) null else {},
+/// What `BuildContext.new` hands out when the arena is out of memory.
+fault_sentinel: [sentinel_size]u8 align(sentinel_align) = @splat(0),
+
+pub const sentinel_size = 256;
+pub const sentinel_align = 16;
 
 const StdHttp = struct {
     inner: std.http.Client,

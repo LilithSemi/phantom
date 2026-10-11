@@ -50,19 +50,18 @@ pub fn new(self: *BuildContext, value: anytype) *@TypeOf(value) {
         return p;
     } else |_| {
         self.owner.sink.report(.oom, "out of memory building widget tree");
-        return sentinel(T);
+        return sentinel(T, self.owner);
     }
 }
 
-const SENTINEL_SIZE: usize = 256;
-const SENTINEL_ALIGN: usize = 16;
-var sentinel_buf: [SENTINEL_SIZE]u8 align(SENTINEL_ALIGN) = @splat(0);
-
-fn sentinel(comptime T: type) *T {
-    if (@sizeOf(T) > SENTINEL_SIZE or @alignOf(T) > SENTINEL_ALIGN) {
+/// The sentinel lives in the owner, so two trees that build on two threads
+/// never write to the same memory.
+fn sentinel(comptime T: type, owner: *BuildOwner) *T {
+    if (@sizeOf(T) > BuildOwner.sentinel_size or @alignOf(T) > BuildOwner.sentinel_align) {
         panic_mod.panic("widget config {s} ({d} bytes) exceeds the fault sentinel", .{ @typeName(T), @sizeOf(T) });
     }
-    return @ptrCast(@alignCast(&sentinel_buf));
+    @memset(&owner.fault_sentinel, 0);
+    return @ptrCast(@alignCast(&owner.fault_sentinel));
 }
 
 fn testOwner(gpa_alloc: std.mem.Allocator, s: *FaultSink) BuildOwner {
@@ -94,4 +93,21 @@ test "new under OOM records a fault and returns an inert sentinel (no crash)" {
     try std.testing.expect(!fault_sink.ok());
     try std.testing.expectEqual(FaultSink.FaultCode.oom, fault_sink.first.?.code);
     try std.testing.expectEqual(@as(u32, 0), p.*);
+}
+
+test "two owners under OOM get two sentinels, each zeroed again" {
+    var sink_a = FaultSink{};
+    var sink_b = FaultSink{};
+    var owner_a = testOwner(std.testing.allocator, &sink_a);
+    defer owner_a.deinit();
+    var owner_b = testOwner(std.testing.allocator, &sink_b);
+    defer owner_b.deinit();
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var a = BuildContext{ .arena = fa.allocator(), .owner = &owner_a };
+    var b = BuildContext{ .arena = fa.allocator(), .owner = &owner_b };
+    const pa = a.new(@as(u32, 1));
+    const pb = b.new(@as(u32, 2));
+    try std.testing.expect(@intFromPtr(pa) != @intFromPtr(pb));
+    pa.* = 7;
+    try std.testing.expectEqual(@as(u32, 0), a.new(@as(u32, 3)).*);
 }
