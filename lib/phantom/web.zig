@@ -175,6 +175,12 @@ pub const WebApp = struct {
         const h = self.scroll_mem.targets[index] orelse return;
         const scroll_to = h.on_scroll_to orelse return;
         if (!scroll_to(h.ctx, x, y)) return;
+        self.paintOffsets();
+    }
+
+    /// Paint without a DOM rebuild, after a view took a new offset from the
+    /// browser. A `ListView` then asks for the rows at that offset.
+    fn paintOffsets(self: *WebApp) void {
         var canvas = phantom.Canvas.init(self.gpa);
         canvas.sink = self.sink;
         defer canvas.deinit();
@@ -216,6 +222,7 @@ pub const WebApp = struct {
         phantom.backend.dom_calls.render(self.gpa, self.ops, canvas.list, physical, phantom.ColorScheme.tokyoNight().bg, self.sink, &self.scroll_mem, reset_scroll) catch |err| {
             self.sink.report(.render_failed, @errorName(err));
         };
+        if (self.scroll_mem.synced) self.paintOffsets();
         _ = self.arena.reset(.retain_capacity);
     }
 
@@ -1267,6 +1274,7 @@ test "a scroll the browser reports far down a ListView builds the rows there" {
     defer destroyWebApp(gpa, app);
     try std.testing.expect(list_rows_highest < 40);
 
+    rec.setScrollOffset(app.scroll_mem.handles[0], .{ .x = 0, .y = 50_000 });
     app.scrollChanged(0, 0, 50_000);
     // The frame after the scroll builds the rows the window asked for.
     app.tick(0, 16);
@@ -1375,6 +1383,63 @@ test "a jumpTo to the end of a ListView builds the end rows and moves the div th
     try std.testing.expectEqual(@as(usize, 9999), list_rows_highest);
     try std.testing.expectEqual(end, scroll_ctl.offset().?.y);
     try std.testing.expect(writtenOffset(&rec, before, app.scroll_mem.handles[0], end));
+    try std.testing.expect(app.sink.ok());
+}
+
+const RowTap = struct { index: usize };
+var row_taps: [20]RowTap = undefined;
+var row_tapped: ?usize = null;
+
+fn onRowTap(ctx: *anyopaque) void {
+    const row: *RowTap = @ptrCast(@alignCast(ctx));
+    row_tapped = row.index;
+}
+
+fn scrollPage(b: *phantom.BuildContext) phantom.Widget {
+    const rows = b.arena.alloc(phantom.Widget, row_taps.len) catch @panic("out of memory");
+    for (rows, &row_taps, 0..) |*row, *tap, i| {
+        tap.index = i;
+        const box = b.new(phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) });
+        const sized = b.new(phantom.SizedBox{ .width = 200, .height = 100, .child = box.widget() });
+        row.* = b.new(phantom.GestureDetector{ .on_tap = onRowTap, .ctx = tap, .child = sized.widget() }).widget();
+    }
+    const column = b.new(phantom.Flex{ .children = rows });
+    return b.new(phantom.ScrollView{ .controller = &scroll_ctl, .child = column.widget() }).widget();
+}
+
+const scroll_routes = [_]phantom.Route{
+    .{ .path = "/", .build = scrollPage },
+    .{ .path = "/b", .build = scrollPage },
+};
+
+fn scrollRouterRoot(b: *phantom.BuildContext) phantom.Widget {
+    return b.new(phantom.Router{ .routes = &scroll_routes, .initial = "/", .not_found = scrollPage }).widget();
+}
+
+test "after a navigation the page offset and the browser's div agree, and a tap hits the row drawn there" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    scroll_ctl = .{};
+    row_tapped = null;
+    rec.setLocation("/");
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(scrollRouterRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    rec.setScrollOffset(app.scroll_mem.handles[0], .{ .x = 0, .y = 500 });
+    app.scrollChanged(0, 0, 500);
+    try std.testing.expectEqual(@as(f32, 500), scroll_ctl.offset().?.y);
+
+    const router = app.owner.router orelse return error.NoRouterClaimed;
+    router.push("/b");
+    app.tick(0, 16);
+
+    // The new div starts at the top, so the page offset must be there too.
+    const shown = rec.ops().readScrollOffset(app.scroll_mem.handles[0]).?;
+    try std.testing.expectEqual(shown.y, scroll_ctl.offset().?.y);
+
+    app.dispatchTap(50, 50);
+    try std.testing.expectEqual(@as(?usize, 0), row_tapped);
     try std.testing.expect(app.sink.ok());
 }
 

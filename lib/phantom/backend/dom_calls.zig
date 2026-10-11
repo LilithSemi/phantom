@@ -261,12 +261,13 @@ pub const max_region_depth = 32;
 /// top), and a fault is reported rather than writing past a fixed array.
 pub const max_scroll_regions = 32;
 
-/// Scroll offsets carried across a rebuild, keyed by creation order. A tap
-/// rebuilds the whole DOM (see `render`), which would otherwise hand the
-/// scroll position of every open region back to the browser's default of
-/// zero. A caller (`WebApp`) owns one instance for the life of the page and
-/// passes a pointer to every `render` call; passing null opts out of
-/// carrying scroll state entirely.
+/// Scroll offsets carried across a rebuild. A tap rebuilds the whole DOM
+/// (see `render`), which would otherwise hand the scroll position of every
+/// open region back to the browser's default of zero. A region is matched to
+/// last frame's region by its handlers, so an offset stays with its render
+/// object when a region is added before it. A caller (`WebApp`) owns one
+/// instance for the life of the page and passes a pointer to every `render`
+/// call. A null pointer turns off the carried scroll state.
 pub const ScrollMemory = struct {
     /// The outer div handle of each scroll region `render` created last
     /// frame, in creation order.
@@ -277,7 +278,21 @@ pub const ScrollMemory = struct {
     /// The `ScrollRegion.moved` of each region, at the same index.
     moved: [max_scroll_regions]u32 = undefined,
     count: usize = 0,
+    /// True when the last `render` moved a view to the offset that its div
+    /// shows. The caller then paints again, so that a list can ask for the
+    /// rows at that offset.
+    synced: bool = false,
 };
+
+/// The index of last frame's region with the handlers `h`. A region with no
+/// handlers can only match the region at its own index.
+fn previousRegion(targets: []const ?*pointer.PointerHandlers, index: usize, h: ?*pointer.PointerHandlers) ?usize {
+    if (h == null) return if (index < targets.len and targets[index] == null) index else null;
+    for (targets, 0..) |t, j| {
+        if (t == h) return j;
+    }
+    return null;
+}
 
 /// One open clip or scroll region: the append target and coordinate origin its
 /// matching push saw before it changed them. A pop restores exactly this, so a
@@ -300,17 +315,24 @@ const RegionFrame = struct {
 /// navigation: the caller is expected to clear it after that one call. A
 /// visitor arriving at a new route expects its top, not wherever the
 /// previous route happened to be scrolled to, so this render drops `mem`'s
-/// saved offsets instead of applying them.
+/// saved offsets instead of applying them and moves the views to the top.
+///
+/// After this call each tracked view has the offset that its div shows. A
+/// view that `render` had to move sets `mem.synced`.
 pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink, mem: ?*ScrollMemory, reset_scroll: bool) !void {
     // Read every remembered region's live offset before its div is destroyed
     // below. Skipped on a navigation (the new page starts at the top) and
     // when the host cannot read scroll position at all.
     var saved: [max_scroll_regions]geometry.PhysicalOffset = undefined;
     var saved_count: usize = 0;
-    // A navigation forgets the old regions, so none of them can match below.
+    var prev_targets: [max_scroll_regions]?*pointer.PointerHandlers = undefined;
+    var prev_moved: [max_scroll_regions]u32 = undefined;
     var prev_count: usize = 0;
     if (mem) |m| {
-        if (!reset_scroll) prev_count = m.count;
+        m.synced = false;
+        prev_count = m.count;
+        @memcpy(prev_targets[0..prev_count], m.targets[0..prev_count]);
+        @memcpy(prev_moved[0..prev_count], m.moved[0..prev_count]);
         if (!reset_scroll and ops.read_scroll_offset != null) {
             for (m.handles[0..m.count]) |h| {
                 saved[saved_count] = ops.readScrollOffset(h) orelse break;
@@ -561,23 +583,41 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 const inner = ops.createElement("div");
                 ops.setStyle(inner, inner_style);
                 ops.appendChild(outer, inner);
-                // This is the Nth region `render` has built this frame: give
-                // it the Nth saved offset (if there is one), then remember its
-                // handle so the render after next can read the offset back.
-                // Must come after `inner` is attached: `outer` has nothing to
-                // scroll to before that, so a browser clamps any offset back
-                // to zero rather than holding it for content not there yet.
-                // The browser's offset wins, because the visitor can be in the
-                // middle of a scroll. The exception is a region that phantom
-                // moved itself since the last frame.
+                // Give the region the saved offset of last frame's region with
+                // the same handlers, then remember its handle so the render
+                // after next can read the offset back. Must come after `inner`
+                // is attached: `outer` has nothing to scroll to before that,
+                // so a browser clamps any offset back to zero rather than
+                // holding it for content not there yet. The browser's offset
+                // wins, because the visitor can be in the middle of a scroll.
+                // Phantom's offset wins for a region that phantom moved since
+                // the last frame, and for a region that is new to the page.
+                // After a navigation every other region goes to the top.
                 if (mem) |m| {
                     if (m.count < max_scroll_regions) {
                         const i = m.count;
-                        const same = sr.handlers != null and i < prev_count and m.targets[i] == sr.handlers;
-                        if (same and m.moved[i] != sr.moved) {
+                        const prev = previousRegion(prev_targets[0..prev_count], i, sr.handlers);
+                        var shown: ?geometry.PhysicalOffset = null;
+                        if (prev != null and sr.handlers != null and prev_moved[prev.?] != sr.moved) {
                             ops.writeScrollOffset(outer, sr.offset);
-                        } else if (i < saved_count) {
-                            ops.writeScrollOffset(outer, saved[i]);
+                            shown = sr.offset;
+                        } else if (reset_scroll) {
+                            shown = geometry.PhysicalOffset.zero;
+                        } else if (prev) |j| {
+                            if (j < saved_count) {
+                                ops.writeScrollOffset(outer, saved[j]);
+                                shown = saved[j];
+                            }
+                        } else if (sr.offset.x != 0 or sr.offset.y != 0) {
+                            ops.writeScrollOffset(outer, sr.offset);
+                        }
+                        // The view takes the offset that the div shows.
+                        if (shown) |to| {
+                            if (sr.handlers) |h| {
+                                if (h.on_scroll_to) |scroll_to| {
+                                    if (scroll_to(h.ctx, to.x, to.y)) m.synced = true;
+                                }
+                            }
                         }
                         // The page reports a scroll on this div by this index.
                         var index_buf: [20]u8 = undefined;
@@ -1561,6 +1601,130 @@ test "dom_calls: a navigation clears a scroll region's offset instead of carryin
     // created element, exactly like following a link to any other page.
     try std.testing.expect(!contains(rec.log.items, "readScrollOffset(102)"));
     try std.testing.expect(!contains(rec.log.items, "writeScrollOffset(105"));
+}
+
+/// A view for the tests below: it takes any offset that `render` gives it.
+const TestView = struct {
+    offset: geometry.PhysicalOffset = .zero,
+    handlers: pointer.PointerHandlers = undefined,
+
+    fn init(self: *TestView) void {
+        self.handlers = .{ .ctx = self, .on_scroll_to = scrollTo };
+    }
+
+    fn scrollTo(ctx: *anyopaque, x: f32, y: f32) bool {
+        const self: *TestView = @ptrCast(@alignCast(ctx));
+        if (self.offset.x == x and self.offset.y == y) return false;
+        self.offset = .{ .x = x, .y = y };
+        return true;
+    }
+};
+
+fn testRegion(view: *TestView) display_list.Primitive {
+    return .{ .push_scroll = .{
+        .viewport = geometry.PhysicalRect{ .x = 0, .y = 0, .width = 100, .height = 50 },
+        .offset = view.offset,
+        .content = geometry.PhysicalSize{ .width = 100, .height = 300 },
+        .handlers = &view.handlers,
+    } };
+}
+
+test "dom_calls: a region keeps its offset when a new region comes before it" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var mem = ScrollMemory{};
+    var page = TestView{};
+    page.init();
+    var added = TestView{};
+    added.init();
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, testRegion(&page));
+    try list.append(gpa, .{ .pop_scroll = {} });
+
+    // Container 101, outer 102. The browser scrolls it and tells the view.
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
+    page.offset.y = 77;
+
+    // Another region now comes first: container 104, outer 105 for it, then
+    // outer 107 for the page.
+    list.primitives.clearRetainingCapacity();
+    for ([_]*TestView{ &added, &page }) |v| {
+        try list.append(gpa, testRegion(v));
+        try list.append(gpa, .{ .pop_scroll = {} });
+    }
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(107,0,77)"));
+    try std.testing.expect(!contains(rec.log.items, "writeScrollOffset(105"));
+    try std.testing.expectEqual(@as(f32, 77), page.offset.y);
+    try std.testing.expectEqual(@as(f32, 0), added.offset.y);
+    try std.testing.expect(!mem.synced);
+    try std.testing.expectEqual(@as(?*pointer.PointerHandlers, &page.handlers), mem.targets[1]);
+}
+
+test "dom_calls: a view that the browser scrolled before its event came takes the browser's offset" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var mem = ScrollMemory{};
+    var page = TestView{};
+    page.init();
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, testRegion(&page));
+    try list.append(gpa, .{ .pop_scroll = {} });
+
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try std.testing.expectEqual(@as(f32, 77), page.offset.y);
+    try std.testing.expect(mem.synced);
+}
+
+test "dom_calls: a navigation moves a view that stays on the page back to the top" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var mem = ScrollMemory{};
+    var page = TestView{};
+    page.init();
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, testRegion(&page));
+    try list.append(gpa, .{ .pop_scroll = {} });
+
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
+    page.offset.y = 77;
+    list.primitives.items[0].push_scroll.offset.y = 77;
+
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, true);
+    try std.testing.expect(!contains(rec.log.items, "writeScrollOffset(105"));
+    try std.testing.expectEqual(@as(f32, 0), page.offset.y);
+    try std.testing.expect(mem.synced);
+}
+
+test "dom_calls: a region new to the page shows the offset its view already has" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var mem = ScrollMemory{};
+    var page = TestView{ .offset = .{ .x = 0, .y = 40 } };
+    page.init();
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, testRegion(&page));
+    try list.append(gpa, .{ .pop_scroll = {} });
+
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(102,0,40)"));
+    try std.testing.expect(!mem.synced);
 }
 
 test "dom_calls: a host with no scroll offset hooks still renders a scroll region" {
