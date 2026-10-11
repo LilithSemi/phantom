@@ -179,6 +179,7 @@ fn writeScrollOffset(ctx: *anyopaque, node: u32, offset: phantom.PhysicalOffset)
 // truncated, shorter route than the one the browser actually shows.
 fn currentPath(win: dom.Window, buf: []u8) ?[]const u8 {
     const loc = win.get_location();
+    defer loc.unref();
     const raw = if (strategy_is_hash) loc.get_hash() else loc.get_pathname();
     defer webidl.rt.freeStr(raw);
     var s = raw;
@@ -206,7 +207,9 @@ fn fillRandom(ctx: *anyopaque, buf: []u8) bool {
     if (buf.len > 65536) return false;
     const c: *DomCtx = @ptrCast(@alignCast(ctx));
     const win = dom.Window{ .handle = c.window };
-    win.get_crypto().getRandomValues(buf);
+    const crypto = win.get_crypto();
+    defer crypto.unref();
+    crypto.getRandomValues(buf);
     return true;
 }
 
@@ -257,7 +260,9 @@ fn rawSlice(ptr: u32, len: u32) []const u8 {
 fn httpSend(ctx: *anyopaque, gpa: std.mem.Allocator, req: phantom.web_net.Request) ?[]u8 {
     const c: *DomCtx = @ptrCast(@alignCast(ctx));
     const win = dom.Window{ .handle = c.window };
-    const page_host = win.get_location().get_hostname();
+    const page_loc = win.get_location();
+    defer page_loc.unref();
+    const page_host = page_loc.get_hostname();
     defer webidl.rt.freeStr(page_host);
 
     const url = phantom.web_net.requestUrl(gpa, page_host, req) catch return null;
@@ -336,7 +341,9 @@ fn readLocation(ctx: *anyopaque, buf: []u8) ?[]const u8 {
 fn readHost(ctx: *anyopaque, buf: []u8) ?[]const u8 {
     const c: *DomCtx = @ptrCast(@alignCast(ctx));
     const win = dom.Window{ .handle = c.window };
-    const raw = win.get_location().get_hostname();
+    const loc = win.get_location();
+    defer loc.unref();
+    const raw = loc.get_hostname();
     defer webidl.rt.freeStr(raw);
     if (raw.len > buf.len) return null;
     @memcpy(buf[0..raw.len], raw);
@@ -347,6 +354,7 @@ fn readQuery(ctx: *anyopaque, buf: []u8) ?[]const u8 {
     const c: *DomCtx = @ptrCast(@alignCast(ctx));
     const win = dom.Window{ .handle = c.window };
     const loc = win.get_location();
+    defer loc.unref();
     const raw = loc.get_search();
     defer webidl.rt.freeStr(raw);
     var s = raw;
@@ -365,6 +373,7 @@ fn writeLocation(ctx: *anyopaque, path: []const u8, mode: phantom.WriteMode) voi
     const c: *DomCtx = @ptrCast(@alignCast(ctx));
     const win = dom.Window{ .handle = c.window };
     const hist = win.get_history();
+    defer hist.unref();
     if (strategy_is_hash) {
         var url_buf: [phantom.router.max_path + 1]u8 = undefined;
         const n = @min(path.len, url_buf.len - 1);
