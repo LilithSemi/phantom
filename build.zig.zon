@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .webidl = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/webidl.zig#e08db1ba1b2dc2a4787ea09f1e69e77ee9fb1035",
-            .hash = "webidl_zig-0.1.0-FrIyV4HQBgCrXu3wwlEMDLBqYkfh0ZHeK7ETgKrhRxUJ",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/webidl.zig#068966e4408c2e6f61dfc6b894b8431abbe81ee5",
+            .hash = "webidl_zig-0.1.0-FrIyV4ARBwDm9n_tOpop47X8vgsc-rZlldhnsVKfgy2A",
         },
         .lattice = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/lattice#04e18082578eaa93c769881803cc58a73a0016c7",
