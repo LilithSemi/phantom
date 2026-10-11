@@ -29,7 +29,7 @@ fn setTextContent(ctx: *anyopaque, node: u32, textv: []const u8) void {
 fn appendChild(ctx: *anyopaque, parent: u32, child: u32) void {
     _ = ctx;
     const el = dom.Element{ .handle = parent };
-    _ = el.appendChild(dom.Node{ .handle = child });
+    el.appendChild(dom.Node{ .handle = child }).unref();
 }
 fn clearChildren(ctx: *anyopaque, node: u32) void {
     _ = ctx;

@@ -64,56 +64,33 @@ fn webPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @trap();
 }
 
-// The generated bindings put each string argument and each returned node in
-// the host's handle table and never take them out. A render makes hundreds
-// of these calls, so the calls below go through the runtime and release
-// every handle they do not keep.
-const rt = webidl.rt;
-
-fn callWithStrings(target: rt.Handle, method: []const u8, comptime n: usize, strings: [n][]const u8) rt.Handle {
-    var args: [n]rt.Handle = undefined;
-    for (&args, strings) |*arg, s| arg.* = rt.fromStr(s);
-    defer for (args) |arg| rt.release(arg);
-    return rt.callMethod(target, method, &args);
-}
-fn setStringAttr(target: rt.Handle, attr: []const u8, value: []const u8) void {
-    const h = rt.fromStr(value);
-    defer rt.release(h);
-    rt.setAttr(target, attr, h);
-}
-fn getNumberAttr(target: rt.Handle, attr: []const u8) f64 {
-    const h = rt.getAttr(target, attr);
-    defer rt.release(h);
-    return rt.toF64(h);
-}
-fn setNumberAttr(target: rt.Handle, attr: []const u8, value: f64) void {
-    const h = rt.fromF64(value);
-    defer rt.release(h);
-    rt.setAttr(target, attr, h);
-}
-
 fn createElement(ctx: *anyopaque, tag: []const u8) u32 {
     const c: *DomCtx = @ptrCast(@alignCast(ctx));
-    return callWithStrings(c.doc, "createElement", 1, .{tag});
+    const doc = dom.Document{ .handle = c.doc };
+    return doc.createElement(tag).handle;
 }
 // An `svg` made by createElement lands in the HTML namespace, where a
 // browser lays it out and never paints it. Only the namespaced call
 // reaches the SVG namespace, so icons need this one.
 fn createElementNS(ctx: *anyopaque, ns: []const u8, tag: []const u8) u32 {
     const c: *DomCtx = @ptrCast(@alignCast(ctx));
-    return callWithStrings(c.doc, "createElementNS", 2, .{ ns, tag });
+    const doc = dom.Document{ .handle = c.doc };
+    return doc.createElementNS(ns, tag).handle;
 }
 fn createTextNode(ctx: *anyopaque, data: []const u8) u32 {
     const c: *DomCtx = @ptrCast(@alignCast(ctx));
-    return callWithStrings(c.doc, "createTextNode", 1, .{data});
+    const doc = dom.Document{ .handle = c.doc };
+    return doc.createTextNode(data).handle;
 }
 fn setAttribute(ctx: *anyopaque, node: u32, name: []const u8, value: []const u8) void {
     _ = ctx;
-    _ = callWithStrings(node, "setAttribute", 2, .{ name, value });
+    const el = dom.Element{ .handle = node };
+    el.setAttribute(name, value);
 }
 fn removeAttribute(ctx: *anyopaque, node: u32, name: []const u8) void {
     _ = ctx;
-    _ = callWithStrings(node, "removeAttribute", 1, .{name});
+    const el = dom.Element{ .handle = node };
+    el.removeAttribute(name);
 }
 fn removeChild(ctx: *anyopaque, parent: u32, child: u32) void {
     _ = ctx;
@@ -127,11 +104,13 @@ fn insertBefore(ctx: *anyopaque, parent: u32, child: u32, ref: u32) void {
 }
 fn setTextContent(ctx: *anyopaque, node: u32, textv: []const u8) void {
     _ = ctx;
-    setStringAttr(node, "textContent", textv);
+    const el = dom.Element{ .handle = node };
+    el.set_textContent(textv);
 }
 fn release(ctx: *anyopaque, node: u32) void {
     _ = ctx;
-    rt.release(node);
+    const n = dom.Node{ .handle = node };
+    n.unref();
 }
 
 // Styling, through the CSSOM rather than through markup.
@@ -171,22 +150,26 @@ fn addFont(ctx: *anyopaque, family: []const u8, src: []const u8) void {
 }
 fn appendChild(ctx: *anyopaque, parent: u32, child: u32) void {
     _ = ctx;
-    rt.release(rt.callMethod(parent, "appendChild", &.{child}));
+    const p = dom.Node{ .handle = parent };
+    p.appendChild(.{ .handle = child }).unref();
 }
 fn clearChildren(ctx: *anyopaque, node: u32) void {
     _ = ctx;
-    setStringAttr(node, "innerHTML", "");
+    const el = dom.Element{ .handle = node };
+    el.set_innerHTML("");
 }
 // The browser owns the scroll position of a region. These two hooks read it
 // for the view and write it when phantom moved the region.
 fn readScrollOffset(ctx: *anyopaque, node: u32) phantom.PhysicalOffset {
     _ = ctx;
-    return .{ .x = @floatCast(getNumberAttr(node, "scrollLeft")), .y = @floatCast(getNumberAttr(node, "scrollTop")) };
+    const el = dom.Element{ .handle = node };
+    return .{ .x = @floatCast(el.get_scrollLeft()), .y = @floatCast(el.get_scrollTop()) };
 }
 fn writeScrollOffset(ctx: *anyopaque, node: u32, offset: phantom.PhysicalOffset) void {
     _ = ctx;
-    setNumberAttr(node, "scrollLeft", offset.x);
-    setNumberAttr(node, "scrollTop", offset.y);
+    const el = dom.Element{ .handle = node };
+    el.set_scrollLeft(offset.x);
+    el.set_scrollTop(offset.y);
 }
 
 // Reads the address bar into buf, according to the build's url strategy. A
