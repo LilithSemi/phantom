@@ -309,6 +309,7 @@ test {
     _ = @import("phantom/widgets/link.zig");
     _ = @import("phantom/web_net.zig");
     _ = @import("phantom/ssr.zig");
+    _ = @import("phantom/ssr/Server.zig");
     _ = @import("phantom/http.zig");
     _ = @import("phantom/widgets/rich_text.zig");
     _ = @import("phantom/widgets/markdown.zig");

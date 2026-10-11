@@ -141,8 +141,38 @@ fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.Ap
     // available runtime, using an inline zero-dependency static server that sets
     // application/wasm for .wasm (required for WebAssembly.instantiateStreaming).
     addServeStep(b, web.dir, dist_dir, execName(b, opts.id, opts.exec_name), step);
+    addServer(b, phantom_dep, opts, web.dir, step);
 
     return step;
+}
+
+/// Install `<exec>-server`, a host binary that serves the dist directory and
+/// renders page requests, and add `zig build serve-<exec>-ssr` to run it.
+fn addServer(
+    b: *std.Build,
+    phantom_dep: *std.Build.Dependency,
+    opts: appmeta.AppOptions,
+    dist: std.Build.LazyPath,
+    app_step: *std.Build.Step,
+) void {
+    const name = execName(b, opts.id, opts.exec_name);
+    const serve = b.step(b.fmt("serve-{s}-ssr", .{name}), b.fmt("Serve {s} with server rendering (dev)", .{name}));
+    if (opts.imports.len > 0) {
+        serve.dependOn(&b.addFail("phantom.addApp: the server renders in a host build, but the modules in `imports` are built for the web target and import its phantom module. Remove imports to get a server").step);
+        return;
+    }
+
+    const entry_options = b.addOptions();
+    entry_options.addOption([]const u8, "shell", shellHtml(b, opts));
+    entry_options.addOption(bool, "strategy_is_hash", opts.url_strategy == .hash);
+    const exe = addHostExe(b, phantom_dep, opts, "server", entry_options);
+    app_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+
+    const run = b.addRunArtifact(exe);
+    run.setCwd(dist);
+    run.setEnvironmentVariable("PHANTOM_SERVE_DIR", ".");
+    run.step.dependOn(app_step);
+    serve.dependOn(&run.step);
 }
 
 /// Build the web page of an app without installing it, for a consumer that
@@ -257,13 +287,7 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
     // Build the webidl-runtime JS and generate a matching index.html.
     const runtime_import = addRuntime(b, webidl_dep, dist, &files, opts.web_runtime);
 
-    // The tab title and description come from the app's own localized text,
-    // not the wasm binary's name, so a name with '&' or '"' cannot break the
-    // generated document.
-    const name_html = appmeta.xmlEscape(b.allocator, opts.name.default) catch @panic("oom");
-    const summary_html = appmeta.xmlEscape(b.allocator, opts.summary.default) catch @panic("oom");
-    const base_html = appmeta.xmlEscape(b.allocator, opts.base_path) catch @panic("oom");
-    const html = buildIndexHtml(b, base_html, name_html, summary_html);
+    const html = shellHtml(b, opts);
     const root_prerendered = for (opts.prerender_routes) |route| {
         if (appmeta.pageDir(route).len == 0) break true;
     } else false;
@@ -591,6 +615,16 @@ fn buildIndexHtml(
         \\  </body>
         \\</html>
     , .{ name_html, summary_html, base_html });
+}
+
+/// The shell page of `opts`. The tab title and description come from the
+/// app's own localized text, not the wasm binary's name, so a name with '&'
+/// or '"' cannot break the generated document.
+fn shellHtml(b: *std.Build, opts: appmeta.AppOptions) []const u8 {
+    const name_html = appmeta.xmlEscape(b.allocator, opts.name.default) catch @panic("oom");
+    const summary_html = appmeta.xmlEscape(b.allocator, opts.summary.default) catch @panic("oom");
+    const base_html = appmeta.xmlEscape(b.allocator, opts.base_path) catch @panic("oom");
+    return buildIndexHtml(b, base_html, name_html, summary_html);
 }
 
 /// Everything the page does, as a module served beside the wasm. See

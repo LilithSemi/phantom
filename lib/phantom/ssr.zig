@@ -16,6 +16,8 @@ const dom = @import("backend/dom.zig");
 const dom_calls = @import("backend/dom_calls.zig");
 const vdom = @import("backend/vdom.zig");
 
+pub const Server = @import("ssr/Server.zig");
+
 pub const Options = struct {
     root: phantom.Root,
     /// The path of the request, such as "/docs/intro", with no query. Reaches
@@ -52,16 +54,66 @@ pub const Options = struct {
     /// `Term.init`). A server that renders often should open one and pass it
     /// to every render.
     io: std.Io,
+    /// The font files the caller already serves. `render` leaves them out of
+    /// `Document.fonts`, so a server that renders often copies each font once.
+    known_fonts: ?FontSet = null,
+};
+
+/// A set of `dom.FontFile.path` values. `contains` can run on more than one
+/// thread when the caller renders on more than one.
+pub const FontSet = struct {
+    ctx: *anyopaque,
+    contains: *const fn (ctx: *anyopaque, path: []const u8) bool,
+};
+
+/// How a page answers. A server turns it into an http status.
+pub const Status = enum {
+    ok,
+    /// The router matched no route and built its not-found page.
+    not_found,
+    /// The path, query or host did not fit the buffer that reads it, so the
+    /// tree read no address and the page is not the one asked for.
+    location_too_long,
+    /// A widget failed to build or paint, or memory ran out.
+    failed,
+
+    fn of(seen: std.EnumSet(phantom.FaultCode)) Status {
+        if (seen.contains(.location_too_long)) return .location_too_long;
+        var it = seen.iterator();
+        while (it.next()) |code| {
+            if (isFailure(code)) return .failed;
+        }
+        if (seen.contains(.route_not_found)) return .not_found;
+        return .ok;
+    }
+
+    fn isFailure(code: phantom.FaultCode) bool {
+        return switch (code) {
+            .oom, .build_failed, .render_failed, .state_init, .state_update => true,
+            .layout_overflow,
+            .protocol,
+            .route_not_found,
+            .route_rejected,
+            .link_unsupported,
+            .location_too_long,
+            .region_overflow,
+            => false,
+        };
+    }
 };
 
 pub const Document = struct {
+    status: Status,
+    /// The first fault of the render, if any.
+    fault: ?phantom.FaultCode,
     /// The body content: the container element and its subtree.
     html: []u8,
     css: []u8,
     /// Where the server serves `css`, under `base`. The name is a hash of the
     /// css, so a browser can keep it.
     css_path: []u8,
-    /// The fonts the server serves under `base`. Each file owns its bytes.
+    /// The fonts the server serves under `base`, less those in
+    /// `Options.known_fonts`. Each file owns its bytes.
     fonts: []dom.FontFile,
     /// The size the page was laid out at, in phantom px.
     size: phantom.PhysicalSize,
@@ -122,20 +174,21 @@ pub fn render(gpa: std.mem.Allocator, opts: Options) !Document {
     defer page.deinit(gpa);
 
     // The fonts belong to the application, which is gone when this returns.
-    const fonts = try gpa.alloc(dom.FontFile, page.fonts.len);
-    var copied: usize = 0;
+    var fonts: std.ArrayList(dom.FontFile) = try .initCapacity(gpa, page.fonts.len);
     errdefer {
-        for (fonts[0..copied]) |file| {
+        for (fonts.items) |file| {
             gpa.free(file.path);
             gpa.free(file.bytes);
         }
-        gpa.free(fonts);
+        fonts.deinit(gpa);
     }
-    for (page.fonts, fonts) |src, *dst| {
+    for (page.fonts) |src| {
+        if (opts.known_fonts) |known| {
+            if (known.contains(known.ctx, src.path)) continue;
+        }
         const path = try gpa.dupe(u8, src.path);
         errdefer gpa.free(path);
-        dst.* = .{ .path = path, .bytes = try gpa.dupe(u8, src.bytes) };
-        copied += 1;
+        fonts.appendAssumeCapacity(.{ .path = path, .bytes = try gpa.dupe(u8, src.bytes) });
     }
     const html = try gpa.dupe(u8, page.html);
     errdefer gpa.free(html);
@@ -143,13 +196,17 @@ pub fn render(gpa: std.mem.Allocator, opts: Options) !Document {
     errdefer gpa.free(css);
     const css_path = try gpa.print("page-{x:0>16}.css", .{std.hash.Wyhash.hash(0, css)});
     errdefer gpa.free(css_path);
+    const base = try gpa.dupe(u8, opts.base);
+    errdefer gpa.free(base);
     return .{
+        .status = .of(app.sink.seen),
+        .fault = if (app.sink.first) |f| f.code else null,
         .html = html,
         .css = css,
         .css_path = css_path,
-        .fonts = fonts,
+        .fonts = try fonts.toOwnedSlice(gpa),
         .size = opts.viewport,
-        .base = try gpa.dupe(u8, opts.base),
+        .base = base,
     };
 }
 
@@ -779,4 +836,82 @@ test "a route with a trailing slash renders the same page as the route" {
     var missing = try renderAt("/nowhere", "/");
     defer missing.deinit(gpa);
     try std.testing.expect(!std.mem.eql(u8, missing.css, slash.css));
+}
+
+test "the status tells a found page from a missing route and a long address" {
+    const gpa = std.testing.allocator;
+    var home = try renderAt("/about", "/");
+    defer home.deinit(gpa);
+    try std.testing.expectEqual(Status.ok, home.status);
+    try std.testing.expectEqual(@as(?phantom.FaultCode, null), home.fault);
+
+    var missing = try renderAt("/nowhere", "/");
+    defer missing.deinit(gpa);
+    try std.testing.expectEqual(Status.not_found, missing.status);
+    try std.testing.expectEqual(@as(?phantom.FaultCode, .route_not_found), missing.fault);
+
+    // The router reads no address and builds its initial route, the home
+    // page, which must not answer as found.
+    const long = "/" ++ @as([phantom.router.max_path]u8, @splat('a'));
+    var too_long = try renderAt(long, "/");
+    defer too_long.deinit(gpa);
+    try std.testing.expectEqual(Status.location_too_long, too_long.status);
+    try std.testing.expectEqualStrings(home.html, too_long.html);
+}
+
+const FailsToInit = struct {
+    pub const State = struct {
+        base: phantom.StateBase = .{},
+        box: phantom.ColoredBox = undefined,
+
+        pub fn initState(_: *@This(), _: *const FailsToInit) anyerror!void {
+            return error.NoData;
+        }
+
+        pub fn build(s: *@This(), _: *phantom.BuildContext) anyerror!phantom.Widget {
+            s.box = .{ .color = phantom.Color.rgb(0, 0, 0) };
+            return s.box.widget();
+        }
+    };
+
+    fn root(b: *phantom.BuildContext) phantom.Widget {
+        return phantom.StatefulWidget(FailsToInit, b.new(FailsToInit{}));
+    }
+};
+
+test "a widget that fails to initialise makes a failed page" {
+    const gpa = std.testing.allocator;
+    var doc = try render(gpa, .{ .root = phantom.Root.plain(FailsToInit.root), .path = "/", .viewport = test_size, .io = std.testing.io });
+    defer doc.deinit(gpa);
+    try std.testing.expectEqual(Status.failed, doc.status);
+    try std.testing.expectEqual(@as(?phantom.FaultCode, .state_init), doc.fault);
+}
+
+test "a font the caller already serves is left out of the document" {
+    const gpa = std.testing.allocator;
+    const Fixture = struct {
+        font: phantom.text.Font,
+
+        fn build(b: *phantom.BuildContext, self: *@This()) phantom.Widget {
+            return b.new(phantom.Text{ .text = "hi", .font = &self.font }).widget();
+        }
+    };
+    const Known = struct {
+        fn contains(_: *anyopaque, path: []const u8) bool {
+            return std.mem.startsWith(u8, path, "fonts/pf-");
+        }
+    };
+    var fixture: Fixture = .{ .font = try phantom.text.Font.load(gpa, phantom.text.builtin.neuropol_bytes) };
+    defer fixture.font.deinit(gpa);
+    var ctx: u8 = 0;
+    var doc = try render(gpa, .{
+        .root = phantom.Root.of(Fixture, Fixture.build, &fixture),
+        .path = "/",
+        .viewport = test_size,
+        .io = std.testing.io,
+        .known_fonts = .{ .ctx = &ctx, .contains = Known.contains },
+    });
+    defer doc.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), doc.fonts.len);
+    try std.testing.expect(std.mem.indexOf(u8, doc.css, "src:url(\"/fonts/pf-") != null);
 }

@@ -46,6 +46,9 @@ pub const Policy = enum { soft, strict };
 policy: Policy = .soft,
 first: ?Fault = null,
 count: usize = 0,
+/// Every code reported since the last reset, so a caller can find a fault
+/// that was not the first.
+seen: std.EnumSet(FaultCode) = .empty,
 
 /// Where a recovered fault is written for a human to read. Null discards the
 /// text: the fault is still counted and still kept in `first`, which is what the
@@ -70,6 +73,7 @@ diagnostics: ?*std.Io.Writer = null,
 /// inspects `first` after the pass and surfaces it.
 pub fn report(self: *FaultSink, code: FaultCode, msg: []const u8) void {
     self.count += 1;
+    self.seen.insert(code);
     if (self.first == null) self.first = .{ .code = code, .msg = msg };
     if (self.policy != .soft) return;
     const w = self.diagnostics orelse return;
@@ -91,6 +95,7 @@ pub fn ok(self: *const FaultSink) bool {
 pub fn reset(self: *FaultSink) void {
     self.first = null;
     self.count = 0;
+    self.seen = .empty;
 }
 
 test "records first fault, counts all, ok/reset behave" {
@@ -179,4 +184,15 @@ test "strict policy still records the first fault" {
     s.report(.state_init, "init failed");
     try std.testing.expect(!s.ok());
     try std.testing.expectEqual(FaultCode.state_init, s.first.?.code);
+}
+
+test "seen holds every reported code until a reset" {
+    var s = FaultSink{};
+    s.report(.location_too_long, "long");
+    s.report(.route_not_found, "/x");
+    try std.testing.expect(s.seen.contains(.location_too_long));
+    try std.testing.expect(s.seen.contains(.route_not_found));
+    try std.testing.expect(!s.seen.contains(.oom));
+    s.reset();
+    try std.testing.expect(!s.seen.contains(.route_not_found));
 }
