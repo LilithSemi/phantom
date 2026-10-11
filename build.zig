@@ -332,37 +332,7 @@ fn addPrerender(
         return null;
     };
 
-    const host = b.graph.host;
-    const phantom_host = b.createModule(.{
-        .root_source_file = phantom_dep.builder.path("lib/phantom.zig"),
-        .target = host,
-        .optimize = opts.optimize,
-    });
-    const app_mod = b.createModule(.{
-        .root_source_file = opts.root,
-        .target = host,
-        .optimize = opts.optimize,
-    });
-    app_mod.addImport("phantom", phantom_host);
-    addAppImports(app_mod, phantom_host, opts.imports);
-
-    const entry_options = b.addOptions();
-    entry_options.addOption([]const u8, "base_path", opts.base_path);
-    entry_options.addOption(u32, "width", opts.default_size.width);
-    entry_options.addOption(u32, "height", opts.default_size.height);
-
-    const exe = b.addExecutable(.{
-        .name = b.fmt("{s}-prerender", .{execName(b, opts.id, opts.exec_name)}),
-        .root_module = b.createModule(.{
-            .root_source_file = phantom_dep.builder.path("build/prerender_entry.zig"),
-            .target = host,
-            .optimize = opts.optimize,
-        }),
-    });
-    exe.root_module.addImport("build_options", entry_options.createModule());
-    exe.root_module.addImport("phantom", phantom_host);
-    exe.root_module.addImport("app_root", app_mod);
-
+    const exe = addHostExe(b, phantom_dep, opts, "prerender", b.addOptions());
     const run = b.addRunArtifact(exe);
     run.addFileArg(b.addWriteFiles().add("shell.html", shell));
     const pages = run.addOutputDirectoryArg("pages");
@@ -379,6 +349,48 @@ fn addPrerender(
         addDistFile(b, files, if (dir.len == 0) "index.html" else b.fmt("{s}/index.html", .{dir}));
     }
     return manifest;
+}
+
+/// Build `build/<kind>_entry.zig` for the build machine, with the app root
+/// as `app_root` and `entry_options` plus the base path and default size as
+/// `build_options`. The exe is named `<exec>-<kind>`.
+fn addHostExe(
+    b: *std.Build,
+    phantom_dep: *std.Build.Dependency,
+    opts: appmeta.AppOptions,
+    kind: []const u8,
+    entry_options: *std.Build.Step.Options,
+) *std.Build.Step.Compile {
+    const host = b.graph.host;
+    const phantom_host = b.createModule(.{
+        .root_source_file = phantom_dep.builder.path("lib/phantom.zig"),
+        .target = host,
+        .optimize = opts.optimize,
+    });
+    const app_mod = b.createModule(.{
+        .root_source_file = opts.root,
+        .target = host,
+        .optimize = opts.optimize,
+    });
+    app_mod.addImport("phantom", phantom_host);
+    addAppImports(app_mod, phantom_host, opts.imports);
+
+    entry_options.addOption([]const u8, "base_path", opts.base_path);
+    entry_options.addOption(u32, "width", opts.default_size.width);
+    entry_options.addOption(u32, "height", opts.default_size.height);
+
+    const exe = b.addExecutable(.{
+        .name = b.fmt("{s}-{s}", .{ execName(b, opts.id, opts.exec_name), kind }),
+        .root_module = b.createModule(.{
+            .root_source_file = phantom_dep.builder.path(b.fmt("build/{s}_entry.zig", .{kind})),
+            .target = host,
+            .optimize = opts.optimize,
+        }),
+    });
+    exe.root_module.addImport("build_options", entry_options.createModule());
+    exe.root_module.addImport("phantom", phantom_host);
+    exe.root_module.addImport("app_root", app_mod);
+    return exe;
 }
 
 fn addDistFile(b: *std.Build, files: *std.ArrayList([]const u8), rel: []const u8) void {
