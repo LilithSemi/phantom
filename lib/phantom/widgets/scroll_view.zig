@@ -111,6 +111,172 @@ pub const Scrollable = struct {
     }
 };
 
+/// Where a scrollbar thumb sits, in physical px along its track.
+pub const Thumb = struct { start: f32, length: f32 };
+
+/// The thumb on a track `track` long, or null when the content fits. Its length
+/// is the visible share of the content, but at least two thicknesses so it stays
+/// easy to grab.
+pub fn thumbFor(viewport: f32, content: f32, offset: f32, track: f32, thickness: f32) ?Thumb {
+    if (content <= viewport or track <= 0) return null;
+    const length = std.math.clamp(viewport / content * track, @min(2 * thickness, track), track);
+    const travel = content - viewport;
+    return .{ .start = std.math.clamp(offset / travel, 0, 1) * (track - length), .length = length };
+}
+
+/// The offset that puts a thumb `length` long at `start` on its track.
+fn offsetForThumb(start: f32, length: f32, track: f32, travel: f32) f32 {
+    const room = track - length;
+    if (room <= 0) return 0;
+    return std.math.clamp(start / room, 0, 1) * travel;
+}
+
+/// The bars `ScrollView` and `GridView` draw over the edges of their viewport
+/// when the content overflows, and the drag that moves a thumb.
+pub const Scrollbars = struct {
+    track_color: geom.Color = geom.Color.rgb(0.5, 0.5, 0.5),
+    thumb_color: geom.Color = geom.Color.rgb(0.5, 0.5, 0.5),
+    /// Physical px per logical px at the last layout.
+    scale: f32 = 1,
+    drag: ?Drag = null,
+
+    const Axis = enum(u1) { vertical, horizontal };
+    /// `grab` is the distance from the thumb start to the pointer.
+    const Drag = struct { axis: Axis, grab: f32 };
+    const empty: geom.PhysicalRect = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+
+    pub fn setColors(self: *Scrollbars, parent: ?*Element) void {
+        const colors = if (phantom.inheritedOf(parent, phantom.ThemeData)) |t| t.colors else phantom.ColorScheme.tokyoNight();
+        self.track_color = colors.fg_dim;
+        self.track_color.a = 0.3;
+        self.thumb_color = colors.fg_muted;
+    }
+
+    /// One bar on one axis: its track in the space of the view's origin, and
+    /// its thumb along that track.
+    const Bar = struct { track: geom.PhysicalRect, thumb: Thumb };
+
+    fn cell(view: Scrollable) ?geom.PhysicalSize {
+        const owner = view.owner orelse return null;
+        return switch (owner.text_metrics) {
+            .proportional => null,
+            .mono => |m| .{ .width = m.advance, .height = m.line },
+        };
+    }
+
+    fn native(view: Scrollable) bool {
+        const owner = view.owner orelse return false;
+        return owner.platform.native_scrollbars;
+    }
+
+    fn overflows(view: Scrollable, axis: Axis) bool {
+        return switch (axis) {
+            .vertical => view.content.height > view.viewport.height,
+            .horizontal => view.content.width > view.viewport.width,
+        };
+    }
+
+    fn along(p: geom.PhysicalOffset, axis: Axis) f32 {
+        return switch (axis) {
+            .vertical => p.y,
+            .horizontal => p.x,
+        };
+    }
+
+    fn barFor(self: *const Scrollbars, view: Scrollable, axis: Axis) ?Bar {
+        if (native(view) or !overflows(view, axis)) return null;
+        const o = view.node.origin;
+        const s = view.node.size;
+        const term = cell(view);
+        // A terminal bar is one cell thick, and its thumb moves in whole cells.
+        const thickness, const unit: f32 = switch (axis) {
+            .vertical => if (term) |c| .{ c.width, c.height } else .{ 6 * self.scale, 0 },
+            .horizontal => if (term) |c| .{ c.height, c.width } else .{ 6 * self.scale, 0 },
+        };
+        const other: Axis = if (axis == .vertical) .horizontal else .vertical;
+        const corner = if (overflows(view, other)) thickness else 0;
+        const track: geom.PhysicalRect = switch (axis) {
+            .vertical => .{ .x = o.x + s.width - thickness, .y = o.y, .width = thickness, .height = s.height - corner },
+            .horizontal => .{ .x = o.x, .y = o.y + s.height - thickness, .width = s.width - corner, .height = thickness },
+        };
+        const length = if (axis == .vertical) track.height else track.width;
+        var thumb = switch (axis) {
+            .vertical => thumbFor(view.viewport.height, view.content.height, view.offset.y, length, thickness),
+            .horizontal => thumbFor(view.viewport.width, view.content.width, view.offset.x, length, thickness),
+        } orelse return null;
+        if (unit > 0) {
+            thumb.length = std.math.clamp(@round(thumb.length / unit) * unit, @min(unit, length), length);
+            thumb.start = std.math.clamp(@round(thumb.start / unit) * unit, 0, length - thumb.length);
+        }
+        return .{ .track = track, .thumb = thumb };
+    }
+
+    /// Draw the bars after the content, and record their tracks for hit testing.
+    pub fn paint(self: *const Scrollbars, cv: *Canvas, view: Scrollable) !void {
+        const radius: f32 = if (cell(view) == null) 3 * self.scale else 0;
+        for ([_]Axis{ .vertical, .horizontal }) |axis| {
+            const slot = &view.node.scroll_bars[@backingInt(axis)];
+            slot.* = empty;
+            const bar = self.barFor(view, axis) orelse continue;
+            slot.* = bar.track;
+            var thumb = bar.track;
+            switch (axis) {
+                .vertical => {
+                    thumb.y += bar.thumb.start;
+                    thumb.height = bar.thumb.length;
+                },
+                .horizontal => {
+                    thumb.x += bar.thumb.start;
+                    thumb.width = bar.thumb.length;
+                },
+            }
+            try cv.fillRRect(bar.track, radius, self.track_color);
+            try cv.fillRRect(thumb, radius, self.thumb_color);
+        }
+    }
+
+    /// A press on a thumb starts a drag. A press on a track outside the thumb
+    /// pages one viewport toward the press.
+    pub fn down(self: *Scrollbars, view: Scrollable, p: geom.PhysicalOffset) void {
+        self.drag = null;
+        for ([_]Axis{ .vertical, .horizontal }) |axis| {
+            const bar = self.barFor(view, axis) orelse continue;
+            const t = bar.track;
+            if (p.x < t.x or p.x >= t.x + t.width or p.y < t.y or p.y >= t.y + t.height) continue;
+            const pos = along(p, axis) - along(.{ .x = t.x, .y = t.y }, axis);
+            if (pos >= bar.thumb.start and pos < bar.thumb.start + bar.thumb.length) {
+                self.drag = .{ .axis = axis, .grab = pos - bar.thumb.start };
+                return;
+            }
+            const sign: f32 = if (pos < bar.thumb.start) -1 else 1;
+            var to = view.offset.*;
+            switch (axis) {
+                .vertical => to.y += sign * view.viewport.height,
+                .horizontal => to.x += sign * view.viewport.width,
+            }
+            _ = view.set(to);
+            return;
+        }
+    }
+
+    pub fn move(self: *Scrollbars, view: Scrollable, p: geom.PhysicalOffset) void {
+        const drag = self.drag orelse return;
+        const bar = self.barFor(view, drag.axis) orelse return;
+        const t = bar.track;
+        const start = along(p, drag.axis) - along(.{ .x = t.x, .y = t.y }, drag.axis) - drag.grab;
+        var to = view.offset.*;
+        switch (drag.axis) {
+            .vertical => to.y = offsetForThumb(start, bar.thumb.length, t.height, view.content.height - view.viewport.height),
+            .horizontal => to.x = offsetForThumb(start, bar.thumb.length, t.width, view.content.width - view.viewport.width),
+        }
+        _ = view.set(to);
+    }
+
+    pub fn up(self: *Scrollbars) void {
+        self.drag = null;
+    }
+};
+
 /// The handle an application holds to reach a mounted scrolling widget. The scroll
 /// offset lives on the render object, which the widget tree owns and rebuilds, so a
 /// controller is the only stable thing a caller can keep across frames. It does not
@@ -207,9 +373,11 @@ const RenderScrollView = struct {
     axis: ScrollView.Axis = .vertical,
     moved: u32 = 0,
     owner: ?*phantom.BuildOwner = null,
+    bars: Scrollbars = .{},
 
     fn layoutFn(base: *RenderObject, c: layout.BoxConstraints) geom.PhysicalSize {
         const self: *RenderScrollView = @fieldParentPtr("base", base);
+        self.bars.scale = c.scale;
         var vp = c.biggest();
         if (self.child) |ch| {
             const child_constraints: layout.BoxConstraints = switch (self.axis) {
@@ -258,6 +426,7 @@ const RenderScrollView = struct {
         });
         if (self.child) |ch| try ch.paint(cv, offset);
         try cv.popScroll();
+        try self.bars.paint(cv, self.scrollable());
     }
 
     fn destroyFn(base: *RenderObject, gpa: std.mem.Allocator) void {
@@ -315,6 +484,21 @@ const RenderScrollView = struct {
         return self.offset.x != before.x or self.offset.y != before.y;
     }
 
+    fn downThunk(ctx: *anyopaque, ev: pointer.PointerEvent) void {
+        const self: *RenderScrollView = @ptrCast(@alignCast(ctx));
+        self.bars.down(self.scrollable(), ev.position);
+    }
+
+    fn moveThunk(ctx: *anyopaque, ev: pointer.PointerEvent) void {
+        const self: *RenderScrollView = @ptrCast(@alignCast(ctx));
+        self.bars.move(self.scrollable(), ev.position);
+    }
+
+    fn upThunk(ctx: *anyopaque, _: pointer.PointerEvent) void {
+        const self: *RenderScrollView = @ptrCast(@alignCast(ctx));
+        self.bars.up();
+    }
+
     fn onKey(ctx: *anyopaque, ev: phantom.input.KeyEvent) bool {
         const self: *RenderScrollView = @ptrCast(@alignCast(ctx));
         if (ev.action == .release) return false;
@@ -327,7 +511,7 @@ const RenderScrollView = struct {
     }
 
     fn installHandlers(self: *RenderScrollView) void {
-        self.handlers = .{ .ctx = self, .on_scroll = scrollThunk, .on_scroll_to = scrollToThunk };
+        self.handlers = .{ .ctx = self, .on_scroll = scrollThunk, .on_scroll_to = scrollToThunk, .on_down = downThunk, .on_move = moveThunk, .on_up = upThunk };
         self.base.pointer = &self.handlers;
         self.base.scroll_offset = &self.offset;
         self.focus_handlers = .{
@@ -375,6 +559,7 @@ pub const ScrollView = struct {
             .axis = self.axis,
             .owner = bctx.owner,
         };
+        ro.bars.setColors(parent);
         ro.id.set(gpa, self.id) catch |e| {
             gpa.destroy(ro);
             return e;
@@ -406,6 +591,7 @@ pub const ScrollView = struct {
         const ro: *RenderScrollView = @fieldParentPtr("base", el.render_object.?);
         ro.axis = self.axis;
         try ro.id.set(ro.gpa, self.id);
+        ro.bars.setColors(el.parent);
         ro.installHandlers();
         ro.attach(self.controller);
         el.child = try el.updateChild(el.child, self.child, bctx);
@@ -1107,4 +1293,167 @@ test "a wheel over a scrolled outer view reaches the inner view drawn there" {
     try h.pump();
     try h.scrollAt(.{ .x = 10, .y = 10 }, 30, 0);
     try std.testing.expectEqual(@as(f32, 30), inner_ro.offset.x);
+}
+
+// ---------------------------------------------------------------------------
+// Scrollbars
+// ---------------------------------------------------------------------------
+
+test "the thumb shows the visible share of the content at the scroll position" {
+    // A quarter of the content shows, so the thumb is a quarter of the track.
+    const top = thumbFor(100, 400, 0, 100, 6).?;
+    try std.testing.expectEqual(@as(f32, 0), top.start);
+    try std.testing.expectEqual(@as(f32, 25), top.length);
+    const middle = thumbFor(100, 400, 150, 100, 6).?;
+    try std.testing.expectEqual(@as(f32, 37.5), middle.start);
+    const end = thumbFor(100, 400, 300, 100, 6).?;
+    try std.testing.expectEqual(@as(f32, 75), end.start);
+}
+
+test "a thumb for very long content keeps a length of two thicknesses" {
+    const top = thumbFor(100, 100_000, 0, 100, 6).?;
+    try std.testing.expectEqual(@as(f32, 12), top.length);
+    const end = thumbFor(100, 100_000, 99_900, 100, 6).?;
+    try std.testing.expectEqual(@as(f32, 88), end.start);
+}
+
+test "content that fits needs no thumb" {
+    try std.testing.expect(thumbFor(100, 100, 0, 100, 6) == null);
+    try std.testing.expect(thumbFor(100, 40, 0, 100, 6) == null);
+}
+
+/// The rects drawn after the last scroll region closes, which is where the bars go.
+fn barRects(prims: []const phantom.Primitive, out: []geom.PhysicalRect) usize {
+    var last_pop: usize = 0;
+    for (prims, 0..) |p, i| {
+        if (p == .pop_scroll) last_pop = i + 1;
+    }
+    var n: usize = 0;
+    for (prims[last_pop..]) |p| {
+        switch (p) {
+            .rrect => |r| {
+                if (n < out.len) out[n] = r.rect;
+                n += 1;
+            },
+            else => {},
+        }
+    }
+    return n;
+}
+
+test "an overflowing ScrollView draws a track and a thumb on its right edge" {
+    const gpa = std.testing.allocator;
+    var list = RowList{};
+    var col = list.column();
+    var sv = ScrollView{ .child = col.widget() };
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+
+    var rects: [4]geom.PhysicalRect = undefined;
+    try std.testing.expectEqual(@as(usize, 2), barRects(h.canvas.list.primitives.items, &rects));
+    // The track runs the full height, 6 wide. The thumb is the 12 unit minimum.
+    try std.testing.expectEqual(geom.PhysicalRect{ .x = 94, .y = 0, .width = 6, .height = 100 }, rects[0]);
+    try std.testing.expectEqual(geom.PhysicalRect{ .x = 94, .y = 0, .width = 6, .height = 12 }, rects[1]);
+    // The bar covers the content edge, so the content keeps its full width.
+    const ro: *RenderScrollView = @fieldParentPtr("base", h.root.render_object.?);
+    try std.testing.expectEqual(@as(f32, 100), ro.content.width);
+}
+
+test "a ScrollView whose content fits draws no bar" {
+    const gpa = std.testing.allocator;
+    const leaf = phantom.ColoredBox{ .color = geom.Color.rgb(0, 1, 0) };
+    const short = phantom.SizedBox{ .width = 100, .height = 50, .child = leaf.widget() };
+    var sv = ScrollView{ .child = short.widget() };
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+
+    var rects: [4]geom.PhysicalRect = undefined;
+    try std.testing.expectEqual(@as(usize, 0), barRects(h.canvas.list.primitives.items, &rects));
+}
+
+test "a backend with its own scrollbars gets no drawn bar" {
+    const gpa = std.testing.allocator;
+    var list = RowList{};
+    var col = list.column();
+    var sv = ScrollView{ .child = col.widget() };
+    var h = try testing.mountWithPlatform(gpa, sv.widget(), .{ .native_scrollbars = true });
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+
+    var rects: [4]geom.PhysicalRect = undefined;
+    try std.testing.expectEqual(@as(usize, 0), barRects(h.canvas.list.primitives.items, &rects));
+    // With no bar drawn, the content edge takes taps again.
+    try std.testing.expectEqual(@as(f32, 0), h.root.render_object.?.scroll_bars[0].width);
+}
+
+test "dragging the thumb from its top to the track bottom scrolls to the end" {
+    const gpa = std.testing.allocator;
+    var list = RowList{};
+    var col = list.column();
+    var ctl = ScrollController{};
+    var sv = ScrollView{ .controller = &ctl, .child = col.widget() };
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+    h.owner.dispatcher = &h.dispatcher;
+
+    h.dispatcher.down(h.root, .{ .x = 97, .y = 0 });
+    h.dispatcher.move(h.root, .{ .x = 97, .y = 50 });
+    const halfway = ctl.offset().?.y;
+    try std.testing.expect(halfway > 0 and halfway < 900);
+    // The pointer leaves the bar and the view, and the drag still follows it.
+    h.dispatcher.move(h.root, .{ .x = 40, .y = 300 });
+    h.dispatcher.up(h.root, .{ .x = 40, .y = 300 });
+    try std.testing.expectEqual(@as(f32, 900), ctl.offset().?.y);
+
+    // After the release a move over the bar scrolls nothing.
+    h.dispatcher.move(h.root, .{ .x = 97, .y = 0 });
+    try std.testing.expectEqual(@as(f32, 900), ctl.offset().?.y);
+}
+
+test "a press on the track outside the thumb pages toward the press" {
+    const gpa = std.testing.allocator;
+    var list = RowList{};
+    var col = list.column();
+    var ctl = ScrollController{};
+    var sv = ScrollView{ .controller = &ctl, .child = col.widget() };
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+
+    h.tapAt(.{ .x = 97, .y = 80 });
+    try std.testing.expectEqual(@as(f32, 100), ctl.offset().?.y);
+    try h.pump();
+    // The thumb now sits below y 0, so a press at the top pages back up.
+    h.tapAt(.{ .x = 97, .y = 0 });
+    try std.testing.expectEqual(@as(f32, 0), ctl.offset().?.y);
+}
+
+test "the terminal draws the bar as one column of cells" {
+    const gpa = std.testing.allocator;
+    var list = RowList{};
+    var col = list.column();
+    var sv = ScrollView{ .child = col.widget() };
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+
+    // Ten cells of 8 by 16 across, four rows down. The thumb is one cell.
+    var r = try h.tuiRender(10, 4, 8, 16);
+    defer r.deinit();
+    const scheme = phantom.ColorScheme.tokyoNight();
+    try r.expectBg(9, 0, scheme.fg_muted);
+    try r.expectBg(8, 0, geom.Color.rgb(0, 1, 0));
+    try r.expectBg(8, 2, geom.Color.rgb(0, 1, 0));
+    // The track tints the rest of the column.
+    const track = (r.grid.cellAt(9, 2) orelse return error.CellOutOfRange).bg;
+    const Rgb = @TypeOf(track);
+    try std.testing.expect(!track.eql(Rgb.fromColor(geom.Color.rgb(0, 1, 0))));
+    try std.testing.expect(!track.eql(Rgb.fromColor(scheme.fg_muted)));
 }

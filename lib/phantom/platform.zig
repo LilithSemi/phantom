@@ -110,6 +110,9 @@ pub const Platform = struct {
     /// one works on the machine it was written on and nowhere else.
     read_host: ?*const fn (*anyopaque, []u8) ?[]const u8 = null,
     strategy: UrlStrategy = .hash,
+    /// True when the host draws its own scrollbars, as a browser does. Scroll
+    /// views then draw none.
+    native_scrollbars: bool = false,
 
     /// True when the URL was opened. False means NOTHING HAPPENED, and a caller
     /// should say so: no hook on this backend, or a browser that refused the

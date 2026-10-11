@@ -843,6 +843,7 @@ pub fn init(
         .open_event_source = if (has_event_source) openEventSourceThunk else null,
         .close_event_source = if (has_event_source) closeEventSourceThunk else null,
         .strategy = strategy,
+        .native_scrollbars = true,
     };
 
     var bctx = phantom.BuildContext{ .arena = arena.allocator(), .owner = owner };

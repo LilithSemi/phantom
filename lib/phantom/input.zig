@@ -201,7 +201,8 @@ pub const KeyEvent = struct {
 /// Routes pointer events into the tree. down records the hit handler as the
 /// pressed target and delivers on_down; up delivers on_up to the SAME pressed
 /// target (passing the up position so a GestureDetector can decide tap-vs-cancel
-/// by its own bounds), then clears pressed. move delivers to the hit handler.
+/// by its own bounds), then clears pressed. move delivers to the pressed target
+/// while there is one, else to the hit handler.
 ///
 /// Each handler gets the position in the space of its own `origin`, so a target
 /// inside scrolled content compares it with its bounds directly.
@@ -237,6 +238,12 @@ pub const Dispatcher = struct {
             self.hovered = h;
         }
         self.hovered_shift = shift;
+        // A pressed target keeps the moves until the release, so a drag that
+        // leaves its bounds still reaches it.
+        if (self.pressed) |hd| {
+            if (hd.on_move) |f| f(hd.ctx, .{ .position = point.add(self.pressed_shift), .phase = .move });
+            return;
+        }
         if (h) |hd| if (hd.on_move) |f| f(hd.ctx, .{ .position = point.add(shift), .phase = .move });
     }
     pub fn clearHover(self: *Dispatcher, point: geom.PhysicalOffset) void {
@@ -657,4 +664,52 @@ test "hit testing moves the point by a scroll offset and cuts at the viewport" {
     // A point on a scrollbar goes to the view, not to the child under it.
     view.base.scroll_bars[0] = .{ .x = 90, .y = 0, .width = 10, .height = 100 };
     try std.testing.expect(hitTest(&view_el, .{ .x = 95, .y = 60 }) == &view.handlers);
+}
+
+test "a move outside the pressed handler still reaches it until the release" {
+    const gpa = std.testing.allocator;
+    var sink = FaultSink{};
+    var owner = BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    const Moves = struct {
+        count: u32 = 0,
+        last: geom.PhysicalOffset = .zero,
+        fn f(ctx: *anyopaque, ev: pointer.PointerEvent) void {
+            const m: *@This() = @ptrCast(@alignCast(ctx));
+            m.count += 1;
+            m.last = ev.position;
+        }
+    };
+    var held = Moves{};
+    var other = Moves{};
+    var box_a = HitBox.make(50, 50);
+    box_a.handlers = .{ .ctx = &held, .on_move = Moves.f };
+    box_a.base.pointer = &box_a.handlers;
+    var box_b = HitBox.make(50, 50);
+    box_b.handlers = .{ .ctx = &other, .on_move = Moves.f };
+    box_b.base.pointer = &box_b.handlers;
+    const vt = widget.Widget.VTable{ .mount = undefined, .update = undefined };
+    var el_a = Element{ .owner = &owner, .vtable = &vt, .type_name = "a", .render_object = &box_a.base };
+    var el_b = Element{ .owner = &owner, .vtable = &vt, .type_name = "b", .render_object = &box_b.base };
+    var root_el = Element{ .owner = &owner, .vtable = &vt, .type_name = "root" };
+    try root_el.children.append(gpa, &el_a);
+    try root_el.children.append(gpa, &el_b);
+    defer root_el.children.deinit(gpa);
+    _ = box_a.base.layout(layout.BoxConstraints.tight(.{ .width = 50, .height = 50 }));
+    _ = box_b.base.layout(layout.BoxConstraints.tight(.{ .width = 50, .height = 50 }));
+    box_b.base.origin = .{ .x = 100, .y = 0 };
+
+    var d = Dispatcher{};
+    d.down(&root_el, .{ .x = 10, .y = 10 });
+    d.move(&root_el, .{ .x = 120, .y = 10 });
+    try std.testing.expectEqual(@as(u32, 1), held.count);
+    try std.testing.expectEqual(@as(f32, 120), held.last.x);
+    try std.testing.expectEqual(@as(u32, 0), other.count);
+    // Hover still follows the pointer while the press is held.
+    try std.testing.expect(d.hovered == &box_b.handlers);
+
+    d.up(&root_el, .{ .x = 120, .y = 10 });
+    d.move(&root_el, .{ .x = 121, .y = 10 });
+    try std.testing.expectEqual(@as(u32, 1), held.count);
+    try std.testing.expectEqual(@as(u32, 1), other.count);
 }

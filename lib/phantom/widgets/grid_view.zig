@@ -86,6 +86,7 @@ const RenderGridView = struct {
     controller: ?*scroll_view.ScrollController = null,
     moved: u32 = 0,
     owner: ?*phantom.BuildOwner = null,
+    bars: scroll_view.Scrollbars = .{},
 
     fn reportOom(self: *RenderGridView, msg: []const u8) void {
         if (self.sink) |s| s.report(.oom, msg);
@@ -94,6 +95,7 @@ const RenderGridView = struct {
     fn layoutFn(base: *RenderObject, c: layout.BoxConstraints) geom.PhysicalSize {
         const self: *RenderGridView = @fieldParentPtr("base", base);
         const vp = c.biggest();
+        self.bars.scale = c.scale;
         self.viewport = vp;
         self.offsets.clearRetainingCapacity();
 
@@ -158,6 +160,7 @@ const RenderGridView = struct {
             try self.children.items[i].paint(cv, offset.add(off));
         }
         try cv.popScroll();
+        try self.bars.paint(cv, self.scrollable());
     }
 
     /// Point the controller at this grid. The same reasoning as `ScrollView`: a
@@ -215,6 +218,21 @@ const RenderGridView = struct {
         return self.offset.x != before.x or self.offset.y != before.y;
     }
 
+    fn downThunk(ctx: *anyopaque, ev: pointer.PointerEvent) void {
+        const self: *RenderGridView = @ptrCast(@alignCast(ctx));
+        self.bars.down(self.scrollable(), ev.position);
+    }
+
+    fn moveThunk(ctx: *anyopaque, ev: pointer.PointerEvent) void {
+        const self: *RenderGridView = @ptrCast(@alignCast(ctx));
+        self.bars.move(self.scrollable(), ev.position);
+    }
+
+    fn upThunk(ctx: *anyopaque, _: pointer.PointerEvent) void {
+        const self: *RenderGridView = @ptrCast(@alignCast(ctx));
+        self.bars.up();
+    }
+
     fn onKey(ctx: *anyopaque, ev: phantom.input.KeyEvent) bool {
         const self: *RenderGridView = @ptrCast(@alignCast(ctx));
         if (ev.action == .release) return false;
@@ -224,7 +242,7 @@ const RenderGridView = struct {
     }
 
     fn installHandlers(self: *RenderGridView) void {
-        self.handlers = .{ .ctx = self, .on_scroll = scrollThunk, .on_scroll_to = scrollToThunk };
+        self.handlers = .{ .ctx = self, .on_scroll = scrollThunk, .on_scroll_to = scrollToThunk, .on_down = downThunk, .on_move = moveThunk, .on_up = upThunk };
         self.base.pointer = &self.handlers;
         self.base.scroll_offset = &self.offset;
         self.focus_handlers = .{ .ctx = self, .on_key = onKey, .node = &self.base, .id = self.id.text };
@@ -285,6 +303,7 @@ pub const GridView = struct {
             .aspect_ratio = self.aspect_ratio,
             .handlers = .{ .ctx = rg },
         };
+        rg.bars.setColors(parent);
         // Before `installHandlers`, which reads the id into the focus handlers.
         rg.id.set(gpa, self.id) catch |e| {
             gpa.destroy(rg);
@@ -318,6 +337,7 @@ pub const GridView = struct {
         rg.columns = self.columns;
         rg.spacing = self.spacing;
         rg.aspect_ratio = self.aspect_ratio;
+        rg.bars.setColors(el.parent);
         // A rebuild can rename the grid or move the controller to another
         // widget, so both are re-read and the handlers re-installed.
         try rg.id.set(bctx.owner.gpa, self.id);
@@ -351,11 +371,13 @@ fn pushScrollOf(prims: []const phantom.Primitive) ?phantom.display_list.ScrollRe
     return null;
 }
 
-/// The rrect rects in paint order, skipping the scroll markers.
+/// The rrect rects in paint order inside the scroll region. The scrollbar
+/// after the region is not a tile.
 fn tileRects(prims: []const phantom.Primitive, out: []geom.PhysicalRect) usize {
     var n: usize = 0;
     for (prims) |p| {
         switch (p) {
+            .pop_scroll => break,
             .rrect => |r| {
                 if (n < out.len) {
                     out[n] = r.rect;
@@ -591,7 +613,8 @@ test "the terminal backend draws only the rows inside the viewport" {
     defer r.deinit();
 
     try r.expectBg(0, 0, phantom.Color.rgb(1, 0, 0));
-    try r.expectBg(15, 3, phantom.Color.rgb(1, 0, 0));
+    // Column 15 holds the scrollbar.
+    try r.expectBg(14, 3, phantom.Color.rgb(1, 0, 0));
     // The green row starts at y 64, which is past the grid, so no cell holds it.
     var row: u16 = 0;
     while (row < 4) : (row += 1) {
@@ -810,4 +833,30 @@ test "a named GridView takes the focus by that name" {
 
     try std.testing.expect(h.focus.focusById("launcher"));
     try std.testing.expectEqualStrings("launcher", h.focus.focusedId().?);
+}
+
+test "an overflowing grid draws a scrollbar after its tiles" {
+    const gpa = std.testing.allocator;
+    var boxes: [6]phantom.ColoredBox = undefined;
+    var kids: [6]Widget = undefined;
+    fillTiles(&boxes, &kids);
+
+    var grid = GridView{ .columns = 2, .children = &kids };
+    var h = try testing.mount(gpa, grid.widget());
+    defer h.deinit();
+    // Three rows of 50 in a viewport 60 tall.
+    h.viewport = .{ .width = 100, .height = 60 };
+    try h.pump();
+
+    const prims = h.canvas.list.primitives.items;
+    try std.testing.expect(prims[prims.len - 3] == .pop_scroll);
+    const track = prims[prims.len - 2].rrect.rect;
+    const thumb = prims[prims.len - 1].rrect.rect;
+    try std.testing.expectEqual(geom.PhysicalRect{ .x = 94, .y = 0, .width = 6, .height = 60 }, track);
+    try std.testing.expectEqual(@as(f32, 24), thumb.height);
+
+    // A press low on the track pages the grid down by one viewport.
+    h.tapAt(.{ .x = 97, .y = 55 });
+    try h.pump();
+    try std.testing.expectEqual(@as(f32, 60), (pushScrollOf(h.canvas.list.primitives.items) orelse return error.NoPushScroll).offset.y);
 }

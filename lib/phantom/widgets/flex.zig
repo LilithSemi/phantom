@@ -1401,7 +1401,8 @@ test "a SizedBox of fixed width around a Column of open height is as wide as the
 // but no tap handler.
 fn findTappable(el: *Element) ?*RenderObject {
     if (el.renderObject()) |ro| {
-        if (ro.pointer) |p| if (p.on_up != null) return ro;
+        // A scroll view takes presses for its scrollbars, so it is skipped.
+        if (ro.pointer) |p| if (p.on_up != null and p.on_scroll == null) return ro;
     }
     if (el.child) |c| {
         if (findTappable(c)) |ro| return ro;
