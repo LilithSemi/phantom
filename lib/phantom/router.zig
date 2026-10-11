@@ -827,6 +827,43 @@ test "unmounting the router that holds the owner's slot releases it" {
     try std.testing.expect(h.owner.router == null);
 }
 
+const RouterWrap = struct {
+    pub const State = struct {
+        base: phantom.StateBase = .{},
+        wrapped: bool = false,
+
+        pub fn build(s: *@This(), b: *BuildContext) anyerror!Widget {
+            const r = b.new(Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage }).widget();
+            if (!s.wrapped) return r;
+            return b.new(phantom.Padding{ .insets = .all(1), .child = r }).widget();
+        }
+    };
+
+    pub fn widget(self: *const RouterWrap) Widget {
+        return phantom.StatefulWidget(RouterWrap, self);
+    }
+};
+
+fn wrapRouter(s: *RouterWrap.State) void {
+    s.wrapped = true;
+}
+
+test "a router replaced by a wrapped router leaves the new one in the owner's slot" {
+    var wrap = RouterWrap{};
+    var h = try phantom.testing.mount(std.testing.allocator, wrap.widget());
+    defer h.deinit();
+    try h.pump();
+    try std.testing.expect(h.owner.router != null);
+
+    const wrap_state = try h.stateOf(phantom.testing.find.byType(RouterWrap), RouterWrap.State);
+    phantom.setState(wrap_state, wrapRouter);
+    try h.pump();
+
+    const state = try h.stateOf(phantom.testing.find.byType(Router), Router.State);
+    try std.testing.expect(h.owner.router != null);
+    try std.testing.expect(h.owner.router.?.state == state);
+    try h.expectNoFaults();
+}
 test "a pop marks the route as changed, so the page it returns to starts at the top" {
     const r = Router{ .routes = &test_routes, .initial = "/", .not_found = missingPage };
     var h = try phantom.testing.mount(std.testing.allocator, r.widget());

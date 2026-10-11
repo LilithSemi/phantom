@@ -129,8 +129,10 @@ pub const Element = struct {
     ///   new == null      -> unmount old (if any), return null
     ///   old == null      -> mount new, return fresh element
     ///   same vtable      -> update old in place, return old
-    ///   different vtable  -> mount new, unmount old, return fresh
-    /// On an error `old` is still alive, and the caller still owns it.
+    ///   different vtable  -> unmount old, mount new, return fresh
+    /// A replacement that fails to mount is a `build_failed` fault and gives
+    /// null. So an error comes only from an update in place or a mount into
+    /// an empty slot, and `old` is then still alive.
     pub fn updateChild(self: *Element, old: ?*Element, new_widget: ?Widget, bctx: *BuildContext) anyerror!?*Element {
         const gpa = bctx.owner.gpa;
         if (new_widget == null) {
@@ -143,12 +145,16 @@ pub const Element = struct {
                 try nw.update(o, bctx);
                 return o;
             }
+            // The old subtree goes first, so its dispose runs before the new
+            // initState. A Router gives up the address slot before the next
+            // one takes it.
+            o.deinit(gpa);
+            return nw.mount(bctx, self) catch |e| {
+                bctx.owner.sink.report(.build_failed, @errorName(e));
+                return null;
+            };
         }
-        // The new element mounts first, so a failed mount leaves `old` in
-        // its slot and alive.
-        const fresh = try nw.mount(bctx, self);
-        if (old) |o| o.deinit(gpa);
-        return fresh;
+        return try nw.mount(bctx, self);
     }
 
     /// Positionally reconcile `self.children` against `new_widgets` (no keys):
@@ -163,7 +169,12 @@ pub const Element = struct {
         for (new_widgets, 0..) |w, i| {
             if (i < self.children.items.len) {
                 const updated = try self.updateChild(self.children.items[i], w, bctx);
-                self.children.items[i] = updated.?;
+                // A replacement that failed to mount leaves no child here.
+                // The fault is reported, so the rest waits for the next build.
+                self.children.items[i] = updated orelse {
+                    _ = self.children.orderedRemove(i);
+                    return;
+                };
             } else {
                 const mounted = try w.mount(bctx, self);
                 errdefer mounted.deinit(gpa);
@@ -412,6 +423,12 @@ test "updateChildren that runs out of memory keeps each child alive or frees it"
             failed += 1;
             continue;
         };
+        // A replacement that failed to mount is a fault and an empty slot.
+        if (sink.count > 0) {
+            failed += 1;
+            try std.testing.expect(parent.children.items.len < 3);
+            continue;
+        }
         try std.testing.expectEqual(@as(usize, 3), parent.children.items.len);
         break;
     }
