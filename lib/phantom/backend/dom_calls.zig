@@ -1,12 +1,10 @@
 const std = @import("std");
 const display_list = @import("../display_list.zig");
 const geometry = @import("../geometry.zig");
-const dom = @import("dom.zig");
+const vdom = @import("vdom.zig");
 const text = @import("../text.zig");
 const image_mod = @import("../image/Image.zig");
-const icon_builtin = @import("../icon/builtin.zig");
 const pointer = @import("../pointer.zig");
-const svg_path = @import("../icon/svg_path.zig");
 const platform = @import("../platform.zig");
 const web_net = @import("../web_net.zig");
 const FaultSink = @import("../FaultSink.zig");
@@ -192,24 +190,9 @@ pub const DomOps = struct {
     }
 };
 
-/// Build the @font-face CSS block for a list of fonts. Call once at init and
-/// inject a single <style> into <head>. Caller owns the returned slice.
-/// The CSS family name for a font.
-///
-/// Derived from the font's own address, NOT from its position in a collected
-/// list, and that is a correctness fix rather than a style choice. The faces are
-/// declared once from the fonts the FIRST render used, while every later frame
-/// names a font by its index in ITS OWN collection. A frame whose text uses a
-/// different set, or the same set in a different order, would then ask for a
-/// family that was declared for another font, and the page would draw in the
-/// wrong one with nothing to indicate it. An address is the same in both places
-/// by construction, so the two cannot drift apart.
-pub fn fontFamily(buf: []u8, font_ptr: *const text.Font) []const u8 {
-    return std.fmt.bufPrint(buf, "pf{x}", .{@intFromPtr(font_ptr)}) catch "pf0";
-}
-
-/// The buffer `fontFamily` needs: "pf" and a pointer in hex.
-pub const family_len = 2 + @sizeOf(usize) * 2;
+/// The CSS family name for a font. See `vdom.fontFamily`.
+pub const fontFamily = vdom.fontFamily;
+pub const family_len = vdom.family_len;
 
 /// The CSS source descriptor for a font: what goes after `src:` in an
 /// `@font-face` rule, and what the `FontFace` constructor takes as its second
@@ -258,11 +241,7 @@ pub fn fontFaceCss(gpa: std.mem.Allocator, fonts: []const *text.Font) ![]u8 {
     return buf.toOwnedSlice(gpa);
 }
 
-/// How many clip/scroll regions can nest before `render` refuses to open any
-/// more and reports a fault instead of corrupting the frame. A real page nests
-/// a handful of regions at most; this catches a runaway or malformed display
-/// list rather than reading or writing past a fixed stack.
-pub const max_region_depth = 32;
+pub const max_region_depth = vdom.max_region_depth;
 
 /// How many scroll regions `render` remembers offsets for across a rebuild.
 /// Unlike `max_region_depth`, this counts every open region in one frame, not
@@ -310,10 +289,6 @@ pub const PageState = struct {
     }
 };
 
-/// The most node handles one primitive creates: an icon makes an svg, a
-/// title and a path.
-const max_nodes_per_primitive = 3;
-
 /// Records each handle `render` creates, when the caller keeps them.
 const Made = struct {
     nodes: ?*std.ArrayList(u32),
@@ -334,14 +309,99 @@ fn previousRegion(targets: []const ?*pointer.PointerHandlers, index: usize, h: ?
     return null;
 }
 
-/// One open clip or scroll region: the append target and coordinate origin its
-/// matching push saw before it changed them. A pop restores exactly this, so a
-/// region nested inside another one cannot leak its coordinates into whatever
-/// comes after it.
-const RegionFrame = struct {
-    parent: u32,
-    origin: ?geometry.PhysicalOffset,
+/// Last frame's scroll state, which `render` reads before it clears the body.
+const ScrollPass = struct {
+    mem: ?*ScrollMemory,
+    sink: ?*FaultSink,
+    reset_scroll: bool,
+    saved: [max_scroll_regions]geometry.PhysicalOffset = undefined,
+    saved_count: usize = 0,
+    prev_targets: [max_scroll_regions]?*pointer.PointerHandlers = undefined,
+    prev_moved: [max_scroll_regions]u32 = undefined,
+    prev_count: usize = 0,
+
+    /// Gives a new scroll region its offset and records it in `mem`. `outer`
+    /// must already hold its inner div: before that it has nothing to scroll
+    /// to, and a browser clamps any offset back to zero. The browser's offset
+    /// wins, because the visitor can be in the middle of a scroll. Phantom's
+    /// offset wins for a region that phantom moved since the last frame, and
+    /// for a region that is new to the page. After a navigation every other
+    /// region goes to the top.
+    fn place(self: *ScrollPass, ops: DomOps, outer: u32, sr: *const display_list.ScrollRegion) !void {
+        const m = self.mem orelse return;
+        if (m.count >= max_scroll_regions) {
+            if (self.sink) |s| s.report(.region_overflow, "scroll region count exceeded max_scroll_regions, offset not tracked");
+            return;
+        }
+        const i = m.count;
+        const prev = previousRegion(self.prev_targets[0..self.prev_count], i, sr.handlers);
+        var shown: ?geometry.PhysicalOffset = null;
+        if (prev != null and sr.handlers != null and self.prev_moved[prev.?] != sr.moved) {
+            ops.writeScrollOffset(outer, sr.offset);
+            shown = sr.offset;
+        } else if (self.reset_scroll) {
+            shown = geometry.PhysicalOffset.zero;
+        } else if (prev) |j| {
+            if (j < self.saved_count) {
+                ops.writeScrollOffset(outer, self.saved[j]);
+                shown = self.saved[j];
+            }
+        } else if (sr.offset.x != 0 or sr.offset.y != 0) {
+            ops.writeScrollOffset(outer, sr.offset);
+        }
+        // The view takes the offset that the div shows.
+        if (shown) |to| {
+            if (sr.handlers) |h| {
+                if (h.on_scroll_to) |scroll_to| {
+                    if (scroll_to(h.ctx, to.x, to.y)) m.synced = true;
+                }
+            }
+        }
+        // The page reports a scroll on this div by this index.
+        var index_buf: [20]u8 = undefined;
+        const index = try std.fmt.bufPrint(&index_buf, "{d}", .{m.count});
+        ops.setAttribute(outer, "data-phantom-scroll", index);
+        m.handles[m.count] = outer;
+        m.targets[m.count] = sr.handlers;
+        m.moved[m.count] = sr.moved;
+        m.count += 1;
+    }
 };
+
+/// Creates one node with its attributes, style and text, and appends it to
+/// `parent`. Its children are left to the caller.
+fn createNode(ops: DomOps, made: Made, node: vdom.Node, parent: u32) u32 {
+    const handle = made.add(switch (node.kind) {
+        .element => ops.createElement(node.tag),
+        .element_svg => ops.createElementNs(svg_ns, node.tag),
+        .text => ops.createTextNode(node.text),
+    });
+    if (node.kind != .text) {
+        for (node.attrs) |attr| ops.setAttribute(handle, attr.name, attr.value);
+        if (node.style.len > 0) ops.setStyle(handle, node.style);
+        if (node.text.len > 0) ops.setTextContent(handle, node.text);
+    }
+    ops.appendChild(parent, handle);
+    return handle;
+}
+
+/// Creates `node` and its subtree under `parent`, parent first. A scroll
+/// region gets its offset after its inner div is attached and before its
+/// content, so regions are numbered in the order they open. Recursion is
+/// bounded by `vdom.max_tree_depth`.
+fn createTree(ops: DomOps, made: Made, pass: *ScrollPass, node: vdom.Node, parent: u32, depth: usize) !void {
+    std.debug.assert(depth < vdom.max_tree_depth);
+    const handle = createNode(ops, made, node, parent);
+    var content = node;
+    var content_handle = handle;
+    if (node.scroll) |sr| {
+        std.debug.assert(node.children.len == 1);
+        content = node.children[0];
+        content_handle = createNode(ops, made, content, handle);
+        try pass.place(ops, handle, sr);
+    }
+    for (content.children) |child| try createTree(ops, made, pass, child, content_handle, depth + 1);
+}
 
 /// Rebuild the whole document body's child tree from the display list. `sink`
 /// records a fault when the display list nests more clip/scroll regions than
@@ -369,27 +429,26 @@ const RegionFrame = struct {
 /// releases them before it clears the body. It also keeps each interactive
 /// rule in the page sheet once, so a rule is added only for a new class.
 pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink, mem: ?*ScrollMemory, page: ?*PageState, reset_scroll: bool) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const tree = try vdom.build(arena_state.allocator(), list, viewport, bg, sink);
+
     // Read every remembered region's live offset before its div is destroyed
     // below. Skipped on a navigation (the new page starts at the top) and
     // when the host cannot read scroll position at all.
-    var saved: [max_scroll_regions]geometry.PhysicalOffset = undefined;
-    var saved_count: usize = 0;
-    var prev_targets: [max_scroll_regions]?*pointer.PointerHandlers = undefined;
-    var prev_moved: [max_scroll_regions]u32 = undefined;
-    var prev_count: usize = 0;
+    var pass: ScrollPass = .{ .mem = mem, .sink = sink, .reset_scroll = reset_scroll };
     if (mem) |m| {
         m.synced = false;
-        prev_count = m.count;
-        @memcpy(prev_targets[0..prev_count], m.targets[0..prev_count]);
-        @memcpy(prev_moved[0..prev_count], m.moved[0..prev_count]);
+        pass.prev_count = m.count;
+        @memcpy(pass.prev_targets[0..m.count], m.targets[0..m.count]);
+        @memcpy(pass.prev_moved[0..m.count], m.moved[0..m.count]);
         if (!reset_scroll and ops.read_scroll_offset != null) {
             for (m.handles[0..m.count]) |h| {
-                saved[saved_count] = ops.readScrollOffset(h) orelse break;
-                saved_count += 1;
+                pass.saved[pass.saved_count] = ops.readScrollOffset(h) orelse break;
+                pass.saved_count += 1;
             }
         }
-        // This frame's regions are recorded fresh as they are created below,
-        // in the loop over `list.primitives`.
+        // This frame's regions are recorded fresh as they are created.
         m.count = 0;
     }
 
@@ -400,389 +459,34 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
     if (page) |pg| {
         for (pg.nodes.items) |h| ops.releaseNode(h);
         pg.nodes.clearRetainingCapacity();
-        try pg.nodes.ensureTotalCapacity(gpa, 1 + max_nodes_per_primitive * list.primitives.items.len);
+        try pg.nodes.ensureTotalCapacity(gpa, tree.count);
         made.nodes = &pg.nodes;
     }
 
     ops.clearChildren(ops.body);
+    try createTree(ops, made, &pass, tree.root, ops.body, 0);
 
-    // Collect distinct fonts once; used for text primitive font-family index lookups.
-    const fonts = try dom.collectFonts(gpa, list);
-    defer gpa.free(fonts);
-
-    // Layout container: position:relative, viewport-sized, branded bg.
-    const container = made.add(ops.createElement("div"));
-    {
-        const style = try gpa.print("position:relative;width:{d}px;height:{d}px;background:rgb({d},{d},{d})", .{ viewport.width, viewport.height, dom.ch(bg.r), dom.ch(bg.g), dom.ch(bg.b) });
-        defer gpa.free(style);
-        ops.setStyle(container, style);
+    // The rules of classes new to the page go to a sheet with no element. A
+    // strict policy refuses a `<style>` element even while it is empty. See
+    // `DomOps.add_rule`.
+    var css: std.ArrayList(u8) = .empty;
+    defer css.deinit(gpa);
+    var fresh: usize = 0;
+    for (tree.rules) |rule| {
+        if (page) |pg| {
+            if (pg.rules.contains(rule.hash)) continue;
+        }
+        try css.appendSlice(gpa, rule.css);
+        fresh += 1;
     }
-    ops.appendChild(ops.body, container);
-
-    // parent is where children append (the container, or a scroll/clip region's
-    // inner div). region_origin subtracts the region's own origin from child
-    // coords. Regions nest, so `region_stack` keeps every open one's parent and
-    // origin, and each pop restores exactly the frame its push saved.
-    var parent: u32 = container;
-    var region_origin: ?geometry.PhysicalOffset = null;
-    var region_stack: [max_region_depth]RegionFrame = undefined;
-    var region_depth: usize = 0;
-    // Opens refused past `max_region_depth`, so a later pop can tell it was
-    // never recorded and must not touch `region_stack`.
-    var region_skipped: usize = 0;
-
-    // The :hover and :active rules of classes new to the page, added after the
-    // loop, and the hashes of those classes.
-    var rules: std.ArrayList(u8) = .empty;
-    defer rules.deinit(gpa);
-    var fresh: std.ArrayList(u64) = .empty;
-    defer fresh.deinit(gpa);
-
-    for (list.primitives.items) |p| switch (p) {
-        .rrect => |r| {
-            const ox: f32 = if (region_origin) |o| o.x else 0;
-            const oy: f32 = if (region_origin) |o| o.y else 0;
-            var abuf: [8]u8 = undefined;
-
-            if (r.hover_color == null and r.active_color == null) {
-                // Non-interactive: plain fill or stroke.
-                if (r.stroke_width > 0) {
-                    // Stroke rrect: border ring, no fill.
-                    const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
-                    defer gpa.free(style);
-                    const node = made.add(ops.createElement("div"));
-                    ops.setStyle(node, style);
-                    ops.appendChild(parent, node);
-                } else {
-                    // Plain fill rrect (kept identical to Task 1).
-                    const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;background:rgba({d},{d},{d},{s})", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
-                    defer gpa.free(style);
-                    const node = made.add(ops.createElement("div"));
-                    ops.setStyle(node, style);
-                    ops.appendChild(parent, node);
-                }
-            } else {
-                // Interactive rrect. The class name is a hash of the rule text,
-                // so the same colours give the same class on every frame and
-                // the page sheet gets each rule once.
-                const prop = if (r.stroke_width > 0) "border-color" else "background";
-                var hover_buf: [state_decl_len]u8 = undefined;
-                var active_buf: [state_decl_len]u8 = undefined;
-                const hover = if (r.hover_color) |h| stateDecl(&hover_buf, prop, h) else "";
-                const active = if (r.active_color) |ac| stateDecl(&active_buf, prop, ac) else "";
-                var hasher = std.hash.Wyhash.init(0);
-                hasher.update(hover);
-                hasher.update("|");
-                hasher.update(active);
-                const key = hasher.final();
-                var cls_buf: [class_len]u8 = undefined;
-                const cls_val = std.fmt.bufPrint(&cls_buf, "pb-{x}", .{key}) catch unreachable;
-
-                const node = made.add(ops.createElement("div"));
-                ops.setAttribute(node, "class", cls_val);
-                if (r.stroke_width > 0) {
-                    const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
-                    defer gpa.free(style);
-                    ops.setStyle(node, style);
-                } else {
-                    const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;background:rgba({d},{d},{d},{s})", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
-                    defer gpa.free(style);
-                    ops.setStyle(node, style);
-                }
-                ops.appendChild(parent, node);
-
-                const known = if (page) |pg| pg.rules.contains(key) else false;
-                if (!known and std.mem.indexOfScalar(u64, fresh.items, key) == null) {
-                    try fresh.append(gpa, key);
-                    if (hover.len > 0) {
-                        const rule = try gpa.print(".{s}:hover{{{s}}}", .{ cls_val, hover });
-                        defer gpa.free(rule);
-                        try rules.appendSlice(gpa, rule);
-                    }
-                    if (active.len > 0) {
-                        const rule = try gpa.print(".{s}:active{{{s}}}", .{ cls_val, active });
-                        defer gpa.free(rule);
-                        try rules.appendSlice(gpa, rule);
-                    }
-                    // A pointer cursor is the browser's own affordance for "this
-                    // responds to a tap", so every interactive rectangle gets one.
-                    const cursor_rule = try gpa.print(".{s}{{cursor:pointer}}", .{cls_val});
-                    defer gpa.free(cursor_rule);
-                    try rules.appendSlice(gpa, cursor_rule);
-                }
-            }
-        },
-        .image => |img| {
-            const im: *image_mod.Image = @ptrCast(@alignCast(img.image));
-            if (im.bytes.len == 0) continue; // no encoded bytes -> nothing to <img> (v1: fromRgba images skipped on web)
-            const ox: f32 = if (region_origin) |o| o.x else 0;
-            const oy: f32 = if (region_origin) |o| o.y else 0;
-            const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px", .{ img.rect.x - ox, img.rect.y - oy, img.rect.width, img.rect.height });
-            defer gpa.free(style);
-            const enc = std.base64.standard.Encoder;
-            const b64 = try gpa.alloc(u8, enc.calcSize(im.bytes.len));
-            defer gpa.free(b64);
-            _ = enc.encode(b64, im.bytes);
-            const src = try gpa.print("data:{s};base64,{s}", .{ image_mod.Image.mime(im.format), b64 });
-            defer gpa.free(src);
-            const node = made.add(ops.createElement("img"));
-            ops.setStyle(node, style);
-            ops.setAttribute(node, "src", src);
-            ops.appendChild(parent, node);
-        },
-        .icon => |ic| {
-            const ox: f32 = if (region_origin) |o| o.x else 0;
-            const oy: f32 = if (region_origin) |o| o.y else 0;
-            const icon_path = icon_builtin.pathFor(ic.id);
-
-            // The viewBox is the authoring grid and width/height are the size
-            // the frontend asked for, so the browser does the scaling and one
-            // centreline serves every size. That also fixes stroke-width in
-            // GRID units: scaling it here as well would square the factor.
-            var gbuf: [svg_path.coord_len]u8 = undefined;
-            const grid_s = svg_path.coord(&gbuf, icon_builtin.grid);
-            const view_box = try gpa.print("0 0 {s} {s}", .{ grid_s, grid_s });
-            defer gpa.free(view_box);
-            const w_s = try gpa.print("{d}", .{ic.size.width});
-            defer gpa.free(w_s);
-            const h_s = try gpa.print("{d}", .{ic.size.height});
-            defer gpa.free(h_s);
-            const style = try gpa.print("position:absolute;left:{d}px;top:{d}px", .{ ic.origin.x - ox, ic.origin.y - oy });
-            defer gpa.free(style);
-
-            const svg = made.add(ops.createElementNs(svg_ns, "svg"));
-            ops.setAttribute(svg, "viewBox", view_box);
-            // See `dom.zig`: without this the browser centres the square grid in
-            // a box that is not square and the mark comes out short.
-            ops.setAttribute(svg, "preserveAspectRatio", "none");
-            ops.setAttribute(svg, "width", w_s);
-            ops.setAttribute(svg, "height", h_s);
-            ops.setStyle(svg, style);
-
-            // `<title>` is the accessible name of an inline SVG, and the first
-            // child is the one a screen reader reads, so it goes in before the
-            // path. It is written only when there is a name: an empty title
-            // takes the name slot and then announces nothing, which is worse
-            // than a mark with no title at all.
-            if (ic.label) |name| {
-                const title = made.add(ops.createElementNs(svg_ns, "title"));
-                ops.setTextContent(title, name);
-                ops.appendChild(svg, title);
-            }
-
-            const d = try svg_path.data(gpa, icon_path, icon_builtin.grid);
-            defer gpa.free(d);
-            var abuf: [8]u8 = undefined;
-            const stroke = try gpa.print("rgba({d},{d},{d},{s})", .{
-                dom.ch(ic.color.r), dom.ch(ic.color.g), dom.ch(ic.color.b), dom.alpha(&abuf, ic.color.a),
-            });
-            defer gpa.free(stroke);
-            var sbuf: [svg_path.coord_len]u8 = undefined;
-
-            const node = made.add(ops.createElementNs(svg_ns, "path"));
-            ops.setAttribute(node, "d", d);
-            // A centreline filled rather than stroked draws as a solid blob.
-            ops.setAttribute(node, "fill", "none");
-            ops.setAttribute(node, "stroke", stroke);
-            ops.setAttribute(node, "stroke-width", svg_path.coord(&sbuf, icon_path.stroke.width));
-            ops.setAttribute(node, "stroke-linecap", svg_path.lineCap(icon_path.stroke.cap));
-            ops.setAttribute(node, "stroke-linejoin", svg_path.lineJoin(icon_path.stroke.join));
-            ops.appendChild(svg, node);
-            ops.appendChild(parent, svg);
-        },
-        .text => |run| {
-            // A zero length run has nothing to draw, and it is not safe to give
-            // one to the host. An empty slice carries the allocator's dangling
-            // pointer, and the JS side builds a memory view from that pointer
-            // before it reads the length, so it throws on a view it never
-            // needed. A blank line in a code block produces exactly this run.
-            if (run.text.len == 0) continue;
-            const ox: f32 = if (region_origin) |o| o.x else 0;
-            const oy: f32 = if (region_origin) |o| o.y else 0;
-            const font_ptr: *text.Font = @ptrCast(@alignCast(run.font));
-            // Named by the font itself, not by where it landed in this frame's
-            // collection. See `fontFamily`: the faces were declared once from
-            // the first frame's fonts, so an index would name a different font
-            // the moment a later frame used a different set.
-            var fam: [family_len]u8 = undefined;
-            const family = fontFamily(&fam, font_ptr);
-            var tbuf: [8]u8 = undefined;
-            // `white-space:pre` because this framework already decided where
-            // every line breaks and how wide each run is. Without it a browser
-            // applies its own rules to the run: it collapses each stretch of
-            // spaces to one, drops the leading spaces of a line, and may break
-            // the run again at a width of its own choosing. Indented source in
-            // a code block loses its indentation to exactly that.
-            const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;white-space:pre;font-family:{s};font-size:{d}px;color:rgba({d},{d},{d},{s})", .{ run.origin.x - ox, run.origin.y - oy, family, run.size, dom.ch(run.color.r), dom.ch(run.color.g), dom.ch(run.color.b), dom.alpha(&tbuf, run.color.a) });
-            defer gpa.free(style);
-            const decl = try gpa.print("{s}{s}{s}", .{
-                style,
-                if (run.italic and !font_ptr.isItalic()) ";font-style:italic" else "",
-                if (run.underline) ";text-decoration:underline" else "",
-            });
-            defer gpa.free(decl);
-            const node = made.add(ops.createElement("div"));
-            ops.setStyle(node, decl);
-            ops.setTextContent(node, run.text);
-            ops.appendChild(parent, node);
-        },
-        .push_scroll => |sr| {
-            if (region_depth >= max_region_depth) {
-                region_skipped += 1;
-                if (sink) |s| s.report(.region_overflow, "scroll region nesting exceeded max_region_depth, region skipped");
-            } else {
-                const ox: f32 = if (region_origin) |o| o.x else 0;
-                const oy: f32 = if (region_origin) |o| o.y else 0;
-                // Outer div: clipping/scrolling window at the viewport position and
-                // size, relative to whatever region this one is nested inside.
-                const outer_style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll", .{ sr.viewport.x - ox, sr.viewport.y - oy, sr.viewport.width, sr.viewport.height });
-                defer gpa.free(outer_style);
-                const outer = made.add(ops.createElement("div"));
-                ops.setStyle(outer, outer_style);
-                ops.appendChild(parent, outer);
-                // Inner div: the full content area that scrolls inside the outer.
-                const inner_style = try gpa.print("position:relative;width:{d}px;height:{d}px", .{ sr.content.width, sr.content.height });
-                defer gpa.free(inner_style);
-                const inner = made.add(ops.createElement("div"));
-                ops.setStyle(inner, inner_style);
-                ops.appendChild(outer, inner);
-                // Give the region the saved offset of last frame's region with
-                // the same handlers, then remember its handle so the render
-                // after next can read the offset back. Must come after `inner`
-                // is attached: `outer` has nothing to scroll to before that,
-                // so a browser clamps any offset back to zero rather than
-                // holding it for content not there yet. The browser's offset
-                // wins, because the visitor can be in the middle of a scroll.
-                // Phantom's offset wins for a region that phantom moved since
-                // the last frame, and for a region that is new to the page.
-                // After a navigation every other region goes to the top.
-                if (mem) |m| {
-                    if (m.count < max_scroll_regions) {
-                        const i = m.count;
-                        const prev = previousRegion(prev_targets[0..prev_count], i, sr.handlers);
-                        var shown: ?geometry.PhysicalOffset = null;
-                        if (prev != null and sr.handlers != null and prev_moved[prev.?] != sr.moved) {
-                            ops.writeScrollOffset(outer, sr.offset);
-                            shown = sr.offset;
-                        } else if (reset_scroll) {
-                            shown = geometry.PhysicalOffset.zero;
-                        } else if (prev) |j| {
-                            if (j < saved_count) {
-                                ops.writeScrollOffset(outer, saved[j]);
-                                shown = saved[j];
-                            }
-                        } else if (sr.offset.x != 0 or sr.offset.y != 0) {
-                            ops.writeScrollOffset(outer, sr.offset);
-                        }
-                        // The view takes the offset that the div shows.
-                        if (shown) |to| {
-                            if (sr.handlers) |h| {
-                                if (h.on_scroll_to) |scroll_to| {
-                                    if (scroll_to(h.ctx, to.x, to.y)) m.synced = true;
-                                }
-                            }
-                        }
-                        // The page reports a scroll on this div by this index.
-                        var index_buf: [20]u8 = undefined;
-                        const index = try std.fmt.bufPrint(&index_buf, "{d}", .{m.count});
-                        ops.setAttribute(outer, "data-phantom-scroll", index);
-                        m.handles[m.count] = outer;
-                        m.targets[m.count] = sr.handlers;
-                        m.moved[m.count] = sr.moved;
-                        m.count += 1;
-                    } else if (sink) |s| {
-                        s.report(.region_overflow, "scroll region count exceeded max_scroll_regions, offset not tracked");
-                    }
-                }
-                // Children now append to the inner div; coords subtract the
-                // viewport origin. The frame this push saw goes on the stack, so
-                // the matching pop restores exactly it and not the top level.
-                region_stack[region_depth] = .{ .parent = parent, .origin = region_origin };
-                region_depth += 1;
-                parent = inner;
-                region_origin = .{ .x = sr.viewport.x, .y = sr.viewport.y };
-            }
-        },
-        .pop_scroll => {
-            if (region_skipped > 0) {
-                // This pop matches a push that was refused for depth, not one
-                // that opened a region, so there is no frame to restore.
-                region_skipped -= 1;
-            } else if (region_depth > 0) {
-                region_depth -= 1;
-                const frame = region_stack[region_depth];
-                parent = frame.parent;
-                region_origin = frame.origin;
-            } else {
-                // A pop with no matching push is a malformed display list, a
-                // runtime fault and not a programmer error, so it falls back to
-                // the top level rather than reading before an empty stack.
-                parent = container;
-                region_origin = null;
-            }
-        },
-        .push_clip => |cr| {
-            if (region_depth >= max_region_depth) {
-                region_skipped += 1;
-                if (sink) |s| s.report(.region_overflow, "clip region nesting exceeded max_region_depth, region skipped");
-            } else {
-                const ox: f32 = if (region_origin) |o| o.x else 0;
-                const oy: f32 = if (region_origin) |o| o.y else 0;
-                // A browser clips to the full rounded shape, so this backend is
-                // the one that honours the radius exactly. Positioned relative to
-                // whatever region this clip is nested inside, like every other
-                // primitive here.
-                const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;overflow:hidden", .{ cr.rect.x - ox, cr.rect.y - oy, cr.rect.width, cr.rect.height, cr.radius });
-                defer gpa.free(style);
-                const node = made.add(ops.createElement("div"));
-                ops.setStyle(node, style);
-                ops.appendChild(parent, node);
-                // Children now append inside the clip; coords subtract its origin.
-                region_stack[region_depth] = .{ .parent = parent, .origin = region_origin };
-                region_depth += 1;
-                parent = node;
-                region_origin = .{ .x = cr.rect.x, .y = cr.rect.y };
-            }
-        },
-        .pop_clip => {
-            if (region_skipped > 0) {
-                region_skipped -= 1;
-            } else if (region_depth > 0) {
-                region_depth -= 1;
-                const frame = region_stack[region_depth];
-                parent = frame.parent;
-                region_origin = frame.origin;
-            } else {
-                parent = container;
-                region_origin = null;
-            }
-        },
-    };
-
-    // The interactive rules, if any were accumulated.
-    // No element is created here any more. A `<style>` element is refused by a
-    // strict policy the moment it enters the document, even empty, so the rules
-    // go to a sheet that has no element at all. See `DomOps.add_rule`.
-    if (rules.items.len > 0) ops.addRule(rules.items);
+    if (css.items.len > 0) ops.addRule(css.items);
     if (page) |pg| {
-        pg.rules.ensureUnusedCapacity(gpa, @intCast(fresh.items.len)) catch {
+        pg.rules.ensureUnusedCapacity(gpa, @intCast(fresh)) catch {
             if (sink) |s| s.report(.oom, "interactive rules were not remembered, so the next frame adds them again");
             return;
         };
-        for (fresh.items) |key| pg.rules.putAssumeCapacity(key, {});
+        for (tree.rules) |rule| pg.rules.putAssumeCapacity(rule.hash, {});
     }
-}
-
-/// Room for "border-color:rgba(255,255,255," and an alpha from `dom.alpha`.
-const state_decl_len = 64;
-/// "pb-" and a u64 in hex.
-const class_len = 3 + 16;
-
-/// The declaration a :hover or :active rule sets, such as
-/// `background:rgba(1,2,3,0.5)`.
-fn stateDecl(buf: *[state_decl_len]u8, prop: []const u8, c: geometry.Color) []const u8 {
-    var abuf: [8]u8 = undefined;
-    return std.fmt.bufPrint(buf, "{s}:rgba({d},{d},{d},{s})", .{ prop, dom.ch(c.r), dom.ch(c.g), dom.ch(c.b), dom.alpha(&abuf, c.a) }) catch unreachable;
 }
 
 // Recording mock for tests. No global mutable state: each fn casts ctx to *Recorder.
@@ -2167,4 +1871,73 @@ test "dom_calls: a stroke and a fill with the same state colours get different c
     try std.testing.expect(!std.mem.eql(u8, classAt(rec.log.items, 0).?, classAt(rec.log.items, 1).?));
     try std.testing.expect(contains(rec.log.items, ":hover{border-color:"));
     try std.testing.expect(contains(rec.log.items, ":hover{background:"));
+}
+
+/// The handles `createElement` lines in `log` returned, into `out`.
+fn createdHandles(log: []const []u8, out: []u32) []u32 {
+    var n: usize = 0;
+    for (log) |l| {
+        out[n] = createdHandle(l) orelse continue;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "dom_calls: after a render fails partway, the next render releases exactly the handles it made" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .push_clip = .{ .rect = .{ .x = 0, .y = 0, .width = 50, .height = 50 } } });
+    try list.append(gpa, .{ .rrect = .{
+        .rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+        .radius = 0,
+        .color = geometry.Color.rgb(1, 0, 0),
+        .hover_color = geometry.Color.rgb(0, 1, 0),
+    } });
+    try list.append(gpa, .{ .pop_clip = {} });
+    const size: geometry.PhysicalSize = .{ .width = 100, .height = 100 };
+    const bg = geometry.Color.rgb(0, 0, 0);
+
+    try render(gpa, rec.ops(), list, size, bg, null, null, &page, false);
+    var partway: usize = 0;
+    var fail_index: usize = 0;
+    while (fail_index < 256) : (fail_index += 1) {
+        // A rule new to the page makes the render allocate after it made
+        // its nodes, which is the failure this test is for.
+        page.rules.clearRetainingCapacity();
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        const failed_start = rec.log.items.len;
+        render(failing.allocator(), rec.ops(), list, size, bg, null, null, &page, false) catch {
+            var made_buf: [8]u32 = undefined;
+            const made = createdHandles(rec.log.items[failed_start..], &made_buf);
+            const good_start = rec.log.items.len;
+            try render(gpa, rec.ops(), list, size, bg, null, null, &page, false);
+            if (made.len == 0) continue;
+            partway += 1;
+            const good = rec.log.items[good_start..];
+            try std.testing.expectEqual(made.len, countLines(good, "release("));
+            var buf: [32]u8 = undefined;
+            for (made) |h| {
+                try std.testing.expectEqual(@as(usize, 1), countLines(good, try std.fmt.bufPrint(&buf, "release({d})", .{h})));
+            }
+            continue;
+        };
+        break;
+    }
+    try std.testing.expect(fail_index < 256);
+    try std.testing.expect(partway > 0);
+
+    // Every node of every frame but the last is released once.
+    var all_buf: [256]u32 = undefined;
+    const all = createdHandles(rec.log.items, &all_buf);
+    var buf: [32]u8 = undefined;
+    for (all) |h| {
+        const live = std.mem.indexOfScalar(u32, page.nodes.items, h) != null;
+        const want: usize = if (live) 0 else 1;
+        try std.testing.expectEqual(want, countLines(rec.log.items, try std.fmt.bufPrint(&buf, "release({d})", .{h})));
+    }
 }

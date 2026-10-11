@@ -3,8 +3,7 @@ const dl = @import("../display_list.zig");
 const geom = @import("../geometry.zig");
 const text = @import("../text.zig");
 const image_mod = @import("../image/Image.zig");
-const icon_builtin = @import("../icon/builtin.zig");
-const svg_path = @import("../icon/svg_path.zig");
+const vdom = @import("vdom.zig");
 
 pub fn ch(v: f32) u8 {
     const scaled = std.math.clamp(v, 0.0, 1.0) * 255.0;
@@ -47,220 +46,78 @@ pub fn collectFonts(gpa: std.mem.Allocator, list: dl.DisplayList) ![]const *text
     return ptrs.toOwnedSlice(gpa);
 }
 
-/// Write HTML-escaped text (escaping &, <, >) into buf.
+/// Write `s` into buf with &, <, > and " escaped, so it is safe as text and as
+/// a quoted attribute value.
 fn appendEscaped(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
     for (s) |byte| {
         switch (byte) {
             '&' => try buf.appendSlice(gpa, "&amp;"),
             '<' => try buf.appendSlice(gpa, "&lt;"),
             '>' => try buf.appendSlice(gpa, "&gt;"),
+            '"' => try buf.appendSlice(gpa, "&quot;"),
             else => try buf.append(gpa, byte),
         }
     }
 }
 
+/// Print `node` and its subtree. Recursion is bounded by
+/// `vdom.max_tree_depth`.
+fn appendNode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, node: vdom.Node, depth: usize) !void {
+    std.debug.assert(depth < vdom.max_tree_depth);
+    if (node.kind == .text) return appendEscaped(buf, gpa, node.text);
+    try buf.print(gpa, "<{s}", .{node.tag});
+    for (node.attrs) |attr| {
+        try buf.print(gpa, " {s}=\"", .{attr.name});
+        try appendEscaped(buf, gpa, attr.value);
+        try buf.append(gpa, '"');
+    }
+    if (node.style.len > 0) {
+        try buf.appendSlice(gpa, " style=\"");
+        try appendEscaped(buf, gpa, node.style);
+        try buf.append(gpa, '"');
+    }
+    if (std.mem.eql(u8, node.tag, "img")) return buf.append(gpa, '>');
+    if (node.kind == .element_svg and node.children.len == 0 and node.text.len == 0) {
+        return buf.appendSlice(gpa, "/>");
+    }
+    try buf.append(gpa, '>');
+    try appendEscaped(buf, gpa, node.text);
+    for (node.children) |child| try appendNode(buf, gpa, child, depth + 1);
+    try buf.print(gpa, "</{s}>", .{node.tag});
+}
+
 pub fn renderToString(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: geom.PhysicalSize, bg: geom.Color) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const tree = try vdom.build(arena_state.allocator(), list, viewport, bg, null);
+
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
 
-    // Base style: fill the whole browser viewport with the theme background and drop
-    // the default body margin, so the branded bg reaches the window edges even though
-    // the layout container below is a fixed size (the real viewport size is threaded
-    // in a later slice). bg is emitted numerically (ch), so there is no injection path.
-    const base_style = try gpa.print("<style>html,body{{margin:0;background:rgb({d},{d},{d})}}</style>", .{ ch(bg.r), ch(bg.g), ch(bg.b) });
-    defer gpa.free(base_style);
-    try buf.appendSlice(gpa, base_style);
+    // Fill the whole browser viewport with the theme background and drop the
+    // default body margin, so the background reaches the window edges.
+    try buf.print(gpa, "<style>html,body{{margin:0;background:rgb({d},{d},{d})}}</style>", .{ ch(bg.r), ch(bg.g), ch(bg.b) });
 
-    // Collect distinct fonts for @font-face emission.
+    // One @font-face per distinct font, under the family the text asks for.
     const fonts = try collectFonts(gpa, list);
     defer gpa.free(fonts);
-
-    // Emit a <style> block with one @font-face per distinct font.
     if (fonts.len > 0) {
         try buf.appendSlice(gpa, "<style>");
-        for (fonts, 0..) |font_ptr, i| {
+        for (fonts) |font_ptr| {
             const enc = std.base64.standard.Encoder;
-            const b64_len = enc.calcSize(font_ptr.bytes.len);
-            const b64_buf = try gpa.alloc(u8, b64_len);
+            const b64_buf = try gpa.alloc(u8, enc.calcSize(font_ptr.bytes.len));
             defer gpa.free(b64_buf);
             _ = enc.encode(b64_buf, font_ptr.bytes);
-            const face = try gpa.print("@font-face{{font-family:pf{d};src:url(data:font/otf;base64,{s}) format(\"opentype\")}}", .{ i, b64_buf });
-            defer gpa.free(face);
-            try buf.appendSlice(gpa, face);
+            var fam: [vdom.family_len]u8 = undefined;
+            try buf.print(gpa, "@font-face{{font-family:{s};src:url(data:font/otf;base64,{s}) format(\"opentype\")}}", .{ vdom.fontFamily(&fam, font_ptr), b64_buf });
         }
         try buf.appendSlice(gpa, "</style>");
     }
 
-    const open = try gpa.print("<div style=\"position:relative;width:{d}px;height:{d}px;background:rgb({d},{d},{d})\">", .{ viewport.width, viewport.height, ch(bg.r), ch(bg.g), ch(bg.b) });
-    defer gpa.free(open);
-    try buf.appendSlice(gpa, open);
-
-    var rules: std.ArrayList(u8) = .empty;
-    defer rules.deinit(gpa);
-    var cls: u32 = 0;
-    var region_origin: ?geom.PhysicalOffset = null;
-
-    for (list.primitives.items) |p| switch (p) {
-        .rrect => |r| {
-            const ox: f32 = if (region_origin) |o| o.x else 0;
-            const oy: f32 = if (region_origin) |o| o.y else 0;
-            var abuf: [8]u8 = undefined;
-            if (r.hover_color == null and r.active_color == null) {
-                // Plain rrect: byte-identical output for opaque colors (regression path).
-                const div = if (r.stroke_width > 0)
-                    try gpa.print("<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
-                        "border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent\"></div>", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, ch(r.color.r), ch(r.color.g), ch(r.color.b), alpha(&abuf, r.color.a) })
-                else
-                    try gpa.print("<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
-                        "border-radius:{d}px;background:rgba({d},{d},{d},{s})\"></div>", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, ch(r.color.r), ch(r.color.g), ch(r.color.b), alpha(&abuf, r.color.a) });
-                defer gpa.free(div);
-                try buf.appendSlice(gpa, div);
-            } else {
-                // Interactive rrect: base div carries a class; state colors go to <style> rules.
-                const c = cls;
-                cls += 1;
-                if (r.stroke_width > 0) {
-                    const div = try gpa.print("<div class=\"pb{d}\" style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
-                        "border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent\"></div>", .{ c, r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, ch(r.color.r), ch(r.color.g), ch(r.color.b), alpha(&abuf, r.color.a) });
-                    defer gpa.free(div);
-                    try buf.appendSlice(gpa, div);
-                    if (r.hover_color) |h| {
-                        var hbuf: [8]u8 = undefined;
-                        const rule = try gpa.print(".pb{d}:hover{{border-color:rgba({d},{d},{d},{s})}}", .{ c, ch(h.r), ch(h.g), ch(h.b), alpha(&hbuf, h.a) });
-                        defer gpa.free(rule);
-                        try rules.appendSlice(gpa, rule);
-                    }
-                    if (r.active_color) |a| {
-                        var pbuf: [8]u8 = undefined;
-                        const rule = try gpa.print(".pb{d}:active{{border-color:rgba({d},{d},{d},{s})}}", .{ c, ch(a.r), ch(a.g), ch(a.b), alpha(&pbuf, a.a) });
-                        defer gpa.free(rule);
-                        try rules.appendSlice(gpa, rule);
-                    }
-                } else {
-                    const div = try gpa.print("<div class=\"pb{d}\" style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
-                        "border-radius:{d}px;background:rgba({d},{d},{d},{s})\"></div>", .{ c, r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, ch(r.color.r), ch(r.color.g), ch(r.color.b), alpha(&abuf, r.color.a) });
-                    defer gpa.free(div);
-                    try buf.appendSlice(gpa, div);
-                    if (r.hover_color) |h| {
-                        var hbuf: [8]u8 = undefined;
-                        const rule = try gpa.print(".pb{d}:hover{{background:rgba({d},{d},{d},{s})}}", .{ c, ch(h.r), ch(h.g), ch(h.b), alpha(&hbuf, h.a) });
-                        defer gpa.free(rule);
-                        try rules.appendSlice(gpa, rule);
-                    }
-                    if (r.active_color) |a| {
-                        var pbuf: [8]u8 = undefined;
-                        const rule = try gpa.print(".pb{d}:active{{background:rgba({d},{d},{d},{s})}}", .{ c, ch(a.r), ch(a.g), ch(a.b), alpha(&pbuf, a.a) });
-                        defer gpa.free(rule);
-                        try rules.appendSlice(gpa, rule);
-                    }
-                }
-            }
-        },
-        .push_scroll => |sr| {
-            const div = try gpa.print("<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll\">" ++
-                "<div style=\"position:relative;width:{d}px;height:{d}px\">", .{ sr.viewport.x, sr.viewport.y, sr.viewport.width, sr.viewport.height, sr.content.width, sr.content.height });
-            defer gpa.free(div);
-            try buf.appendSlice(gpa, div);
-            region_origin = .{ .x = sr.viewport.x, .y = sr.viewport.y };
-        },
-        .pop_scroll => {
-            try buf.appendSlice(gpa, "</div></div>");
-            region_origin = null;
-        },
-        .push_clip => |cr| {
-            // A browser clips to the full rounded shape, so this backend is the
-            // one that honours the radius exactly.
-            const div = try gpa.print("<div style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;" ++
-                "border-radius:{d}px;overflow:hidden\">", .{ cr.rect.x, cr.rect.y, cr.rect.width, cr.rect.height, cr.radius });
-            defer gpa.free(div);
-            try buf.appendSlice(gpa, div);
-            region_origin = .{ .x = cr.rect.x, .y = cr.rect.y };
-        },
-        .pop_clip => {
-            try buf.appendSlice(gpa, "</div>");
-            region_origin = null;
-        },
-        .image => |img| {
-            const im: *image_mod.Image = @ptrCast(@alignCast(img.image));
-            if (im.bytes.len == 0) continue; // no encoded bytes -> nothing to <img> (v1: fromRgba images skipped on web)
-            const ox: f32 = if (region_origin) |o| o.x else 0;
-            const oy: f32 = if (region_origin) |o| o.y else 0;
-            const enc = std.base64.standard.Encoder;
-            const b64_buf = try gpa.alloc(u8, enc.calcSize(im.bytes.len));
-            defer gpa.free(b64_buf);
-            _ = enc.encode(b64_buf, im.bytes);
-            const tag = try gpa.print("<img style=\"position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px\" src=\"data:{s};base64,{s}\">", .{ img.rect.x - ox, img.rect.y - oy, img.rect.width, img.rect.height, image_mod.Image.mime(im.format), b64_buf });
-            defer gpa.free(tag);
-            try buf.appendSlice(gpa, tag);
-        },
-        .icon => |ic| {
-            const ox: f32 = if (region_origin) |o| o.x else 0;
-            const oy: f32 = if (region_origin) |o| o.y else 0;
-            const icon_path = icon_builtin.pathFor(ic.id);
-            const d = try svg_path.data(gpa, icon_path, icon_builtin.grid);
-            defer gpa.free(d);
-            // The viewBox is the authoring grid and width/height are the size
-            // the frontend asked for, so the browser does the scaling and one
-            // centreline serves every size. That also fixes stroke-width in
-            // GRID units: scaling it here as well would square the factor.
-            //
-            // `preserveAspectRatio="none"` lets the two axes scale apart. The
-            // default centres the square grid inside the box and leaves the rest
-            // blank, which for a rule in a tall box draws exactly the short,
-            // gapped mark the box was made non-square to avoid.
-            var gbuf: [svg_path.coord_len]u8 = undefined;
-            const grid_s = svg_path.coord(&gbuf, icon_builtin.grid);
-            var sbuf: [svg_path.coord_len]u8 = undefined;
-            var abuf: [8]u8 = undefined;
-            const svg_open = try gpa.print("<svg viewBox=\"0 0 {s} {s}\" preserveAspectRatio=\"none\" width=\"{d}\" height=\"{d}\" style=\"position:absolute;left:{d}px;top:{d}px\">", .{ grid_s, grid_s, ic.size.width, ic.size.height, ic.origin.x - ox, ic.origin.y - oy });
-            defer gpa.free(svg_open);
-            try buf.appendSlice(gpa, svg_open);
-            // `<title>` is the accessible name of an inline SVG, and the first
-            // child is the one a screen reader reads. It is written only when
-            // there is a name: an empty title takes the name slot and then
-            // announces nothing, which is worse than a mark with no title at
-            // all, because a reader can still fall back on the surroundings.
-            if (ic.label) |name| {
-                try buf.appendSlice(gpa, "<title>");
-                try appendEscaped(&buf, gpa, name);
-                try buf.appendSlice(gpa, "</title>");
-            }
-            const tag = try gpa.print("<path d=\"{s}\" fill=\"none\" stroke=\"rgba({d},{d},{d},{s})\" stroke-width=\"{s}\" stroke-linecap=\"{s}\" stroke-linejoin=\"{s}\"/></svg>", .{ d, ch(ic.color.r), ch(ic.color.g), ch(ic.color.b), alpha(&abuf, ic.color.a), svg_path.coord(&sbuf, icon_path.stroke.width), svg_path.lineCap(icon_path.stroke.cap), svg_path.lineJoin(icon_path.stroke.join) });
-            defer gpa.free(tag);
-            try buf.appendSlice(gpa, tag);
-        },
-        .text => |run| {
-            const ox: f32 = if (region_origin) |o| o.x else 0;
-            const oy: f32 = if (region_origin) |o| o.y else 0;
-            const font_ptr: *text.Font = @ptrCast(@alignCast(run.font));
-            // Find the index for this font pointer.
-            // collectFonts scanned the same primitive list, so every text run's font
-            // is guaranteed present; the else enforces that invariant.
-            var font_idx: usize = 0;
-            for (fonts, 0..) |fp, i| {
-                if (fp == font_ptr) {
-                    font_idx = i;
-                    break;
-                }
-            } else unreachable;
-            var tbuf: [8]u8 = undefined;
-            const header = try gpa.print("<div style=\"position:absolute;left:{d}px;top:{d}px;font-family:pf{d};font-size:{d}px;color:rgba({d},{d},{d},{s})\">", .{
-                run.origin.x - ox, run.origin.y - oy,
-                font_idx,          run.size,
-                ch(run.color.r),   ch(run.color.g),
-                ch(run.color.b),   alpha(&tbuf, run.color.a),
-            });
-            defer gpa.free(header);
-            try buf.appendSlice(gpa, header);
-            try appendEscaped(&buf, gpa, run.text);
-            try buf.appendSlice(gpa, "</div>");
-        },
-    };
-
-    try buf.appendSlice(gpa, "</div>");
-    if (rules.items.len > 0) {
+    try appendNode(&buf, gpa, tree.root, 0);
+    if (tree.rules.len > 0) {
         try buf.appendSlice(gpa, "<style>");
-        try buf.appendSlice(gpa, rules.items);
+        for (tree.rules) |rule| try buf.appendSlice(gpa, rule.css);
         try buf.appendSlice(gpa, "</style>");
     }
     return buf.toOwnedSlice(gpa);
@@ -277,7 +134,10 @@ test "renderToString emits an @font-face and a positioned text div" {
     const html = try renderToString(gpa, list, geom.PhysicalSize{ .width = 200, .height = 100 }, geom.Color.rgb(0, 0, 0));
     defer gpa.free(html);
     try std.testing.expect(std.mem.indexOf(u8, html, "@font-face") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "font-family:pf0") != null);
+    var fam: [vdom.family_len]u8 = undefined;
+    var want: [vdom.family_len + 32]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, html, try std.fmt.bufPrint(&want, "@font-face{{font-family:{s};", .{vdom.fontFamily(&fam, &font)})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, try std.fmt.bufPrint(&want, ";font-family:{s};", .{vdom.fontFamily(&fam, &font)})) != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "base64,") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, ">Hello<") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "left:12px") != null);
@@ -396,14 +256,13 @@ test "renderToString: fillRRectStates emits class and hover/active style rules" 
     const html = try renderToString(std.testing.allocator, cv.list, geom.PhysicalSize{ .width = 200, .height = 100 }, geom.Color.rgb(0, 0, 0));
     defer std.testing.allocator.free(html);
 
-    // The div must carry class="pb0".
-    try std.testing.expect(std.mem.indexOf(u8, html, "class=\"pb0\"") != null);
-    // A <style> block must be present after the wrapper close.
+    // The div carries a class, and the rules after the wrapper name it.
+    const cls = classOf(html).?;
+    try std.testing.expect(std.mem.startsWith(u8, cls, "pb-"));
     try std.testing.expect(std.mem.indexOf(u8, html, "<style>") != null);
-    // Hover rule uses background.
-    try std.testing.expect(std.mem.indexOf(u8, html, ".pb0:hover{background:rgba(") != null);
-    // Active rule uses background.
-    try std.testing.expect(std.mem.indexOf(u8, html, ".pb0:active{background:rgba(") != null);
+    var want: [64]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, html, try std.fmt.bufPrint(&want, ".{s}:hover{{background:rgba(", .{cls})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, try std.fmt.bufPrint(&want, ".{s}:active{{background:rgba(", .{cls})) != null);
     // No border-color in style rules (this is a fill).
     try std.testing.expect(std.mem.indexOf(u8, html, "border-color") == null);
 }
@@ -422,14 +281,20 @@ test "renderToString: strokeRRectStates emits border-color hover/active style ru
     const html = try renderToString(std.testing.allocator, cv.list, geom.PhysicalSize{ .width = 200, .height = 100 }, geom.Color.rgb(0, 0, 0));
     defer std.testing.allocator.free(html);
 
-    // The div must carry class="pb0".
-    try std.testing.expect(std.mem.indexOf(u8, html, "class=\"pb0\"") != null);
-    // Hover rule uses border-color.
-    try std.testing.expect(std.mem.indexOf(u8, html, ".pb0:hover{border-color:rgba(") != null);
-    // Active rule uses border-color.
-    try std.testing.expect(std.mem.indexOf(u8, html, ".pb0:active{border-color:rgba(") != null);
+    const cls = classOf(html).?;
+    try std.testing.expect(std.mem.startsWith(u8, cls, "pb-"));
+    var want: [64]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, html, try std.fmt.bufPrint(&want, ".{s}:hover{{border-color:rgba(", .{cls})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, try std.fmt.bufPrint(&want, ".{s}:active{{border-color:rgba(", .{cls})) != null);
     // No background in style rules (this is a stroke).
-    try std.testing.expect(std.mem.indexOf(u8, html, ".pb0:hover{background") == null);
+    try std.testing.expect(std.mem.indexOf(u8, html, ":hover{background") == null);
+}
+
+/// The value of the first `class` attribute in `html`.
+fn classOf(html: []const u8) ?[]const u8 {
+    const start = (std.mem.indexOf(u8, html, "class=\"") orelse return null) + "class=\"".len;
+    const end = std.mem.indexOfScalarPos(u8, html, start, '"') orelse return null;
+    return html[start..end];
 }
 
 test "alpha() formats CSS alpha compactly: opaque 1, transparent 0, fractional trimmed" {

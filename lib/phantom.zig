@@ -135,6 +135,7 @@ pub const backend = struct {
     pub const prism = @import("phantom/backend/prism.zig");
     pub const PrismBackend = prism.PrismBackend;
     pub const dom_calls = @import("phantom/backend/dom_calls.zig");
+    pub const vdom = @import("phantom/backend/vdom.zig");
     pub const cell_grid = @import("phantom/backend/cell_grid.zig");
     pub const tui_cells = @import("phantom/backend/tui_cells.zig");
     pub const tui_pixels = @import("phantom/backend/tui_pixels.zig");
@@ -241,6 +242,7 @@ test {
     _ = backend.dom;
     _ = backend.prism;
     _ = backend.dom_calls;
+    _ = backend.vdom;
     _ = @import("phantom/backend/glyph_atlas.zig");
     _ = @import("phantom/panic.zig");
     _ = @import("phantom/BuildOwner.zig");
