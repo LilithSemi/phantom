@@ -134,6 +134,10 @@ pub const font_path_len = font_dir.len + vdom.family_len + ".otf".len;
 /// The path, relative to the page base, where a page serves a font that has
 /// no `text.Font.url`. The name is the font family, so it follows the font
 /// bytes.
+///
+/// Only a first frame writes these files. A prerender writes the fonts of
+/// its pages, and `ssr.Server` serves a font only after a render used it. A
+/// font that the app uses first in a later frame can get 404 at this path.
 pub fn fontFilePath(buf: *[font_path_len]u8, font_ptr: *const text.Font) []const u8 {
     var fam: [vdom.family_len]u8 = undefined;
     const family = vdom.fontFamily(&fam, font_ptr);

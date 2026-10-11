@@ -8,6 +8,10 @@
 //! fetch an `initState` starts fails at once with `error.NetworkDown`, so an
 //! app that shows an error state for a failed fetch renders that error state
 //! on the server too.
+//!
+//! A render runs the widgets of the app in this process, so a widget that
+//! panics stops the process. A server that faces the internet must be behind
+//! a reverse proxy and restart when it stops.
 
 const std = @import("std");
 const phantom = @import("../phantom.zig");

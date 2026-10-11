@@ -1,6 +1,7 @@
 //! An http server for one web app. A request for a file in the dist directory
 //! gets that file. Any other path under the base is a page: the server renders
-//! it with `ssr.render` at the size the browser reports.
+//! it with `ssr.render` at the size the browser reports. A missing file with an
+//! extension the server knows, such as "favicon.ico", gets 404 and no render.
 //!
 //! Every request renders fresh, also for a route the build prerendered. A
 //! prerendered page has the default size only, and a fresh page has the size,
@@ -15,6 +16,10 @@
 //! directory is build output. Every answer carries `Options.csp`. The default
 //! allows requests to the site itself only (`connect-src 'self'`), so an app
 //! that talks to another origin must set its own policy.
+//!
+//! A widget that panics during a render stops the whole process. When the
+//! server faces the internet, put it behind a reverse proxy and restart it
+//! when it stops.
 
 const std = @import("std");
 const phantom = @import("../../phantom.zig");
@@ -31,6 +36,8 @@ opts: Options,
 mutex: Io.Mutex = .init,
 styles: Cache = .{ .max_bytes = max_style_bytes, .evict = true },
 fonts: Cache = .{ .max_bytes = max_font_bytes, .evict = false },
+/// The fonts the cache refused, so the log gets each one once.
+unkept_fonts: std.StringArrayHashMapUnmanaged(void) = .empty,
 log_mutex: Io.Mutex = .init,
 connections: std.atomic.Value(u32) = .init(0),
 /// Connections closed early because the server was full or could not start
@@ -86,15 +93,21 @@ const max_requests_per_connection = 1000;
 pub const min_width = 240;
 pub const max_width = 7680;
 
-pub fn init(gpa: std.mem.Allocator, io: Io, opts: Options) error{InvalidBase}!Server {
+pub fn init(gpa: std.mem.Allocator, io: Io, opts: Options) error{ InvalidBase, InvalidSize }!Server {
     if (!dom.validBase(opts.base)) return error.InvalidBase;
-    std.debug.assert(opts.default_size.width > 0 and opts.default_size.height > 0);
+    const width = opts.default_size.width;
+    const height = opts.default_size.height;
+    if (!(width > 0 and height > 0 and std.math.isFinite(width) and std.math.isFinite(height))) {
+        return error.InvalidSize;
+    }
     return .{ .gpa = gpa, .io = io, .opts = opts };
 }
 
 pub fn deinit(self: *Server) void {
     self.styles.deinit(self.gpa);
     self.fonts.deinit(self.gpa);
+    for (self.unkept_fonts.keys()) |path| self.gpa.free(path);
+    self.unkept_fonts.deinit(self.gpa);
     self.* = undefined;
 }
 
@@ -214,7 +227,7 @@ const Progress = struct {
 /// Read one request from `http` and answer it. Returns whether the
 /// connection stays open. With `watch`, the deadline stops once the head is
 /// in, because the render has no limit, and the writes move it on.
-pub fn serveOne(self: *Server, http: *std.http.Server, watch: ?*Watch) bool {
+fn serveOne(self: *Server, http: *std.http.Server, watch: ?*Watch) bool {
     var request = http.receiveHead() catch |err| {
         const status: std.http.Status = switch (err) {
             error.HttpHeadersOversize => .request_header_fields_too_large,
@@ -300,12 +313,15 @@ pub fn handle(self: *Server, request: *Request) !bool {
     const host_name = if (host) |h| hostName(&host_buf, h) else null;
 
     if (rel.len > 0 and rel[rel.len - 1] != '/') {
-        if (try self.serveFile(request, rel, keep)) return keep;
+        // A ':' can name a drive on Windows, so such a path is a page only.
+        if (std.mem.indexOfScalar(u8, rel, ':') == null) {
+            if (try self.serveFile(request, rel, keep)) return keep;
+        }
         if (isStyle(rel)) return self.serveStyle(request, rel, query orelse "", host_name, keep);
         if (std.mem.startsWith(u8, rel, "fonts/pf-")) return self.serveFont(request, rel, keep);
-        // A missing file such as favicon.ico or a .js is no page.
-        const last = rel[if (std.mem.lastIndexOfScalar(u8, rel, '/')) |i| i + 1 else 0..];
-        if (std.mem.indexOfScalar(u8, last, '.') != null) return self.plain(request, .not_found, keep);
+        // A missing file of a known type, such as favicon.ico, is no page.
+        // A route such as "/v1.2" renders.
+        if (fileType(rel) != null) return self.plain(request, .not_found, keep);
     }
 
     return self.servePage(request, .{
@@ -393,7 +409,9 @@ fn serveStyle(self: *Server, request: *Request, rel: []const u8, query: []const 
         if (std.mem.eql(u8, key, "q") and page_query == null) page_query = try decoded(self.gpa, value);
     }
     const page_path = path orelse return self.plain(request, .not_found, keep);
-    if (page_path.len == 0 or page_path[0] != '/' or page_path.len > max_path) return self.plain(request, .not_found, keep);
+    if (page_path.len == 0 or page_path[0] != '/' or page_path.len > max_path or !safePath(page_path)) {
+        return self.plain(request, .not_found, keep);
+    }
 
     var doc = self.render(.{
         .path = page_path,
@@ -415,7 +433,7 @@ fn decoded(gpa: std.mem.Allocator, value: []const u8) ![]u8 {
 }
 
 fn serveFont(self: *Server, request: *Request, rel: []const u8, keep: bool) !bool {
-    if (try self.serveCached(request, &self.fonts, rel, mimeOf(rel), keep)) return keep;
+    if (try self.serveCached(request, &self.fonts, rel, "font/otf", keep)) return keep;
     return self.plain(request, .not_found, keep);
 }
 
@@ -428,7 +446,7 @@ fn serveFile(self: *Server, request: *Request, rel: []const u8, keep: bool) !boo
 
     const cache = if (isStyle(rel) or std.mem.startsWith(u8, rel, "fonts/pf-")) long_cache else no_cache;
     var fields: [7]std.http.Header = undefined;
-    const answer: Answer = .{ .status = .ok, .content_type = mimeOf(rel), .cache = cache };
+    const answer: Answer = .{ .status = .ok, .content_type = fileType(rel) orelse "application/octet-stream", .cache = cache };
     const is_get = request.head.method == .GET;
     self.logAnswer(request, .ok);
     var out_buf: [4096]u8 = undefined;
@@ -478,7 +496,15 @@ fn keepAssets(self: *Server, doc: ssr.Document) void {
     defer self.mutex.unlock(self.io);
     self.styles.put(self.gpa, doc.css_path, doc.css) catch {};
     for (doc.fonts) |font| {
-        self.fonts.put(self.gpa, font.path, font.bytes) catch self.logLine("font {s} not kept", .{font.path});
+        self.fonts.put(self.gpa, font.path, font.bytes) catch {
+            if (self.unkept_fonts.contains(font.path)) continue;
+            const path = self.gpa.dupe(u8, font.path) catch continue;
+            self.unkept_fonts.put(self.gpa, path, {}) catch {
+                self.gpa.free(path);
+                continue;
+            };
+            self.logLine("font {s} not kept", .{font.path});
+        };
     }
 }
 
@@ -571,10 +597,10 @@ const Escaped = struct {
 };
 
 /// False for a path that could leave the dist directory once decoded: a "."
-/// or ".." segment, an empty segment, a '\', a ':' (a drive on Windows) or a
-/// NUL byte.
+/// or ".." segment, an empty segment, a '\' or a NUL byte. A ':' can name a
+/// drive on Windows, so `handle` also keeps a path with one away from files.
 fn safePath(path: []const u8) bool {
-    if (std.mem.indexOfAny(u8, path, "\\:\x00") != null) return false;
+    if (std.mem.indexOfAny(u8, path, "\\\x00") != null) return false;
     var parts = std.mem.splitScalar(u8, path[1..], '/');
     while (parts.next()) |part| {
         if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
@@ -615,23 +641,35 @@ fn hostName(buf: []u8, value: []const u8) ?[]const u8 {
     return buf[0..name.len];
 }
 
-fn mimeOf(path: []const u8) []const u8 {
+/// The content type of a file name, or null for an extension this server
+/// does not know. A missing file of a known type answers 404 with no render.
+fn fileType(path: []const u8) ?[]const u8 {
     const types = [_]struct { []const u8, []const u8 }{
         .{ ".html", "text/html; charset=utf-8" },
         .{ ".js", "text/javascript" },
+        .{ ".mjs", "text/javascript" },
+        .{ ".map", "application/json" },
         .{ ".wasm", "application/wasm" },
         .{ ".css", "text/css; charset=utf-8" },
         .{ ".json", "application/json" },
+        .{ ".txt", "text/plain; charset=utf-8" },
+        .{ ".xml", "application/xml" },
         .{ ".svg", "image/svg+xml" },
         .{ ".png", "image/png" },
+        .{ ".jpg", "image/jpeg" },
+        .{ ".jpeg", "image/jpeg" },
+        .{ ".gif", "image/gif" },
+        .{ ".webp", "image/webp" },
+        .{ ".ico", "image/x-icon" },
         .{ ".otf", "font/otf" },
         .{ ".ttf", "font/ttf" },
+        .{ ".woff", "font/woff" },
         .{ ".woff2", "font/woff2" },
     };
     for (types) |t| {
         if (std.mem.endsWith(u8, path, t[0])) return t[1];
     }
-    return "application/octet-stream";
+    return null;
 }
 
 /// Hashed files by path, oldest first, bounded by their total size. With
@@ -861,13 +899,55 @@ test "a path that could leave the dist directory is refused" {
         "/%2Fetc/passwd",
         "/./secret",
         "/boot.js%00",
-        "/C:/Windows/win.ini",
-        "/C%3A/Windows/win.ini",
     }) |target| {
         const reply = try site.get(target);
         defer reply.deinit();
         try std.testing.expectEqual(@as(u16, 400), reply.status());
         try std.testing.expect(std.mem.indexOf(u8, reply.body(), "secret") == null);
+    }
+    // A drive is never a file, so these are pages.
+    for ([_][]const u8{ "/C:/secret", "/C%3A/secret" }) |target| {
+        const reply = try site.get(target);
+        defer reply.deinit();
+        try std.testing.expectEqual(@as(u16, 404), reply.status());
+        try std.testing.expect(std.mem.indexOf(u8, reply.body(), ">no such page</div>") != null);
+    }
+}
+
+fn pathPage(b: *phantom.BuildContext) phantom.Widget {
+    var buf: [256]u8 = undefined;
+    const path = b.owner.platform.readLocation(&buf) orelse "";
+    return b.new(phantom.Text{ .text = b.arena.dupe(u8, path) catch "" }).widget();
+}
+
+test "a page path with a ':' or a '.' renders the page" {
+    var site: TestSite = undefined;
+    try site.init(.plain(pathPage));
+    defer site.deinit();
+    for ([_][]const u8{ "/time/12:00", "/v1.2", "/docs/v1.2", "/a.b/c" }) |target| {
+        const reply = try site.get(target);
+        defer reply.deinit();
+        try std.testing.expectEqual(@as(u16, 200), reply.status());
+        var want_buf: [64]u8 = undefined;
+        const want = try std.fmt.bufPrint(&want_buf, ">{s}</div>", .{target});
+        try std.testing.expect(std.mem.indexOf(u8, reply.body(), want) != null);
+    }
+}
+
+test "a default size that is not positive and finite is refused" {
+    const io = std.testing.io;
+    for ([_]phantom.PhysicalSize{
+        .{ .width = 0, .height = 800 },
+        .{ .width = 1280, .height = -1 },
+        .{ .width = std.math.nan(f32), .height = 800 },
+        .{ .width = 1280, .height = std.math.inf(f32) },
+    }) |default_size| {
+        try std.testing.expectError(error.InvalidSize, Server.init(std.testing.allocator, io, .{
+            .root = .plain(homePage),
+            .shell = test_shell,
+            .dist = std.Io.Dir.cwd(),
+            .default_size = default_size,
+        }));
     }
 }
 
@@ -1079,7 +1159,7 @@ test "a missing file with an extension answers 404 and renders no page" {
     var site: TestSite = undefined;
     try site.init(.plain(routerRoot));
     defer site.deinit();
-    for ([_][]const u8{ "/favicon.ico", "/robots.txt", "/missing.js", "/fonts/none.otf" }) |target| {
+    for ([_][]const u8{ "/favicon.ico", "/robots.txt", "/missing.js", "/fonts/none.otf", "/a/b.png", "/x.wasm", "/C:/x.css" }) |target| {
         const reply = try site.get(target);
         defer reply.deinit();
         try std.testing.expectEqual(@as(u16, 404), reply.status());
@@ -1116,6 +1196,49 @@ test "a stylesheet that left the cache is made again from the inputs in its url"
     const other = try site.ask(try std.fmt.bufPrint(&head_buf, "GET /{s}?w=900&p=/ HTTP/1.1\r\nhost: example.com\r\n\r\n", .{name}));
     defer other.deinit();
     try std.testing.expectEqual(@as(u16, 404), other.status());
+}
+
+test "a stylesheet miss with a bad width or page path answers 404" {
+    var site: TestSite = undefined;
+    try site.init(.plain(routerRoot));
+    defer site.deinit();
+    for ([_][]const u8{
+        "/page-0000000000000000.css?w=600",
+        "/page-0000000000000000.css?p=/text",
+        "/page-0000000000000000.css?w=wide&p=/text",
+        "/page-0000000000000000.css?w=600&p=text",
+        "/page-0000000000000000.css?w=600&p=",
+        "/page-0000000000000000.css?w=600&p=/../secret",
+        "/page-0000000000000000.css?w=600&p=%2F..%2Fsecret",
+        "/page-0000000000000000.css?w=600&p=/a//b",
+        "/page-0000000000000000.css?w=600&p=/a%5Cb",
+        "/page-0000000000000000.css?w=600&p=/a%00",
+    }) |target| {
+        const reply = try site.get(target);
+        defer reply.deinit();
+        try std.testing.expectEqual(@as(u16, 404), reply.status());
+        try std.testing.expectEqualStrings("text/plain; charset=utf-8", reply.header("content-type").?);
+    }
+}
+
+test "a font the cache refuses goes to the log once" {
+    const gpa = std.testing.allocator;
+    var fixture: FontPage = .{ .font = try phantom.text.Font.load(gpa, phantom.text.builtin.neuropol_bytes) };
+    defer fixture.font.deinit(gpa);
+    var site: TestSite = undefined;
+    try site.init(.of(FontPage, FontPage.build, &fixture));
+    defer site.deinit();
+    site.server.fonts.max_bytes = 1;
+    var log: Io.Writer.Allocating = .init(gpa);
+    defer log.deinit();
+    site.server.opts.log = &log.writer;
+
+    for (0..3) |_| {
+        const page = try site.get("/");
+        page.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), site.server.fonts.map.count());
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log.written(), "not kept"));
 }
 
 test "the log prints control bytes of a target as escapes" {
@@ -1216,6 +1339,44 @@ test "a slow reader that keeps reading gets the whole answer" {
     // The answer took longer than one timeout, so a deadline for the whole
     // answer would have cut it.
     try std.testing.expect(elapsedMs(start) > 300);
+}
+
+test "a reader that stops reading is cut by the write timeout" {
+    const io = std.testing.io;
+    var live: LiveSite = undefined;
+    try live.start(.fromMilliseconds(300));
+    defer live.stop();
+    const big_len = 32 * 1024 * 1024;
+    const big = try std.testing.allocator.alloc(u8, big_len);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    try live.site.tmp.dir.writeFile(io, .{ .sub_path = "big.bin", .data = big });
+
+    const stream = try live.connect();
+    defer stream.close(io);
+    try sendAll(stream, "GET /big.bin HTTP/1.1\r\nconnection: close\r\n\r\n");
+    const start = Io.Clock.awake.now(io);
+    while (live.site.server.connections.load(.monotonic) == 0) {
+        try std.testing.expect(elapsedMs(start) < 5000);
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    while (live.site.server.connections.load(.monotonic) > 0) {
+        try std.testing.expect(elapsedMs(start) < 5000);
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+    try std.testing.expect(elapsedMs(start) >= 250);
+
+    // The client gets what the socket held, then the end, short of the file.
+    var in_buf: [64 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+    var chunk: [256 * 1024]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = reader.interface.readSliceShort(&chunk) catch break;
+        total += n;
+        if (n < chunk.len) break;
+    }
+    try std.testing.expect(total < big_len);
 }
 
 test "an idle connection closes after the idle timeout" {
