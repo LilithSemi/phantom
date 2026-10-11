@@ -119,8 +119,7 @@ pub const Page = struct {
 };
 
 pub const FontFile = struct {
-    /// Relative to the page, like `text.Font.url`. The name is the font
-    /// family, so it follows the font bytes.
+    /// Relative to the page base. See `fontFilePath`.
     path: []u8,
     /// Borrowed from the font.
     bytes: []const u8,
@@ -128,6 +127,54 @@ pub const FontFile = struct {
 
 /// Where a page puts the fonts that have no url.
 pub const font_dir = "fonts/";
+
+/// The buffer `fontFilePath` needs.
+pub const font_path_len = font_dir.len + vdom.family_len + ".otf".len;
+
+/// The path, relative to the page base, where a page serves a font that has
+/// no `text.Font.url`. The name is the font family, so it follows the font
+/// bytes.
+pub fn fontFilePath(buf: *[font_path_len]u8, font_ptr: *const text.Font) []const u8 {
+    var fam: [vdom.family_len]u8 = undefined;
+    const family = vdom.fontFamily(&fam, font_ptr);
+    return std.fmt.bufPrint(buf, font_dir ++ "{s}.otf", .{family}) catch unreachable;
+}
+
+/// True when `base` is a usable page base: it starts and ends with '/'.
+pub fn validBase(base: []const u8) bool {
+    return base.len > 0 and base[0] == '/' and base[base.len - 1] == '/';
+}
+
+/// The url a page fetches a font from, printed with `{f}`. A relative
+/// `text.Font.url`, or the file of a font with no url, goes under `base`. The
+/// linked stylesheet and the `FontFace` calls then fetch the same file on
+/// every route.
+pub const FontUrl = struct {
+    base: []const u8,
+    font: *const text.Font,
+
+    pub fn format(self: FontUrl, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.font.url) |url| {
+            if (!isRelative(url)) return w.writeAll(url);
+            return w.print("{s}{s}", .{ self.base, url });
+        }
+        var buf: [font_path_len]u8 = undefined;
+        try w.print("{s}{s}", .{ self.base, fontFilePath(&buf, self.font) });
+    }
+};
+
+pub fn fontUrl(base: []const u8, font_ptr: *const text.Font) FontUrl {
+    std.debug.assert(validBase(base));
+    return .{ .base = base, .font = font_ptr };
+}
+
+/// False for a url with a scheme and for one that starts with '/'.
+fn isRelative(url: []const u8) bool {
+    if (url.len > 0 and url[0] == '/') return false;
+    const colon = std.mem.indexOfScalar(u8, url, ':') orelse return true;
+    const end = std.mem.indexOfAny(u8, url, "/?#") orelse return false;
+    return end < colon;
+}
 
 const PageWriter = struct {
     gpa: std.mem.Allocator,
@@ -171,8 +218,9 @@ const PageWriter = struct {
 };
 
 /// Print `tree` as a page. The same tree gives the same bytes on every target.
-/// `Page.fonts` borrows from the fonts in the tree.
-pub fn renderPage(gpa: std.mem.Allocator, tree: vdom.Tree) !Page {
+/// `Page.fonts` borrows from the fonts in the tree. Font urls go under `base`,
+/// the path the site is served at. See `FontUrl`.
+pub fn renderPage(gpa: std.mem.Allocator, tree: vdom.Tree, base: []const u8) !Page {
     var w: PageWriter = .{ .gpa = gpa };
     defer w.html.deinit(gpa);
     defer w.css.deinit(gpa);
@@ -188,13 +236,13 @@ pub fn renderPage(gpa: std.mem.Allocator, tree: vdom.Tree) !Page {
     for (tree.fonts) |font_ptr| {
         var fam: [vdom.family_len]u8 = undefined;
         const family = vdom.fontFamily(&fam, font_ptr);
-        const url = font_ptr.url orelse url: {
+        if (font_ptr.url == null) {
+            var buf: [font_path_len]u8 = undefined;
             try fonts.ensureUnusedCapacity(gpa, 1);
-            const path = try gpa.print(font_dir ++ "{s}.otf", .{family});
+            const path = try gpa.dupe(u8, fontFilePath(&buf, font_ptr));
             fonts.appendAssumeCapacity(.{ .path = path, .bytes = font_ptr.bytes });
-            break :url path;
-        };
-        try w.css.print(gpa, "@font-face{{font-family:{s};src:url(\"{s}\") format(\"opentype\")}}", .{ family, url });
+        }
+        try w.css.print(gpa, "@font-face{{font-family:{s};src:url(\"{f}\") format(\"opentype\")}}", .{ family, fontUrl(base, font_ptr) });
     }
     try w.node(tree.root, 0);
     for (tree.rules) |rule| try w.css.appendSlice(gpa, rule.css);
@@ -212,7 +260,7 @@ fn testPage(gpa: std.mem.Allocator, list: dl.DisplayList, viewport: geom.Physica
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const tree = try vdom.build(arena_state.allocator(), list, viewport, geom.Color.rgb(0, 0, 0), null);
-    var page = try renderPage(gpa, tree);
+    var page = try renderPage(gpa, tree, "/");
     defer page.deinit(gpa);
     return std.mem.concat(gpa, u8, &.{ page.css, page.html });
 }
@@ -694,7 +742,7 @@ fn buildPage(gpa: std.mem.Allocator, list: dl.DisplayList) !Page {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const tree = try vdom.build(arena_state.allocator(), list, .{ .width = 64, .height = 32 }, geom.Color.rgb(0, 0, 0), null);
-    return renderPage(gpa, tree);
+    return renderPage(gpa, tree, "/");
 }
 
 test "renderPage: a small tree gives this html and css, with no inline style" {
@@ -709,7 +757,7 @@ test "renderPage: a small tree gives this html and css, with no inline style" {
     try std.testing.expect(std.mem.indexOf(u8, page.html, "style=") == null);
     try std.testing.expectEqualStrings("<div class=\"p0\"><div class=\"p1\"></div><div class=\"p2 pb-788763ab9d2ec3be\"></div><div class=\"p3\">a&lt;b</div></div>", page.html);
     try std.testing.expectEqualStrings("html,body{margin:0;background:rgb(0,0,0)}" ++
-        "@font-face{font-family:pf-0b107d216918b3e5;src:url(\"fonts/Neuropol.otf\") format(\"opentype\")}" ++
+        "@font-face{font-family:pf-0b107d216918b3e5;src:url(\"/fonts/Neuropol.otf\") format(\"opentype\")}" ++
         ".p0{position:relative;width:4rem;height:2rem;background:rgb(0,0,0)}" ++
         ".p1{position:absolute;left:0;top:0;width:2rem;height:1rem;border-radius:0;background:rgba(255,0,0,1)}" ++
         ".p2{position:absolute;left:0;top:1rem;width:2rem;height:1rem;border-radius:0.25rem;background:rgba(0,0,255,1)}" ++
@@ -734,9 +782,29 @@ test "renderPage: a font with no url is a file the page lists, never a data url"
     try std.testing.expectEqual(@as(usize, 1), page.fonts.len);
     try std.testing.expectEqualStrings("fonts/pf-0b107d216918b3e5.otf", page.fonts[0].path);
     try std.testing.expectEqual(a.bytes.ptr, page.fonts[0].bytes.ptr);
-    try std.testing.expect(std.mem.indexOf(u8, page.css, "@font-face{font-family:pf-0b107d216918b3e5;src:url(\"fonts/pf-0b107d216918b3e5.otf\") format(\"opentype\")}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page.css, "@font-face{font-family:pf-0b107d216918b3e5;src:url(\"/fonts/pf-0b107d216918b3e5.otf\") format(\"opentype\")}") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, page.css, "@font-face"));
     try std.testing.expect(std.mem.indexOf(u8, page.css, "data:") == null);
+}
+
+test "a font url goes under the base unless it has a scheme or starts with a slash" {
+    const gpa = std.testing.allocator;
+    var font = try text.Font.load(gpa, text.builtin.neuropol_bytes);
+    defer font.deinit(gpa);
+    var buf: [128]u8 = undefined;
+
+    try std.testing.expectEqualStrings("/app/fonts/pf-0b107d216918b3e5.otf", try std.fmt.bufPrint(&buf, "{f}", .{fontUrl("/app/", &font)}));
+    font.url = "fonts/Neuropol.otf";
+    try std.testing.expectEqualStrings("/fonts/Neuropol.otf", try std.fmt.bufPrint(&buf, "{f}", .{fontUrl("/", &font)}));
+    try std.testing.expectEqualStrings("/app/fonts/Neuropol.otf", try std.fmt.bufPrint(&buf, "{f}", .{fontUrl("/app/", &font)}));
+    font.url = "/static/a.otf";
+    try std.testing.expectEqualStrings("/static/a.otf", try std.fmt.bufPrint(&buf, "{f}", .{fontUrl("/app/", &font)}));
+    font.url = "https://cdn.example.com/a.otf";
+    try std.testing.expectEqualStrings("https://cdn.example.com/a.otf", try std.fmt.bufPrint(&buf, "{f}", .{fontUrl("/app/", &font)}));
+    font.url = "a:b/c.otf";
+    try std.testing.expectEqualStrings("a:b/c.otf", try std.fmt.bufPrint(&buf, "{f}", .{fontUrl("/", &font)}));
+    font.url = "fonts/a:b.otf";
+    try std.testing.expectEqualStrings("/fonts/a:b.otf", try std.fmt.bufPrint(&buf, "{f}", .{fontUrl("/", &font)}));
 }
 
 test "renderPage: one input gives the same bytes on every run" {

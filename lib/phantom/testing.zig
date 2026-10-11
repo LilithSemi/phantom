@@ -192,7 +192,7 @@ pub const Harness = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const tree = try phantom.backend.vdom.build(arena_state.allocator(), self.canvas.list, physical, phantom.Color.rgb(0, 0, 0), null);
-        var page = try phantom.backend.dom.renderPage(self.gpa, tree);
+        var page = try phantom.backend.dom.renderPage(self.gpa, tree, "/");
         defer page.deinit(self.gpa);
         const found = std.mem.indexOf(u8, page.html, needle) != null or std.mem.indexOf(u8, page.css, needle) != null;
         try std.testing.expect(found);

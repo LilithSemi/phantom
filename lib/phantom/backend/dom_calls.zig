@@ -2,6 +2,7 @@ const std = @import("std");
 const display_list = @import("../display_list.zig");
 const geometry = @import("../geometry.zig");
 const vdom = @import("vdom.zig");
+const dom = @import("dom.zig");
 const text = @import("../text.zig");
 const image_mod = @import("../image/Image.zig");
 const pointer = @import("../pointer.zig");
@@ -33,6 +34,9 @@ pub const DomOps = struct {
     clear_children: *const fn (ctx: *anyopaque, node: u32) void,
     body: u32,
     head: u32,
+    /// The path the site is served at. It starts and ends with '/'. Font urls
+    /// go under it. See `dom.FontUrl`.
+    base: []const u8 = "/",
     /// Opens a URL in a new tab. Null on a host that has no browser.
     /// Opens `url` in `mode`, and reports whether it WAS opened. A browser hands
     /// back nothing when it refuses a popup, and that has to reach the caller:
@@ -83,7 +87,7 @@ pub const DomOps = struct {
     add_rule: ?*const fn (ctx: *anyopaque, css: []const u8) void = null,
     /// Registers one font face, WITHOUT a stylesheet of any kind: the `FontFace`
     /// constructor and `document.fonts`. `src` is the CSS source descriptor, so
-    /// `url("fonts/X.otf")` for a font served as a file and a `data:` URL for one
+    /// `url("/fonts/X.otf")` for a font served as a file and a `data:` URL for one
     /// that is not.
     ///
     /// Separate from `add_rule` because a font that fails to register fails in a
@@ -219,12 +223,13 @@ pub const family_len = vdom.family_len;
 /// `@font-face` rule, and what the `FontFace` constructor takes as its second
 /// argument. Caller owns the returned slice.
 ///
-/// A font that says where it is served from is referenced BY URL. One that does
-/// not has its bytes embedded as a `data:` URL, which is the only thing left to
-/// do with it and which `font-src 'self'` refuses: see `text.Font.url`.
-pub fn fontSrc(gpa: std.mem.Allocator, font_ptr: *const text.Font) ![]u8 {
-    if (font_ptr.url) |url| {
-        return gpa.print("url(\"{s}\") format(\"opentype\")", .{url});
+/// A font that says where it is served from is referenced BY URL, under
+/// `base`. One that does not has its bytes embedded as a `data:` URL, which
+/// is the only thing left to do with it and which `font-src 'self'` refuses:
+/// see `text.Font.url`.
+pub fn fontSrc(gpa: std.mem.Allocator, base: []const u8, font_ptr: *const text.Font) ![]u8 {
+    if (font_ptr.url != null) {
+        return gpa.print("url(\"{f}\") format(\"opentype\")", .{dom.fontUrl(base, font_ptr)});
     }
     const enc = std.base64.standard.Encoder;
     const b64 = try gpa.alloc(u8, enc.calcSize(font_ptr.bytes.len));
@@ -239,25 +244,14 @@ pub fn fontSrc(gpa: std.mem.Allocator, font_ptr: *const text.Font) ![]u8 {
 /// a stylesheet, and under a strict Content Security Policy there is nowhere to
 /// put one. `add_font` exists because of that, and this stays for hosts that
 /// predate it.
-pub fn fontFaceCss(gpa: std.mem.Allocator, fonts: []const *text.Font) ![]u8 {
+pub fn fontFaceCss(gpa: std.mem.Allocator, base: []const u8, fonts: []const *text.Font) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
     for (fonts) |font_ptr| {
         var fam: [family_len]u8 = undefined;
-        const family = fontFamily(&fam, font_ptr);
-        if (font_ptr.url) |url| {
-            const face = try gpa.print("@font-face{{font-family:{s};src:url(\"{s}\") format(\"opentype\")}}", .{ family, url });
-            defer gpa.free(face);
-            try buf.appendSlice(gpa, face);
-            continue;
-        }
-        const enc = std.base64.standard.Encoder;
-        const b64 = try gpa.alloc(u8, enc.calcSize(font_ptr.bytes.len));
-        defer gpa.free(b64);
-        _ = enc.encode(b64, font_ptr.bytes);
-        const face = try gpa.print("@font-face{{font-family:{s};src:url(data:font/otf;base64,{s}) format(\"opentype\")}}", .{ family, b64 });
-        defer gpa.free(face);
-        try buf.appendSlice(gpa, face);
+        const src = try fontSrc(gpa, base, font_ptr);
+        defer gpa.free(src);
+        try buf.print(gpa, "@font-face{{font-family:{s};src:{s}}}", .{ fontFamily(&fam, font_ptr), src });
     }
     return buf.toOwnedSlice(gpa);
 }
@@ -1048,7 +1042,7 @@ test "dom_calls: a text primitive names its font the same way the font-face does
     // frame whose text used a different set.
     var fam: [family_len]u8 = undefined;
     const family = fontFamily(&fam, &font);
-    const decl = try fontFaceCss(gpa, &.{&font});
+    const decl = try fontFaceCss(gpa, "/", &.{&font});
     defer gpa.free(decl);
     try std.testing.expect(std.mem.indexOf(u8, decl, family) != null);
 
@@ -1972,7 +1966,7 @@ test "dom_calls: a font that is served as a file is referenced by url, never emb
     var font = try text.builtin.neuropol(gpa);
     defer font.deinit(gpa);
 
-    const css = try fontFaceCss(gpa, &.{&font});
+    const css = try fontFaceCss(gpa, "/", &.{&font});
     defer gpa.free(css);
 
     // `font-src 'self'` refuses a `data:` URL however the rule reached the
@@ -1980,7 +1974,7 @@ test "dom_calls: a font that is served as a file is referenced by url, never emb
     // measured against this font, so the glyphs a person sees and the rectangles
     // taps are tested against stop agreeing.
     try std.testing.expect(std.mem.indexOf(u8, css, "data:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, css, "url(\"fonts/Neuropol.otf\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "url(\"/fonts/Neuropol.otf\")") != null);
 }
 
 test "dom_calls: a font with nowhere to be fetched from still works, embedded" {
@@ -1991,7 +1985,7 @@ test "dom_calls: a font with nowhere to be fetched from still works, embedded" {
     defer font.deinit(gpa);
     try std.testing.expectEqual(@as(?[]const u8, null), font.url);
 
-    const css = try fontFaceCss(gpa, &.{&font});
+    const css = try fontFaceCss(gpa, "/", &.{&font});
     defer gpa.free(css);
     try std.testing.expect(std.mem.indexOf(u8, css, "data:font/otf;base64,") != null);
 }
@@ -2009,9 +2003,9 @@ test "dom_calls: two fonts get two different families, so neither can answer for
 
     // And the order they are declared in does not change what either is called,
     // which is exactly what an index could not promise.
-    const one = try fontFaceCss(gpa, &.{ &a, &b });
+    const one = try fontFaceCss(gpa, "/", &.{ &a, &b });
     defer gpa.free(one);
-    const other = try fontFaceCss(gpa, &.{ &b, &a });
+    const other = try fontFaceCss(gpa, "/", &.{ &b, &a });
     defer gpa.free(other);
     try std.testing.expect(std.mem.indexOf(u8, one, fontFamily(&fam_a, &a)) != null);
     try std.testing.expect(std.mem.indexOf(u8, other, fontFamily(&fam_a, &a)) != null);

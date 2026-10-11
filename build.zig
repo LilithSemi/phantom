@@ -188,10 +188,11 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
 
     // The web entry point is `build/web_entry.zig`, a real file rather than a
     // string in this one: it imports the consumer's source as `app_root`, calls
-    // `phantom.web.init`, and exports everything the host page calls. The one
-    // per-build value it cannot work out for itself arrives as a build option.
+    // `phantom.web.init`, and exports everything the host page calls. The
+    // per-build values it cannot work out for itself arrive as build options.
     const entry_options = b.addOptions();
     entry_options.addOption(bool, "strategy_is_hash", opts.url_strategy == .hash);
+    entry_options.addOption([]const u8, "base_path", opts.base_path);
 
     const wasm = b.addExecutable(.{
         .name = wasm_name,

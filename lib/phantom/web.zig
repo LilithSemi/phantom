@@ -137,7 +137,7 @@ pub const WebApp = struct {
 
             var fam: [phantom.backend.dom_calls.family_len]u8 = undefined;
             const family = phantom.backend.dom_calls.fontFamily(&fam, font_ptr);
-            const src = phantom.backend.dom_calls.fontSrc(self.gpa, font_ptr) catch {
+            const src = phantom.backend.dom_calls.fontSrc(self.gpa, self.ops.base, font_ptr) catch {
                 self.sink.report(.oom, "a font source could not be built");
                 return;
             };
@@ -2153,7 +2153,7 @@ test "a page drawn with the default theme embeds no font, so a strict font-src c
     var referenced = false;
     for (rec.log.items) |line| {
         if (std.mem.indexOf(u8, line, "data:font/otf") != null) embedded = true;
-        if (std.mem.indexOf(u8, line, "url(\"fonts/") != null) referenced = true;
+        if (std.mem.indexOf(u8, line, "url(\"/fonts/") != null) referenced = true;
     }
     try std.testing.expect(!embedded);
     try std.testing.expect(referenced);

@@ -20,9 +20,11 @@ const webidl = @import("webidl");
 const app_root = @import("app_root");
 
 /// Whether the build chose the hash url strategy (`/#/gallery`) over the path
-/// one (`/gallery`). The one thing about a web build this file cannot work out
-/// for itself, so it is the one thing passed in.
+/// one (`/gallery`). This file cannot work it out for itself, so the build
+/// passes it in.
 const strategy_is_hash = @import("build_options").strategy_is_hash;
+/// The path the site is served at, from `base_path` of `addApp`.
+const base_path = @import("build_options").base_path;
 
 const DomCtx = struct { doc: u32, window: u32 };
 var dom_ctx: DomCtx = undefined;
@@ -430,6 +432,7 @@ export fn init(doc_handle: u32, body_handle: u32, window_handle: u32, root_font:
         .clear_children = clearChildren,
         .body = body_handle,
         .head = head,
+        .base = base_path,
         .open_url = openUrl,
         .read_location = readLocation,
         .read_query = readQuery,
