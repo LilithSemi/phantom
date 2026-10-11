@@ -153,12 +153,30 @@ pub fn render(gpa: std.mem.Allocator, opts: Options) !Document {
     };
 }
 
+/// The paths `writePage` wrote, relative to its `out` directory, each once.
+pub const Written = struct {
+    paths: std.StringArrayHashMapUnmanaged(void) = .empty,
+
+    pub fn deinit(self: *Written, gpa: std.mem.Allocator) void {
+        for (self.paths.keys()) |path| gpa.free(path);
+        self.paths.deinit(gpa);
+        self.* = undefined;
+    }
+
+    fn add(self: *Written, gpa: std.mem.Allocator, path: []const u8) !void {
+        if (self.paths.contains(path)) return;
+        const owned = try gpa.dupe(u8, path);
+        errdefer gpa.free(owned);
+        try self.paths.put(gpa, owned, {});
+    }
+};
+
 /// Render `opts` and write the page, its stylesheet and its font files under
 /// `out`, each at the path the page uses for it under `opts.base`. The page of
 /// "/app/docs/intro" with base "/app/" goes to "docs/intro/index.html", and
-/// the page of the base itself to "index.html". This is how `addApp` writes
-/// its prerendered routes.
-pub fn writePage(gpa: std.mem.Allocator, out: std.Io.Dir, shell: []const u8, opts: Options) !void {
+/// the page of the base itself to "index.html". Each path goes into `written`
+/// too. This is how `addApp` writes its prerendered routes.
+pub fn writePage(gpa: std.mem.Allocator, out: std.Io.Dir, shell: []const u8, opts: Options, written: *Written) !void {
     if (!dom.validBase(opts.base)) return error.InvalidBase;
     if (!std.mem.startsWith(u8, opts.path, opts.base) and !std.mem.eql(u8, opts.path, opts.base[0 .. opts.base.len - 1])) {
         return error.PathOutsideBase;
@@ -179,9 +197,12 @@ pub fn writePage(gpa: std.mem.Allocator, out: std.Io.Dir, shell: []const u8, opt
     const page_path = try std.fs.path.join(gpa, &.{ dir, "index.html" });
     defer gpa.free(page_path);
     try writeFile(opts.io, out, page_path, page.written());
+    try written.add(gpa, page_path);
     try writeFile(opts.io, out, doc.css_path, doc.css);
+    try written.add(gpa, doc.css_path);
     for (doc.fonts) |font| {
         try writeFile(opts.io, out, font.path, font.bytes);
+        try written.add(gpa, font.path);
     }
 }
 
@@ -646,7 +667,9 @@ test "dpr reaches a mounted app the same way the browser's devicePixelRatio does
 }
 
 fn writeAt(out: std.Io.Dir, root: phantom.Root, path: []const u8, base: []const u8) !void {
-    try writePage(std.testing.allocator, out, test_shell, .{ .root = root, .path = path, .viewport = test_size, .base = base, .io = std.testing.io });
+    var written: Written = .{};
+    defer written.deinit(std.testing.allocator);
+    try writePage(std.testing.allocator, out, test_shell, .{ .root = root, .path = path, .viewport = test_size, .base = base, .io = std.testing.io }, &written);
 }
 
 fn readAt(dir: std.Io.Dir, path: []const u8) ![]u8 {
@@ -707,4 +730,36 @@ test "writePage refuses a path outside the base" {
     try std.testing.expectError(error.PathOutsideBase, writeAt(tmp.dir, root, "/other/about", "/app/"));
     try std.testing.expectError(error.PathOutsideBase, writeAt(tmp.dir, root, "/app/../x", "/app/"));
     try std.testing.expectError(error.InvalidBase, writeAt(tmp.dir, root, "/", ""));
+}
+
+test "writePage lists each page, stylesheet and font file it writes, once" {
+    const gpa = std.testing.allocator;
+    const Fixture = struct {
+        font: phantom.text.Font,
+
+        fn build(b: *phantom.BuildContext, self: *@This()) phantom.Widget {
+            return b.new(phantom.Text{ .text = "hi", .font = &self.font }).widget();
+        }
+    };
+    var fixture: Fixture = .{ .font = try phantom.text.Font.load(gpa, phantom.text.builtin.neuropol_bytes) };
+    defer fixture.font.deinit(gpa);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var written: Written = .{};
+    defer written.deinit(gpa);
+
+    const root = phantom.Root.of(Fixture, Fixture.build, &fixture);
+    for ([_][]const u8{ "/", "/about" }) |path| {
+        try writePage(gpa, tmp.dir, test_shell, .{ .root = root, .path = path, .viewport = test_size, .io = std.testing.io }, &written);
+    }
+    const paths = written.paths.keys();
+    try std.testing.expectEqual(@as(usize, 4), paths.len);
+    try std.testing.expectEqualStrings("index.html", paths[0]);
+    try std.testing.expect(std.mem.startsWith(u8, paths[1], "page-"));
+    try std.testing.expectEqualStrings("fonts/pf-0b107d216918b3e5.otf", paths[2]);
+    try std.testing.expectEqualStrings("about/index.html", paths[3]);
+    for (paths) |path| {
+        const bytes = try readAt(tmp.dir, path);
+        gpa.free(bytes);
+    }
 }

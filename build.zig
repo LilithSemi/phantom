@@ -114,10 +114,15 @@ fn addAppImports(app_mod: *std.Build.Module, phantom_mod: *std.Build.Module, imp
 pub const WebDist = struct {
     /// The directory that holds the page. Every path in `files` is relative to it.
     dir: std.Build.LazyPath,
-    /// Every file of the page, relative to `dir`, as the page refers to it.
-    /// The stylesheets and font files of prerendered routes are in `dir` but
-    /// not here: their names are content hashes made when the build runs.
+    /// Every file of the page, relative to `dir`, as the page refers to it,
+    /// except the files in `extra_files`.
     files: []const []const u8,
+    /// A text file that lists the prerendered pages, stylesheets and font
+    /// files, one path a line, relative to `dir`. Null with no
+    /// `prerender_routes`. The names are content hashes made when the build
+    /// runs, so an embedder must read this file in its own make step, not at
+    /// configure time.
+    extra_files: ?std.Build.LazyPath = null,
 };
 
 fn addWebApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.AppOptions) *std.Build.Step {
@@ -299,25 +304,22 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
         addDistFile(b, &files, rel);
     }
 
-    if (opts.prerender_routes.len > 0) {
-        addPrerender(b, phantom_dep, opts, html, dist, &files);
-    }
+    const extra_files = if (opts.prerender_routes.len > 0) addPrerender(b, phantom_dep, opts, html, dist) else null;
 
-    return .{ .dir = dist.getDirectory(), .files = files.items };
+    return .{ .dir = dist.getDirectory(), .files = files.items, .extra_files = extra_files };
 }
 
 /// Render `opts.prerender_routes` to static pages in `dist`. A host program
 /// built for the build machine runs the app root once and writes each page,
-/// its stylesheet and its font files. The stylesheet and font names are
-/// content hashes known only after the run, so `files` gets only the pages.
+/// its stylesheet and its font files. Returns the list of those files, see
+/// `WebDist.extra_files`.
 fn addPrerender(
     b: *std.Build,
     phantom_dep: *std.Build.Dependency,
     opts: appmeta.AppOptions,
     shell: []const u8,
     dist: *std.Build.Step.WriteFile,
-    files: *std.ArrayList([]const u8),
-) void {
+) ?std.Build.LazyPath {
     appmeta.checkPrerender(opts.url_strategy, opts.prerender_routes, opts.imports.len > 0) catch |err| {
         const why = switch (err) {
             error.HashRoute => "a .hash route lives after the '#', which a host never receives, so only \"/\" can be prerendered. Use url_strategy .path",
@@ -325,7 +327,7 @@ fn addPrerender(
             error.Imports => "the routes render in a host build, but the modules in `imports` are built for the web target and import its phantom module. Remove imports or prerender_routes",
         };
         dist.step.dependOn(&b.addFail(b.fmt("phantom.addApp: prerender_routes: {s}", .{why})).step);
-        return;
+        return null;
     };
 
     const host = b.graph.host;
@@ -362,13 +364,10 @@ fn addPrerender(
     const run = b.addRunArtifact(exe);
     run.addFileArg(b.addWriteFiles().add("shell.html", shell));
     const pages = run.addOutputDirectoryArg("pages");
+    const manifest = run.addOutputFileArg("files.txt");
     run.addArgs(opts.prerender_routes);
     _ = dist.addCopyDirectory(pages, "", .{});
-
-    for (opts.prerender_routes) |route| {
-        const dir = appmeta.pageDir(route);
-        addDistFile(b, files, if (dir.len == 0) "index.html" else b.fmt("{s}/index.html", .{dir}));
-    }
+    return manifest;
 }
 
 fn addDistFile(b: *std.Build, files: *std.ArrayList([]const u8), rel: []const u8) void {

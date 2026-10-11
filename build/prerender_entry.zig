@@ -2,8 +2,10 @@
 //!
 //! `addWebDist` builds this file for the build machine, with the consumer's
 //! source as `app_root`, and runs it once. The arguments are the shell page,
-//! the output directory, and then each route. `phantom.ssr.writePage` writes
-//! each page with its stylesheet and font files.
+//! the output directory, the manifest file, and then each route.
+//! `phantom.ssr.writePage` writes each page with its stylesheet and font
+//! files. The manifest lists every file written, one path a line, relative to
+//! the output directory.
 
 const std = @import("std");
 const phantom = @import("phantom");
@@ -14,7 +16,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len < 3) return error.MissingArgument;
+    if (args.len < 4) return error.MissingArgument;
 
     const cwd = std.Io.Dir.cwd();
     const shell = try cwd.readFileAlloc(io, args[1], gpa, .limited(1 << 20));
@@ -24,12 +26,28 @@ pub fn main(init: std.process.Init) !void {
     var out = try cwd.openDir(io, args[2], .{});
     defer out.close(io);
 
-    for (args[3..]) |route| {
-        try renderRoute(gpa, io, out, shell, route);
+    var written: phantom.ssr.Written = .{};
+    defer written.deinit(gpa);
+    for (args[4..]) |route| {
+        try renderRoute(gpa, io, out, shell, route, &written);
     }
+
+    var manifest: std.Io.Writer.Allocating = .init(gpa);
+    defer manifest.deinit();
+    for (written.paths.keys()) |path| {
+        try manifest.writer.print("{s}\n", .{path});
+    }
+    try cwd.writeFile(io, .{ .sub_path = args[3], .data = manifest.written() });
 }
 
-fn renderRoute(gpa: std.mem.Allocator, io: std.Io, out: std.Io.Dir, shell: []const u8, route: []const u8) !void {
+fn renderRoute(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    out: std.Io.Dir,
+    shell: []const u8,
+    route: []const u8,
+    written: *phantom.ssr.Written,
+) !void {
     // The live `.path` strategy reads the full pathname, base included.
     const path = try std.mem.concat(gpa, u8, &.{ options.base_path, std.mem.trim(u8, route, "/") });
     defer gpa.free(path);
@@ -39,5 +57,5 @@ fn renderRoute(gpa: std.mem.Allocator, io: std.Io, out: std.Io.Dir, shell: []con
         .viewport = .{ .width = @floatFromInt(options.width), .height = @floatFromInt(options.height) },
         .base = options.base_path,
         .io = io,
-    });
+    }, written);
 }
