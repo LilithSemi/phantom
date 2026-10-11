@@ -34,6 +34,13 @@ pub const RenderObject = struct {
     /// manager collects these in tree order too, and consults them last: after the
     /// focused node and after Tab and Escape.
     key_listener: ?*@import("focus.zig").FocusHandlers = null,
+    /// The offset of a render object that scrolls its children. Hit testing adds
+    /// it to a point before it tests a child, because a child records its
+    /// unscrolled position in `origin`.
+    scroll_offset: ?*const geom.PhysicalOffset = null,
+    /// The scrollbar tracks the last paint drew, in the space of `origin`. A point
+    /// on one goes to this render object and not to a child under it.
+    scroll_bars: [2]geom.PhysicalRect = @splat(.{ .x = 0, .y = 0, .width = 0, .height = 0 }),
     /// Identity of the concrete struct that embeds this base, set at construction
     /// with `typeId(T)`. Null means untagged: no parent may downcast it, which
     /// keeps every render object that does not need a downcast unchanged.

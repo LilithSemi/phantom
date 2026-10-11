@@ -564,3 +564,42 @@ test "mounting, scrolling and unmounting a ListView frees everything" {
     h.deinit();
     try std.testing.expect(!ctl.attached());
 }
+
+/// Rows 20 tall that record their index when tapped.
+const TapRows = struct {
+    tapped: ?usize = null,
+
+    const Tap = struct { rows: *TapRows, index: usize };
+
+    fn onTap(ctx: *anyopaque) void {
+        const tap: *Tap = @ptrCast(@alignCast(ctx));
+        tap.rows.tapped = tap.index;
+    }
+
+    fn build(ctx: *anyopaque, b: *BuildContext, index: usize) Widget {
+        const self: *TapRows = @ptrCast(@alignCast(ctx));
+        const tap = b.new(Tap{ .rows = self, .index = index });
+        const box = b.new(phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) });
+        const sized = b.new(phantom.SizedBox{ .height = 20, .child = box.widget() });
+        return b.new(phantom.GestureDetector{ .on_tap = onTap, .ctx = tap, .child = sized.widget() }).widget();
+    }
+};
+
+test "a tap on a scrolled ListView lands on the row under the pointer" {
+    const gpa = std.testing.allocator;
+    var rows = TapRows{};
+    var ctl = ScrollController{};
+    const list = ListView{ .count = 1000, .builder = TapRows.build, .ctx = &rows, .item_extent = 20, .controller = &ctl };
+    var h = try testing.mount(gpa, list.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 200, .height = 200 };
+    try h.pump();
+    try h.pump();
+
+    try std.testing.expect(ctl.jumpTo(.{ .x = 0, .y = 2000 }));
+    try h.pump();
+    try h.pump();
+    // Row 100 starts at content y 2000, so it is drawn at the top. y 50 is row 102.
+    h.tapAt(.{ .x = 10, .y = 50 });
+    try std.testing.expectEqual(@as(?usize, 102), rows.tapped);
+}

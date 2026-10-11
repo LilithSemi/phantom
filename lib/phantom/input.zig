@@ -6,24 +6,62 @@ const focus = @import("focus.zig");
 
 const Element = widget.Element;
 
+/// A pointer target and the shift that moves a window point into the space of
+/// its `origin`. The shift is the sum of the scroll offsets above the target.
+pub const Target = struct {
+    handlers: *pointer.PointerHandlers,
+    shift: geom.PhysicalOffset,
+};
+
 /// Walk the element tree (pre-order) and return the DEEPEST render object's
 /// pointer handlers whose absolute bounds [origin, origin+size] contain the
 /// point. Deepest means a child listener wins over a parent listener. Overlapping
 /// siblings are not disambiguated (z-order deferred); the last match wins.
 pub fn hitTest(root: *Element, point: geom.PhysicalOffset) ?*pointer.PointerHandlers {
-    var found: ?*pointer.PointerHandlers = null;
-    walk(root, point, &found);
+    const t = hitTarget(root, point) orelse return null;
+    return t.handlers;
+}
+
+/// Like `hitTest`, and also gives the shift into the target's space.
+pub fn hitTarget(root: *Element, point: geom.PhysicalOffset) ?Target {
+    var found: ?Target = null;
+    walk(root, point, .zero, &found, struct {
+        fn visit(f: *?Target, ro: *RenderObject, shift: geom.PhysicalOffset) void {
+            if (ro.pointer) |h| f.* = .{ .handlers = h, .shift = shift };
+        }
+    }.visit);
     return found;
 }
 
-fn walk(el: *Element, point: geom.PhysicalOffset, found: *?*pointer.PointerHandlers) void {
+/// Calls `visit` for each render object that contains the point, parents first.
+/// `shift` moves the window point into the space of the render object's origin.
+fn walk(
+    el: *Element,
+    point: geom.PhysicalOffset,
+    shift: geom.PhysicalOffset,
+    ctx: anytype,
+    comptime visit: fn (@TypeOf(ctx), *RenderObject, geom.PhysicalOffset) void,
+) void {
+    var inner = shift;
     if (el.render_object) |ro| {
-        if (ro.pointer) |h| {
-            if (contains(ro.origin, ro.size, point)) found.* = h;
-        }
+        const local = point.add(shift);
+        if (contains(ro.origin, ro.size, local)) visit(ctx, ro, shift);
+        inner = childShift(ro, local, shift) orelse return;
     }
-    if (el.child) |c| walk(c, point, found);
-    for (el.children.items) |c| walk(c, point, found);
+    if (el.child) |c| walk(c, point, inner, ctx, visit);
+    for (el.children.items) |c| walk(c, point, inner, ctx, visit);
+}
+
+/// The shift for the children of `ro`, or null when no child can take the point.
+/// Children of a scroll view are drawn moved by its offset and cut to its
+/// viewport, and its scrollbars cover them.
+fn childShift(ro: *const RenderObject, local: geom.PhysicalOffset, shift: geom.PhysicalOffset) ?geom.PhysicalOffset {
+    const offset = ro.scroll_offset orelse return shift;
+    if (!contains(ro.origin, ro.size, local)) return null;
+    for (ro.scroll_bars) |bar| {
+        if (contains(.{ .x = bar.x, .y = bar.y }, .{ .width = bar.width, .height = bar.height }, local)) return null;
+    }
+    return shift.add(offset.*);
 }
 
 fn contains(origin: geom.PhysicalOffset, size: geom.PhysicalSize, p: geom.PhysicalOffset) bool {
@@ -36,18 +74,14 @@ fn contains(origin: geom.PhysicalOffset, size: geom.PhysicalSize, p: geom.Physic
 /// This finds the innermost scrollable container (skips non-scrollable handlers).
 pub fn hitTestScroll(root: *Element, point: geom.PhysicalOffset) ?*pointer.PointerHandlers {
     var found: ?*pointer.PointerHandlers = null;
-    walkScroll(root, point, &found);
-    return found;
-}
-
-fn walkScroll(el: *Element, point: geom.PhysicalOffset, found: *?*pointer.PointerHandlers) void {
-    if (el.render_object) |ro| {
-        if (ro.pointer) |h| {
-            if (h.on_scroll != null and contains(ro.origin, ro.size, point)) found.* = h;
+    walk(root, point, .zero, &found, struct {
+        fn visit(f: *?*pointer.PointerHandlers, ro: *RenderObject, _: geom.PhysicalOffset) void {
+            if (ro.pointer) |h| if (h.on_scroll != null) {
+                f.* = h;
+            };
         }
-    }
-    if (el.child) |c| walkScroll(c, point, found);
-    for (el.children.items) |c| walkScroll(c, point, found);
+    }.visit);
+    return found;
 }
 
 /// Walk the element tree (pre-order) and return the DEEPEST render object's focus
@@ -62,18 +96,12 @@ fn walkScroll(el: *Element, point: geom.PhysicalOffset, found: *?*pointer.Pointe
 /// an outer focusable panel is the one the user aimed at.
 pub fn hitTestFocus(root: *Element, point: geom.PhysicalOffset) ?*focus.FocusHandlers {
     var found: ?*focus.FocusHandlers = null;
-    walkFocus(root, point, &found);
-    return found;
-}
-
-fn walkFocus(el: *Element, point: geom.PhysicalOffset, found: *?*focus.FocusHandlers) void {
-    if (el.render_object) |ro| {
-        if (ro.focus) |h| {
-            if (contains(ro.origin, ro.size, point)) found.* = h;
+    walk(root, point, .zero, &found, struct {
+        fn visit(f: *?*focus.FocusHandlers, ro: *RenderObject, _: geom.PhysicalOffset) void {
+            if (ro.focus) |h| f.* = h;
         }
-    }
-    if (el.child) |c| walkFocus(c, point, found);
-    for (el.children.items) |c| walkFocus(c, point, found);
+    }.visit);
+    return found;
 }
 
 /// A key, identified by its X11 keysym. The values match the ones Midstall's
@@ -174,33 +202,45 @@ pub const KeyEvent = struct {
 /// pressed target and delivers on_down; up delivers on_up to the SAME pressed
 /// target (passing the up position so a GestureDetector can decide tap-vs-cancel
 /// by its own bounds), then clears pressed. move delivers to the hit handler.
+///
+/// Each handler gets the position in the space of its own `origin`, so a target
+/// inside scrolled content compares it with its bounds directly.
 pub const Dispatcher = struct {
     pressed: ?*pointer.PointerHandlers = null,
+    pressed_shift: geom.PhysicalOffset = .zero,
     hovered: ?*pointer.PointerHandlers = null,
+    hovered_shift: geom.PhysicalOffset = .zero,
 
     pub fn down(self: *Dispatcher, root: *Element, point: geom.PhysicalOffset) void {
-        const h = hitTest(root, point);
-        self.pressed = h;
-        if (h) |hd| if (hd.on_down) |f| f(hd.ctx, .{ .position = point, .phase = .down });
+        const t = hitTarget(root, point) orelse {
+            self.pressed = null;
+            return;
+        };
+        self.pressed = t.handlers;
+        self.pressed_shift = t.shift;
+        if (t.handlers.on_down) |f| f(t.handlers.ctx, .{ .position = point.add(t.shift), .phase = .down });
     }
     pub fn up(self: *Dispatcher, root: *Element, point: geom.PhysicalOffset) void {
         if (self.pressed) |hd| {
-            if (hd.on_up) |f| f(hd.ctx, .{ .position = point, .phase = .up });
+            if (hd.on_up) |f| f(hd.ctx, .{ .position = point.add(self.pressed_shift), .phase = .up });
         }
         self.pressed = null;
         _ = root;
     }
     pub fn move(self: *Dispatcher, root: *Element, point: geom.PhysicalOffset) void {
-        const h = hitTest(root, point);
+        const t = hitTarget(root, point);
+        const h = if (t) |hit| hit.handlers else null;
+        const shift = if (t) |hit| hit.shift else geom.PhysicalOffset.zero;
         if (h != self.hovered) {
-            if (self.hovered) |old| if (old.on_leave) |f| f(old.ctx, .{ .position = point, .phase = .leave });
-            if (h) |new| if (new.on_enter) |f| f(new.ctx, .{ .position = point, .phase = .enter });
+            if (self.hovered) |old| if (old.on_leave) |f| f(old.ctx, .{ .position = point.add(self.hovered_shift), .phase = .leave });
+            if (h) |new| if (new.on_enter) |f| f(new.ctx, .{ .position = point.add(shift), .phase = .enter });
             self.hovered = h;
         }
-        if (h) |hd| if (hd.on_move) |f| f(hd.ctx, .{ .position = point, .phase = .move });
+        self.hovered_shift = shift;
+        if (h) |hd| if (hd.on_move) |f| f(hd.ctx, .{ .position = point.add(shift), .phase = .move });
     }
     pub fn clearHover(self: *Dispatcher, point: geom.PhysicalOffset) void {
-        if (self.hovered) |old| if (old.on_leave) |f| f(old.ctx, .{ .position = point, .phase = .leave });
+        if (self.hovered) |old| if (old.on_leave) |f| f(old.ctx, .{ .position = point.add(self.hovered_shift), .phase = .leave });
         self.hovered = null;
     }
 
@@ -218,23 +258,27 @@ pub const Dispatcher = struct {
     /// the delta. Does nothing if no scrollable is under the point.
     pub fn scroll(self: *Dispatcher, root: *Element, point: geom.PhysicalOffset, dx: f32, dy: f32) void {
         _ = self;
-        _ = deliverScroll(root, point, dx, dy);
+        _ = deliverScroll(root, point, .zero, dx, dy);
     }
 };
 
 /// Visits children before the parent, and later siblings first, which is the
 /// order `hitTestScroll` ranks them in. Returns true once a view moves.
-fn deliverScroll(el: *Element, point: geom.PhysicalOffset, dx: f32, dy: f32) bool {
-    var i = el.children.items.len;
-    while (i > 0) {
-        i -= 1;
-        if (deliverScroll(el.children.items[i], point, dx, dy)) return true;
+fn deliverScroll(el: *Element, point: geom.PhysicalOffset, shift: geom.PhysicalOffset, dx: f32, dy: f32) bool {
+    const local = point.add(shift);
+    const inner = if (el.render_object) |ro| childShift(ro, local, shift) else shift;
+    if (inner) |s| {
+        var i = el.children.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (deliverScroll(el.children.items[i], point, s, dx, dy)) return true;
+        }
+        if (el.child) |c| if (deliverScroll(c, point, s, dx, dy)) return true;
     }
-    if (el.child) |c| if (deliverScroll(c, point, dx, dy)) return true;
     const ro = el.render_object orelse return false;
     const h = ro.pointer orelse return false;
     const f = h.on_scroll orelse return false;
-    if (!contains(ro.origin, ro.size, point)) return false;
+    if (!contains(ro.origin, ro.size, local)) return false;
     return f(h.ctx, dx, dy);
 }
 
@@ -575,4 +619,42 @@ test "Dispatcher.scroll passes the delta out when the inner view cannot move" {
     disp.scroll(&outer_el, .{ .x = 40, .y = 40 }, 0, 5);
     try std.testing.expectEqual(@as(u32, 2), inner_count.calls);
     try std.testing.expectEqual(@as(u32, 1), outer_count.calls);
+}
+
+test "hit testing moves the point by a scroll offset and cuts at the viewport" {
+    const gpa = std.testing.allocator;
+    var sink = FaultSink{};
+    var owner = BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    var view = HitBox.make(100, 100);
+    view.base.pointer = &view.handlers;
+    var offset = geom.PhysicalOffset{ .x = 0, .y = 200 };
+    view.base.scroll_offset = &offset;
+    // A child at content y 250 is drawn at y 50 once the view scrolls by 200.
+    var child = HitBox.make(100, 40);
+    child.base.pointer = &child.handlers;
+    var below = HitBox.make(100, 40);
+    below.base.pointer = &below.handlers;
+    const vt = widget.Widget.VTable{ .mount = undefined, .update = undefined };
+    var child_el = Element{ .owner = &owner, .vtable = &vt, .type_name = "child", .render_object = &child.base };
+    var below_el = Element{ .owner = &owner, .vtable = &vt, .type_name = "below", .render_object = &below.base };
+    var view_el = Element{ .owner = &owner, .vtable = &vt, .type_name = "view", .render_object = &view.base };
+    try view_el.children.append(gpa, &child_el);
+    try view_el.children.append(gpa, &below_el);
+    defer view_el.children.deinit(gpa);
+    _ = view.base.layout(layout.BoxConstraints.tight(.{ .width = 100, .height = 100 }));
+    _ = child.base.layout(layout.BoxConstraints.tight(.{ .width = 100, .height = 40 }));
+    child.base.origin = .{ .x = 0, .y = 250 };
+    // Drawn at y 120 to 160, which is outside the viewport.
+    _ = below.base.layout(layout.BoxConstraints.tight(.{ .width = 100, .height = 40 }));
+    below.base.origin = .{ .x = 0, .y = 320 };
+
+    const t = hitTarget(&view_el, .{ .x = 10, .y = 60 }) orelse return error.NoHit;
+    try std.testing.expect(t.handlers == &child.handlers);
+    try std.testing.expectEqual(@as(f32, 200), t.shift.y);
+    try std.testing.expect(hitTest(&view_el, .{ .x = 10, .y = 130 }) == null);
+
+    // A point on a scrollbar goes to the view, not to the child under it.
+    view.base.scroll_bars[0] = .{ .x = 90, .y = 0, .width = 10, .height = 100 };
+    try std.testing.expect(hitTest(&view_el, .{ .x = 95, .y = 60 }) == &view.handlers);
 }

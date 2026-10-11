@@ -226,6 +226,7 @@ const RenderGridView = struct {
     fn installHandlers(self: *RenderGridView) void {
         self.handlers = .{ .ctx = self, .on_scroll = scrollThunk, .on_scroll_to = scrollToThunk };
         self.base.pointer = &self.handlers;
+        self.base.scroll_offset = &self.offset;
         self.focus_handlers = .{ .ctx = self, .on_key = onKey, .node = &self.base, .id = self.id.text };
         self.base.focus = &self.focus_handlers;
     }

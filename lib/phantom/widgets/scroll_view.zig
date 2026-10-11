@@ -329,6 +329,7 @@ const RenderScrollView = struct {
     fn installHandlers(self: *RenderScrollView) void {
         self.handlers = .{ .ctx = self, .on_scroll = scrollThunk, .on_scroll_to = scrollToThunk };
         self.base.pointer = &self.handlers;
+        self.base.scroll_offset = &self.offset;
         self.focus_handlers = .{
             .ctx = self,
             .on_key = onKey,
@@ -1006,11 +1007,104 @@ test "a wheel the inner view cannot use goes to the outer view" {
     const outer_ro: *RenderScrollView = @fieldParentPtr("base", h.root.render_object.?);
     const inner_ro = innerScrollView(h.root, h.root) orelse return error.NoInnerScrollView;
 
-    try h.scrollAt(.{ .x = 10, .y = 10 }, 0, 30);
-    try std.testing.expectEqual(@as(f32, 30), outer_ro.offset.y);
-    try std.testing.expectEqual(@as(f32, 0), inner_ro.offset.y);
-
     try h.scrollAt(.{ .x = 10, .y = 10 }, 30, 0);
     try std.testing.expectEqual(@as(f32, 30), inner_ro.offset.x);
     try std.testing.expectEqual(@as(f32, 0), outer_ro.offset.x);
+
+    // The inner view only scrolls across, so the outer view takes this one.
+    try h.scrollAt(.{ .x = 10, .y = 10 }, 0, 30);
+    try std.testing.expectEqual(@as(f32, 30), outer_ro.offset.y);
+    try std.testing.expectEqual(@as(f32, 0), inner_ro.offset.y);
+}
+
+// ---------------------------------------------------------------------------
+// Hit testing inside scrolled content
+// ---------------------------------------------------------------------------
+
+/// Ten rows of 100 that each record their index when tapped.
+const TapRows = struct {
+    leaf: phantom.ColoredBox = .{ .color = geom.Color.rgb(0, 1, 0) },
+    boxes: [10]phantom.SizedBox = undefined,
+    taps: [10]Tap = undefined,
+    detectors: [10]phantom.GestureDetector = undefined,
+    widgets: [10]phantom.Widget = undefined,
+    tapped: ?usize = null,
+
+    const Tap = struct { rows: *TapRows, index: usize };
+
+    fn onTap(ctx: *anyopaque) void {
+        const tap: *Tap = @ptrCast(@alignCast(ctx));
+        tap.rows.tapped = tap.index;
+    }
+
+    fn column(self: *TapRows) phantom.Flex {
+        for (0..10) |i| {
+            self.boxes[i] = .{ .width = 100, .height = 100, .child = self.leaf.widget() };
+            self.taps[i] = .{ .rows = self, .index = i };
+            self.detectors[i] = .{ .on_tap = onTap, .ctx = &self.taps[i], .child = self.boxes[i].widget() };
+            self.widgets[i] = self.detectors[i].widget();
+        }
+        return phantom.Column(.{ .main = .start, .cross = .start, .children = &self.widgets });
+    }
+};
+
+test "a tap after a scroll lands on the row drawn under the pointer" {
+    const gpa = std.testing.allocator;
+    var rows = TapRows{};
+    var col = rows.column();
+    var ctl = ScrollController{};
+    var sv = ScrollView{ .controller = &ctl, .child = col.widget() };
+    var h = try testing.mount(gpa, sv.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+
+    try std.testing.expect(ctl.jumpTo(.{ .x = 0, .y = 300 }));
+    try h.pump();
+    h.tapAt(.{ .x = 50, .y = 50 });
+    try std.testing.expectEqual(@as(?usize, 3), rows.tapped);
+}
+
+test "a tap below a scroll view does not reach a row scrolled into that area" {
+    const gpa = std.testing.allocator;
+    var rows = TapRows{};
+    var col = rows.column();
+    var sv = ScrollView{ .child = col.widget() };
+    const frame = phantom.SizedBox{ .width = 100, .height = 100, .child = sv.widget() };
+    const filler_box = phantom.ColoredBox{ .color = geom.Color.rgb(1, 0, 0) };
+    const filler = phantom.SizedBox{ .width = 100, .height = 100, .child = filler_box.widget() };
+    const page = phantom.Column(.{ .main = .start, .cross = .start, .children = &.{ frame.widget(), filler.widget() } });
+    var h = try testing.mount(gpa, page.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 200 };
+    try h.pump();
+
+    // Row 1 is laid out at y 100 to 200, below the viewport, where the filler shows.
+    h.tapAt(.{ .x = 50, .y = 150 });
+    try std.testing.expectEqual(@as(?usize, null), rows.tapped);
+    h.tapAt(.{ .x = 50, .y = 50 });
+    try std.testing.expectEqual(@as(?usize, 0), rows.tapped);
+}
+
+test "a wheel over a scrolled outer view reaches the inner view drawn there" {
+    const gpa = std.testing.allocator;
+    const box = phantom.ColoredBox{ .color = geom.Color.rgb(1, 1, 1) };
+    const filler = phantom.SizedBox{ .width = 100, .height = 200, .child = box.widget() };
+    const strip = phantom.SizedBox{ .width = 300, .height = 50, .child = box.widget() };
+    const inner = ScrollView{ .axis = .horizontal, .child = strip.widget() };
+    const tail = phantom.SizedBox{ .width = 100, .height = 1000, .child = box.widget() };
+    const col = phantom.Column(.{ .children = &.{ filler.widget(), inner.widget(), tail.widget() } });
+    var ctl = ScrollController{};
+    const outer = ScrollView{ .controller = &ctl, .child = col.widget() };
+    var h = try testing.mount(gpa, outer.widget());
+    defer h.deinit();
+    h.viewport = .{ .width = 100, .height = 100 };
+    try h.pump();
+    const inner_ro = innerScrollView(h.root, h.root) orelse return error.NoInnerScrollView;
+
+    // The inner view sits at content y 200 to 250, so a scroll of 200 draws it at the top.
+    try std.testing.expect(ctl.jumpTo(.{ .x = 0, .y = 200 }));
+    try h.pump();
+    try h.scrollAt(.{ .x = 10, .y = 10 }, 30, 0);
+    try std.testing.expectEqual(@as(f32, 30), inner_ro.offset.x);
 }
