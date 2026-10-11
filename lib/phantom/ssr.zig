@@ -143,13 +143,20 @@ pub const Document = struct {
     /// by a literal text search, not by parsing markup, so neither tag name
     /// may be upper or mixed case and no comment or string may hide one.
     pub fn writeHtml(self: Document, w: *std.Io.Writer, shell: []const u8) WriteError!void {
+        return self.writeHtmlQuery(w, shell, "");
+    }
+
+    /// `writeHtml` with `?query` after the stylesheet url when `query` is
+    /// not empty. `query` is written as is, so it must be safe in a double
+    /// quoted attribute.
+    pub fn writeHtmlQuery(self: Document, w: *std.Io.Writer, shell: []const u8, query: []const u8) WriteError!void {
         const head_end = std.mem.indexOf(u8, shell, "</head>") orelse return error.InvalidShell;
         const body_at = std.mem.indexOfPos(u8, shell, head_end, "<body") orelse return error.InvalidShell;
         const body_end = std.mem.indexOfScalarPos(u8, shell, body_at, '>') orelse return error.InvalidShell;
         if (shell[body_end - 1] == '/') return error.InvalidShell;
 
         try w.writeAll(shell[0..head_end]);
-        try w.print("<link rel=\"stylesheet\" href=\"{s}{s}\" />", .{ self.base, self.css_path });
+        try w.print("<link rel=\"stylesheet\" href=\"{s}{s}{s}{s}\" />", .{ self.base, self.css_path, if (query.len > 0) "?" else "", query });
         try w.writeAll(shell[head_end..body_end]);
         try w.print(" data-phantom-size=\"{d}x{d}\">", .{ self.size.width, self.size.height });
         try w.writeAll(self.html);
