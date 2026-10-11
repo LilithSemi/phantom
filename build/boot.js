@@ -341,6 +341,7 @@ const w = {
   dispatchTap: wrap(ex.dispatchTap), dispatchKey: wrap(ex.dispatchKey),
   dispatchChar: wrap(ex.dispatchChar), dispatchText: wrap(ex.dispatchText),
   locationChanged: wrap(ex.locationChanged), serverEvent: wrap(ex.serverEvent),
+  scrollChanged: wrap(ex.scrollChanged),
 };
 
 // True while the tree is on the stack, which under JSPI includes the
@@ -460,9 +461,29 @@ const drainEvents = async () => {
     await w.serverEvent(app, id, kind, ty[0], ty[1], da[0], da[1], li[0], li[1]);
   }
 };
+// Scroll regions. Each render builds new divs, so one listener on the
+// document catches them all. A scroll event does not bubble, so it has to
+// capture. Only the last offset of each element in a frame is sent. The
+// element is the key, not its index, because a render between the event
+// and the drain can give a different region the same index.
+const scrolled = new Map();
+document.addEventListener("scroll", (e) => {
+  if (e.target?.dataset?.phantomScroll === undefined) return;
+  scrolled.set(e.target, [e.target.scrollLeft, e.target.scrollTop]);
+}, true);
+const drainScrolls = async () => {
+  const changes = [...scrolled];
+  scrolled.clear();
+  for (const [el, [x, y]] of changes) {
+    if (!el.isConnected) continue;
+    const index = Number(el.dataset.phantomScroll);
+    await w.scrollChanged(app, index, x, y);
+  }
+};
 const frame = (t) => {
   enter(async () => {
     await drainEvents();
+    await drainScrolls();
     return w.tick(app, Date.now(), t);
   });
   requestAnimationFrame(frame);

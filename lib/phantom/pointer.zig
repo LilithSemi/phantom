@@ -20,4 +20,7 @@ pub const PointerHandlers = struct {
     /// Returns true when the view moved. A false return passes the delta to the
     /// next scrollable view out.
     on_scroll: ?*const fn (ctx: *anyopaque, dx: f32, dy: f32) bool = null,
+    /// Scroll to an absolute offset that something outside the tree already
+    /// shows, such as a browser scroll region. Returns true when the view moved.
+    on_scroll_to: ?*const fn (ctx: *anyopaque, x: f32, y: f32) bool = null,
 };

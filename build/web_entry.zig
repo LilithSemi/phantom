@@ -423,6 +423,12 @@ export fn tick(app: usize, wall_ms: f64, mono_ms: f64) void {
     const a: *phantom.web.WebApp = @ptrFromInt(app);
     a.tick(wall_ms, mono_ms);
 }
+// The browser scrolled the region the page tagged with `index`.
+export fn scrollChanged(app: usize, index: u32, x: f32, y: f32) void {
+    if (app == 0) return;
+    const a: *phantom.web.WebApp = @ptrFromInt(app);
+    a.scrollChanged(index, x, y);
+}
 // The browser moved back or forward. The address bar already shows the new
 // location, so this reads it back and tells the tree, rather than taking the
 // new path as a string argument: a string argument would need the JS host to

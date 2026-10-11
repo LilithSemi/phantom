@@ -5,6 +5,7 @@ const dom = @import("dom.zig");
 const text = @import("../text.zig");
 const image_mod = @import("../image/Image.zig");
 const icon_builtin = @import("../icon/builtin.zig");
+const pointer = @import("../pointer.zig");
 const svg_path = @import("../icon/svg_path.zig");
 const platform = @import("../platform.zig");
 const web_net = @import("../web_net.zig");
@@ -270,6 +271,9 @@ pub const ScrollMemory = struct {
     /// The outer div handle of each scroll region `render` created last
     /// frame, in creation order.
     handles: [max_scroll_regions]u32 = undefined,
+    /// The scroll handlers of the render object behind each region, at the
+    /// same index. Valid until the tree next rebuilds.
+    targets: [max_scroll_regions]?*pointer.PointerHandlers = undefined,
     count: usize = 0,
 };
 
@@ -561,7 +565,12 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 if (mem) |m| {
                     if (m.count < max_scroll_regions) {
                         if (m.count < saved_count) ops.writeScrollOffset(outer, saved[m.count]);
+                        // The page reports a scroll on this div by this index.
+                        var index_buf: [20]u8 = undefined;
+                        const index = try std.fmt.bufPrint(&index_buf, "{d}", .{m.count});
+                        ops.setAttribute(outer, "data-phantom-scroll", index);
                         m.handles[m.count] = outer;
+                        m.targets[m.count] = sr.handlers;
                         m.count += 1;
                     } else if (sink) |s| {
                         s.report(.region_overflow, "scroll region count exceeded max_scroll_regions, offset not tracked");
@@ -1536,6 +1545,38 @@ test "dom_calls: a host with no scroll offset hooks still renders a scroll regio
     // The region is still remembered, so a host that gains the hooks later
     // starts carrying its offset from the very next render.
     try std.testing.expectEqual(@as(usize, 1), mem.count);
+}
+
+test "dom_calls: each scroll region div names its index, and the memory keeps its handlers" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var mem = ScrollMemory{};
+    var first: u8 = 0;
+    var second: u8 = 0;
+    var first_handlers = pointer.PointerHandlers{ .ctx = &first };
+    var second_handlers = pointer.PointerHandlers{ .ctx = &second };
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    for ([_]*pointer.PointerHandlers{ &first_handlers, &second_handlers }) |h| {
+        try list.append(gpa, .{ .push_scroll = .{
+            .viewport = geometry.PhysicalRect{ .x = 0, .y = 0, .width = 100, .height = 50 },
+            .offset = geometry.PhysicalOffset{ .x = 0, .y = 0 },
+            .content = geometry.PhysicalSize{ .width = 100, .height = 300 },
+            .handlers = h,
+        } });
+        try list.append(gpa, .{ .pop_scroll = {} });
+    }
+
+    // Container 101, then outer 102 and inner 103, then outer 104 and inner 105.
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try std.testing.expect(contains(rec.log.items, "setAttribute(102,data-phantom-scroll,0)"));
+    try std.testing.expect(contains(rec.log.items, "setAttribute(104,data-phantom-scroll,1)"));
+    try std.testing.expect(!contains(rec.log.items, "setAttribute(103,data-phantom-scroll"));
+    try std.testing.expectEqual(@as(usize, 2), mem.count);
+    try std.testing.expectEqual(@as(?*pointer.PointerHandlers, &first_handlers), mem.targets[0]);
+    try std.testing.expectEqual(@as(?*pointer.PointerHandlers, &second_handlers), mem.targets[1]);
 }
 
 test "dom_calls: a rendered frame sets no style ATTRIBUTE anywhere, because a strict policy refuses every one" {

@@ -145,6 +145,7 @@ const RenderGridView = struct {
             .viewport = geom.PhysicalRect.fromOriginSize(offset, base.size),
             .offset = self.offset,
             .content = self.content,
+            .handlers = &self.handlers,
         });
         // Iterate by offsets length so a short offsets list (OOM during layout)
         // never indexes out of bounds; tiles beyond it are skipped this frame.
@@ -195,12 +196,13 @@ const RenderGridView = struct {
 
     fn scrollThunk(ctx: *anyopaque, dx: f32, dy: f32) bool {
         const self: *RenderGridView = @ptrCast(@alignCast(ctx));
+        return scrollToThunk(self, self.offset.x + dx, self.offset.y + dy);
+    }
+
+    fn scrollToThunk(ctx: *anyopaque, x: f32, y: f32) bool {
+        const self: *RenderGridView = @ptrCast(@alignCast(ctx));
         const before = self.offset;
-        self.offset = scroll_view.clampOffset(
-            .{ .x = self.offset.x + dx, .y = self.offset.y + dy },
-            self.content,
-            self.viewport,
-        );
+        self.offset = scroll_view.clampOffset(.{ .x = x, .y = y }, self.content, self.viewport);
         return self.offset.x != before.x or self.offset.y != before.y;
     }
 
@@ -213,7 +215,7 @@ const RenderGridView = struct {
     }
 
     fn installHandlers(self: *RenderGridView) void {
-        self.handlers = .{ .ctx = self, .on_scroll = scrollThunk };
+        self.handlers = .{ .ctx = self, .on_scroll = scrollThunk, .on_scroll_to = scrollToThunk };
         self.base.pointer = &self.handlers;
         self.focus_handlers = .{ .ctx = self, .on_key = onKey, .node = &self.base, .id = self.id.text };
         self.base.focus = &self.focus_handlers;

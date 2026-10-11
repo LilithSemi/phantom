@@ -148,6 +148,38 @@ pub const WebApp = struct {
         }
     }
 
+    /// Lay out and paint the tree into `canvas`. Returns false when the tree
+    /// has no render object to draw.
+    fn paint(self: *WebApp, canvas: *phantom.Canvas) bool {
+        const physical = self.view.metrics.size.toPhysical(self.view.metrics.text_scale);
+        const ro = self.root.renderObject() orelse return false;
+        _ = ro.layout(phantom.BoxConstraints.tightScaled(physical, self.view.metrics.text_scale));
+        // A dropped frame leaves the previous DOM on screen, which is
+        // indistinguishable from "nothing changed" unless it is recorded.
+        ro.paint(canvas, phantom.PhysicalOffset.zero) catch |err| {
+            self.sink.report(.render_failed, @errorName(err));
+        };
+        return true;
+    }
+
+    /// Called by the page when the browser scrolled region `index` of the last
+    /// frame to `x`, `y`. The view of that region takes the same offset.
+    ///
+    /// The browser already shows the new offset, so the DOM is not built again
+    /// here. A paint runs instead, which lets a `ListView` see the offset and
+    /// ask for new rows. The next tick then draws what was asked for. A DOM
+    /// rebuild on each scroll would replace the div under a scrollbar drag.
+    pub fn scrollChanged(self: *WebApp, index: u32, x: f32, y: f32) void {
+        if (index >= self.scroll_mem.count) return;
+        const h = self.scroll_mem.targets[index] orelse return;
+        const scroll_to = h.on_scroll_to orelse return;
+        if (!scroll_to(h.ctx, x, y)) return;
+        var canvas = phantom.Canvas.init(self.gpa);
+        canvas.sink = self.sink;
+        defer canvas.deinit();
+        _ = self.paint(&canvas);
+    }
+
     pub fn render(self: *WebApp) void {
         // One BuildContext per render for flushDirty + layout + paint.
         var bctx = phantom.BuildContext{ .arena = self.arena.allocator(), .owner = self.owner };
@@ -166,13 +198,11 @@ pub const WebApp = struct {
         var canvas = phantom.Canvas.init(self.gpa);
         canvas.sink = self.sink;
         defer canvas.deinit();
-        const ro = self.root.renderObject() orelse return;
-        _ = ro.layout(phantom.BoxConstraints.tightScaled(physical, self.view.metrics.text_scale));
-        // A dropped frame leaves the previous DOM on screen, which is
-        // indistinguishable from "nothing changed" unless it is recorded.
-        ro.paint(&canvas, phantom.PhysicalOffset.zero) catch |err| {
-            self.sink.report(.render_failed, @errorName(err));
-        };
+        if (!self.paint(&canvas)) {
+            // The rebuild above can have freed the render objects these point at.
+            for (self.scroll_mem.targets[0..self.scroll_mem.count]) |*t| t.* = null;
+            return;
+        }
         // Before the frame reaches the DOM, so a face exists by the time any
         // text asks for it. See `registerFonts`.
         self.registerFonts(canvas.list);
@@ -1175,6 +1205,70 @@ test "locationChanged does nothing when the host has no read_location hook, rath
 
     app.locationChanged();
 
+    try std.testing.expect(app.sink.ok());
+}
+
+// ---------------------------------------------------------------------------
+// Scroll offsets the browser reports back.
+// ---------------------------------------------------------------------------
+
+var scroll_ctl: phantom.ScrollController = .{};
+
+fn tallScrollRoot(b: *phantom.BuildContext) phantom.Widget {
+    const box = b.new(phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) });
+    const tall = b.new(phantom.SizedBox{ .height = 2000, .child = box.widget() });
+    return b.new(phantom.ScrollView{ .controller = &scroll_ctl, .child = tall.widget() }).widget();
+}
+
+test "a scroll the browser reports moves the ScrollView of that region" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    scroll_ctl = .{};
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(tallScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    // The browser already shows the offset, so the DOM is left alone.
+    const lines = rec.log.items.len;
+    app.scrollChanged(0, 0, 500);
+    try std.testing.expectEqual(@as(f32, 500), scroll_ctl.offset().?.y);
+    try std.testing.expectEqual(lines, rec.log.items.len);
+    app.tick(0, 16);
+    try std.testing.expectEqual(lines, rec.log.items.len);
+
+    // An index past the regions of the last frame is dropped.
+    app.scrollChanged(7, 0, 100);
+    try std.testing.expectEqual(@as(f32, 500), scroll_ctl.offset().?.y);
+    try std.testing.expect(app.sink.ok());
+}
+
+var list_rows_highest: usize = 0;
+
+fn listRow(_: *anyopaque, b: *phantom.BuildContext, index: usize) phantom.Widget {
+    list_rows_highest = @max(list_rows_highest, index);
+    const box = b.new(phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1) });
+    return b.new(phantom.SizedBox{ .height = 20, .child = box.widget() }).widget();
+}
+
+fn listRoot(b: *phantom.BuildContext) phantom.Widget {
+    return b.new(phantom.ListView{ .count = 10_000, .builder = listRow, .item_extent = 20, .controller = &scroll_ctl }).widget();
+}
+
+test "a scroll the browser reports far down a ListView builds the rows there" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    scroll_ctl = .{};
+    list_rows_highest = 0;
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(listRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+    try std.testing.expect(list_rows_highest < 40);
+
+    app.scrollChanged(0, 0, 50_000);
+    // The frame after the scroll builds the rows the window asked for.
+    app.tick(0, 16);
+    try std.testing.expectEqual(@as(f32, 50_000), scroll_ctl.offset().?.y);
+    try std.testing.expect(list_rows_highest >= 2510);
     try std.testing.expect(app.sink.ok());
 }
 

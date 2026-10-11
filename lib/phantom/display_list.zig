@@ -1,5 +1,6 @@
 const std = @import("std");
 const geom = @import("geometry.zig");
+const pointer = @import("pointer.zig");
 /// The icon subsystem imports nothing from here, so naming `Id` directly costs
 /// no cycle and spares every backend an untyped integer to switch on. Fonts are
 /// type-erased above only because text.zig does import this module.
@@ -49,6 +50,9 @@ pub const ScrollRegion = struct {
     viewport: geom.PhysicalRect,
     offset: geom.PhysicalOffset,
     content: geom.PhysicalSize,
+    /// The handlers of the render object that scrolls this region. A backend
+    /// that scrolls by itself uses them to send the new offset back.
+    handlers: ?*pointer.PointerHandlers = null,
 };
 
 /// A rounded rectangle that bounds everything drawn until the matching
