@@ -371,7 +371,7 @@ test "renderPage: filled rrect uses background and no border; stroked rrect uses
     try std.testing.expect(std.mem.indexOf(u8, html, expected_filled) != null);
 }
 
-test "renderPage: plain filled rrect is byte-identical (no class, no pb style)" {
+test "renderPage: plain filled rrect has its own class and no pb style" {
     var list = dl.DisplayList{};
     defer list.deinit(std.testing.allocator);
     try list.append(std.testing.allocator, .{ .rrect = .{

@@ -43,6 +43,7 @@ pub const ErrorBox = struct {
         _ = ptr;
         const gpa = bctx.owner.gpa;
         const ro = try gpa.create(RenderErrorBox);
+        errdefer gpa.destroy(ro);
         ro.* = .{ .base = .{ .layoutFn = RenderErrorBox.layoutFn, .paintFn = RenderErrorBox.paintFn, .destroyFn = RenderErrorBox.destroyFn } };
         const el = try gpa.create(Element);
         el.* = .{ .owner = bctx.owner, .parent = parent, .vtable = &vtable, .type_name = @typeName(ErrorBox), .render_object = &ro.base, .depth = phantom.widget.depthOf(parent) };

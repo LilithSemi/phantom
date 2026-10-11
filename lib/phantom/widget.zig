@@ -129,7 +129,8 @@ pub const Element = struct {
     ///   new == null      -> unmount old (if any), return null
     ///   old == null      -> mount new, return fresh element
     ///   same vtable      -> update old in place, return old
-    ///   different vtable  -> unmount old, mount new, return fresh
+    ///   different vtable  -> mount new, unmount old, return fresh
+    /// On an error `old` is still alive, and the caller still owns it.
     pub fn updateChild(self: *Element, old: ?*Element, new_widget: ?Widget, bctx: *BuildContext) anyerror!?*Element {
         const gpa = bctx.owner.gpa;
         if (new_widget == null) {
@@ -142,9 +143,12 @@ pub const Element = struct {
                 try nw.update(o, bctx);
                 return o;
             }
-            o.deinit(gpa);
         }
-        return try nw.mount(bctx, self);
+        // The new element mounts first, so a failed mount leaves `old` in
+        // its slot and alive.
+        const fresh = try nw.mount(bctx, self);
+        if (old) |o| o.deinit(gpa);
+        return fresh;
     }
 
     /// Positionally reconcile `self.children` against `new_widgets` (no keys):
@@ -162,6 +166,7 @@ pub const Element = struct {
                 self.children.items[i] = updated.?;
             } else {
                 const mounted = try w.mount(bctx, self);
+                errdefer mounted.deinit(gpa);
                 try self.children.append(gpa, mounted);
             }
         }
@@ -179,7 +184,10 @@ pub const Element = struct {
         const built = sv.build(self.state.?, bctx) catch |e| {
             bctx.owner.sink.report(.state_update, @errorName(e));
             const eb = phantom.ErrorBox{};
-            self.child = self.updateChild(self.child, eb.widget(), bctx) catch null;
+            self.child = self.updateChild(self.child, eb.widget(), bctx) catch blk: {
+                if (self.child) |c| c.deinit(bctx.owner.gpa);
+                break :blk null;
+            };
             self.reattachAfterChildChange();
             return;
         };
@@ -371,6 +379,44 @@ test "updateChildren positionally reconciles: grow, shrink, type-change in place
     try std.testing.expectEqual(@as(usize, 1), parent.children.items.len);
     // identity changed (the ColoredBox element was unmounted and an ErrorBox mounted)
     try std.testing.expect(parent.children.items[0] != kept0);
+}
+
+test "updateChildren that runs out of memory keeps each child alive or frees it" {
+    const gpa = std.testing.allocator;
+    const box = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 1), .radius = 0 };
+    const eb = phantom.ErrorBox{};
+    var fail_index: usize = 0;
+    var failed: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{});
+        const fa = failing.allocator();
+        var sink = FaultSink{};
+        var owner = BuildOwner{ .gpa = fa, .sink = &sink };
+        defer owner.deinit();
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var bctx = BuildContext{ .arena = arena.allocator(), .owner = &owner };
+        const vt = Widget.VTable{ .mount = undefined, .update = undefined };
+        var parent = Element{ .owner = &owner, .vtable = &vt, .type_name = "parent" };
+        defer {
+            for (parent.children.items) |c| c.deinit(fa);
+            parent.children.deinit(fa);
+        }
+        // Room for one child only, so a new child must grow the list.
+        try parent.children.ensureTotalCapacityPrecise(fa, 1);
+        parent.children.appendAssumeCapacity(try box.widget().mount(&bctx, &parent));
+
+        // A replaced first child and two new ones, with one allocation failing.
+        failing.fail_index = failing.alloc_index + fail_index;
+        parent.updateChildren(&.{ eb.widget(), box.widget(), box.widget() }, &bctx) catch {
+            failed += 1;
+            continue;
+        };
+        try std.testing.expectEqual(@as(usize, 3), parent.children.items.len);
+        break;
+    }
+    try std.testing.expect(fail_index < 64);
+    try std.testing.expect(failed > 0);
 }
 
 test "updateChild updates same-type in place and replaces on type change" {

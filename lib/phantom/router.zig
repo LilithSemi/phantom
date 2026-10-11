@@ -152,6 +152,7 @@ pub const RouterScope = struct {
             .inherited_data = self.handle,
             .depth = phantom.widget.depthOf(parent),
         };
+        errdefer el.deinit(bctx.owner.gpa);
         el.child = try el.updateChild(null, self.child, bctx);
         return el;
     }

@@ -65,6 +65,7 @@ pub const Padding = struct {
         const self: *const Padding = @ptrCast(@alignCast(ptr));
         const gpa = bctx.owner.gpa;
         const ro = try gpa.create(RenderPadding);
+        errdefer gpa.destroy(ro);
         ro.* = .{
             .base = .{ .layoutFn = RenderPadding.layoutFn, .paintFn = RenderPadding.paintFn, .adoptChildFn = RenderPadding.adoptChildFn, .destroyFn = RenderPadding.destroyFn },
             .insets = self.insets,
@@ -89,7 +90,10 @@ pub const Padding = struct {
         el.child = el.updateChild(el.child, self.child, bctx) catch |e| blk: {
             bctx.owner.sink.report(.build_failed, @errorName(e));
             const eb = phantom.ErrorBox{};
-            break :blk el.updateChild(el.child, eb.widget(), bctx) catch null;
+            break :blk el.updateChild(el.child, eb.widget(), bctx) catch {
+                if (el.child) |c| c.deinit(bctx.owner.gpa);
+                break :blk null;
+            };
         };
         ro.base.adoptChild(if (el.child) |c| c.renderObject() else null);
     }

@@ -44,6 +44,7 @@ pub const ColoredBox = struct {
         const self: *const ColoredBox = @ptrCast(@alignCast(ptr));
         const gpa = bctx.owner.gpa;
         const ro = try gpa.create(RenderColoredBox);
+        errdefer gpa.destroy(ro);
         ro.* = .{
             .base = .{ .layoutFn = RenderColoredBox.layoutFn, .paintFn = RenderColoredBox.paintFn, .destroyFn = RenderColoredBox.destroyFn },
             .color = self.color,

@@ -352,9 +352,9 @@ const Host = struct {
     }
 
     /// `randomSecure` can fail from a pending cancel alone, which happens
-    /// when Chock cancels the request task, even though the source itself
-    /// still works. This hook must never answer false for that, so a failed
-    /// `randomSecure` falls back to `random`, which cannot fail.
+    /// when the embedder cancels the request task, even though the source
+    /// itself still works. This hook must never answer false for that, so a
+    /// failed `randomSecure` falls back to `random`, which cannot fail.
     fn fillRandom(ctx: *anyopaque, buf: []u8) bool {
         const self: *Host = @ptrCast(@alignCast(ctx));
         std.Io.randomSecure(self.io, buf) catch std.Io.random(self.io, buf);

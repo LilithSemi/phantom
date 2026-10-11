@@ -55,6 +55,7 @@ pub const MediaQuery = struct {
             .inherited_data = self.data,
             .depth = depthOf(parent),
         };
+        errdefer el.deinit(bctx.owner.gpa);
         el.child = try el.updateChild(null, self.child, bctx);
         return el;
     }

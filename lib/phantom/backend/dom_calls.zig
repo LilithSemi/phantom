@@ -761,8 +761,13 @@ const Walk = struct {
         if (node.style.len > 0) self.ops.setStyle(h.handle, node.style);
         for (node.attrs) |attr| self.ops.setAttribute(h.handle, attr.name, attr.value);
         if (findAttr(node.attrs, "class") == null) self.ops.removeAttribute(h.handle, "class");
+        const div = node.kind == .element and std.mem.eql(u8, node.tag, "div");
+        // A div at the place of a server scroll region must not read as one.
+        if (div and findAttr(node.attrs, "data-phantom-scroll") == null) {
+            self.ops.removeAttribute(h.handle, "data-phantom-scroll");
+        }
         // A box at the place of a server text div must lose the text.
-        const leaf_div = node.kind == .element and node.children.len == 0 and std.mem.eql(u8, node.tag, "div");
+        const leaf_div = div and node.children.len == 0;
         if (node.text.len > 0 or leaf_div) self.ops.setTextContent(h.handle, node.text);
         for (node.children, h.children) |child, *ch| self.restyle(child, ch, depth + 1);
     }
@@ -2977,4 +2982,40 @@ test "dom_calls: a region whose view is not at the top keeps its offset through 
     try std.testing.expect(!contains(after, "writeScrollOffset("));
     try std.testing.expectEqual(@as(f32, 40), view.offset.y);
     try std.testing.expect(!mem.synced);
+}
+
+test "dom_calls: a clip adopted at a server scroll region loses the region mark" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var view = TestView{};
+    view.init();
+    const row: display_list.Primitive = .{ .rrect = .{ .rect = .{ .x = 0, .y = 0, .width = 100, .height = 20 }, .radius = 0, .color = geometry.Color.rgb(0, 0, 1) } };
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, testRegion(&view));
+    try list.append(gpa, row);
+    try list.append(gpa, .{ .pop_scroll = {} });
+    const size: geometry.PhysicalSize = .{ .width = 200, .height = 100 };
+    const bg = geometry.Color.rgb(0, 0, 0);
+    // Container 101, outer 102, inner 103, row 104.
+    _ = try servePage(&rec, arena_state.allocator(), list, size);
+
+    // The client draws two clips of the same shape.
+    list.clear();
+    const clip: display_list.Primitive = .{ .push_clip = .{ .rect = .{ .x = 0, .y = 0, .width = 100, .height = 50 } } };
+    try list.append(gpa, clip);
+    try list.append(gpa, clip);
+    try list.append(gpa, row);
+    try list.append(gpa, .{ .pop_clip = {} });
+    try list.append(gpa, .{ .pop_clip = {} });
+    try std.testing.expect(try hydrate(gpa, rec.ops(), list, size, bg, null, &page));
+    try std.testing.expect(contains(rec.log.items, "removeAttribute(102,data-phantom-scroll)"));
+    try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "setAttribute(102,data-phantom-scroll"));
+    try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "createElement"));
+    try std.testing.expectEqual(@as(usize, 0), rec.misuse);
 }
