@@ -115,6 +115,8 @@ pub const WebDist = struct {
     /// The directory that holds the page. Every path in `files` is relative to it.
     dir: std.Build.LazyPath,
     /// Every file of the page, relative to `dir`, as the page refers to it.
+    /// The stylesheets and font files of prerendered routes are in `dir` but
+    /// not here: their names are content hashes made when the build runs.
     files: []const []const u8,
 };
 
@@ -254,12 +256,15 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
     // generated document.
     const name_html = appmeta.xmlEscape(b.allocator, opts.name.default) catch @panic("oom");
     const summary_html = appmeta.xmlEscape(b.allocator, opts.summary.default) catch @panic("oom");
-    // A prerendered route installs THIS page one directory down, where `./`
-    // resolves somewhere else, so the base tag has to be there even at the root.
-    const prerendered = opts.url_strategy == .path and opts.prerender_routes.len > 0;
-    const html = buildIndexHtml(b, opts.base_path, prerendered, name_html, summary_html);
-    _ = dist.add("index.html", html);
-    addDistFile(b, &files, "index.html");
+    const base_html = appmeta.xmlEscape(b.allocator, opts.base_path) catch @panic("oom");
+    const html = buildIndexHtml(b, base_html, name_html, summary_html);
+    const root_prerendered = for (opts.prerender_routes) |route| {
+        if (appmeta.pageDir(route).len == 0) break true;
+    } else false;
+    if (!root_prerendered) {
+        _ = dist.add("index.html", html);
+        addDistFile(b, &files, "index.html");
+    }
 
     // The page's logic, as a file beside it. See `buildIndexHtml`: an inline
     // script is refused by any strict Content Security Policy, and a blank page
@@ -294,34 +299,75 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
         addDistFile(b, &files, rel);
     }
 
-    // prerender_routes only means something with the .path strategy: a .hash
-    // route lives after the '#', so a host never requests the plain path and
-    // the extra copy goes unused. Report it rather than fail the build, since
-    // the app still works, it just carries a dead copy.
-    if (opts.url_strategy == .hash and opts.prerender_routes.len > 0) {
-        std.log.warn(
-            "phantom.addApp: prerender_routes is set but url_strategy is .hash ({d} routes ignored)",
-            .{opts.prerender_routes.len},
-        );
-    }
-
-    // With the .path strategy, write a standalone copy of the page at each
-    // route so a static host answers a refresh with 200 instead of 404.
-    // "/gallery" becomes "gallery/index.html", so a static host serves the
-    // same application for that path with no rewrite rule. A route with a '/'
-    // inside it, such as "/docs/intro", works the same way, because the path
-    // keeps the separator.
-    if (opts.url_strategy == .path) {
-        for (opts.prerender_routes) |route| {
-            const trimmed = std.mem.trim(u8, route, "/");
-            if (trimmed.len == 0) continue;
-            const rel = b.fmt("{s}/index.html", .{trimmed});
-            _ = dist.add(rel, html);
-            addDistFile(b, &files, rel);
-        }
+    if (opts.prerender_routes.len > 0) {
+        addPrerender(b, phantom_dep, opts, html, dist, &files);
     }
 
     return .{ .dir = dist.getDirectory(), .files = files.items };
+}
+
+/// Render `opts.prerender_routes` to static pages in `dist`. A host program
+/// built for the build machine runs the app root once and writes each page,
+/// its stylesheet and its font files. The stylesheet and font names are
+/// content hashes known only after the run, so `files` gets only the pages.
+fn addPrerender(
+    b: *std.Build,
+    phantom_dep: *std.Build.Dependency,
+    opts: appmeta.AppOptions,
+    shell: []const u8,
+    dist: *std.Build.Step.WriteFile,
+    files: *std.ArrayList([]const u8),
+) void {
+    appmeta.checkPrerender(opts.url_strategy, opts.prerender_routes) catch |err| {
+        const why = switch (err) {
+            error.HashRoute => "a .hash route lives after the '#', which a host never receives, so only \"/\" can be prerendered. Use url_strategy .path",
+            error.InvalidRoute => "each route must start with '/' and have no query, fragment, '\\' or \".\" or \"..\" segment",
+        };
+        dist.step.dependOn(&b.addFail(b.fmt("phantom.addApp: prerender_routes: {s}", .{why})).step);
+        return;
+    };
+
+    const host = b.graph.host;
+    const phantom_host = b.createModule(.{
+        .root_source_file = phantom_dep.builder.path("lib/phantom.zig"),
+        .target = host,
+        .optimize = opts.optimize,
+    });
+    const app_mod = b.createModule(.{
+        .root_source_file = opts.root,
+        .target = host,
+        .optimize = opts.optimize,
+    });
+    app_mod.addImport("phantom", phantom_host);
+    addAppImports(app_mod, phantom_host, opts.imports);
+
+    const entry_options = b.addOptions();
+    entry_options.addOption([]const u8, "base_path", opts.base_path);
+    entry_options.addOption(u32, "width", opts.default_size.width);
+    entry_options.addOption(u32, "height", opts.default_size.height);
+
+    const exe = b.addExecutable(.{
+        .name = b.fmt("{s}-prerender", .{execName(b, opts.id, opts.exec_name)}),
+        .root_module = b.createModule(.{
+            .root_source_file = phantom_dep.builder.path("build/prerender_entry.zig"),
+            .target = host,
+            .optimize = opts.optimize,
+        }),
+    });
+    exe.root_module.addImport("build_options", entry_options.createModule());
+    exe.root_module.addImport("phantom", phantom_host);
+    exe.root_module.addImport("app_root", app_mod);
+
+    const run = b.addRunArtifact(exe);
+    run.addFileArg(b.addWriteFiles().add("shell.html", shell));
+    const pages = run.addOutputDirectoryArg("pages");
+    run.addArgs(opts.prerender_routes);
+    _ = dist.addCopyDirectory(pages, "", .{});
+
+    for (opts.prerender_routes) |route| {
+        const dir = appmeta.pageDir(route);
+        addDistFile(b, files, if (dir.len == 0) "index.html" else b.fmt("{s}/index.html", .{dir}));
+    }
 }
 
 fn addDistFile(b: *std.Build, files: *std.ArrayList([]const u8), rel: []const u8) void {
@@ -337,11 +383,11 @@ fn addDistFile(b: *std.Build, files: *std.ArrayList([]const u8), rel: []const u8
 // (node/bun `-e` eval mode does not expose a positional arg at a stable argv
 // index, so an env var is used uniformly).
 // Content-Type: .wasm -> application/wasm, .js -> text/javascript,
-// .html -> text/html, anything else -> application/octet-stream.
+// .html -> text/html, .css -> text/css, .otf -> font/otf, anything else ->
+// application/octet-stream.
 // A path with no file extension is a route, not a file, so it maps to that
-// path's own index.html. This mirrors the prerendered copies addWebApp
-// writes for the .path url strategy, so a browser refresh on a route works
-// on the dev server the same way it works on a static host.
+// path's own index.html, the page addWebApp prerenders for it. A route with
+// no prerendered page gets the root index.html, so the app still opens there.
 // Each script resolves the request against the served root and refuses a
 // path that escapes it (a "../" walk answers 404), so a client cannot read
 // files elsewhere on the developer's disk.
@@ -499,39 +545,29 @@ fn addRuntimeModules(
 /// with a console violation. As a file it is `'self'` and needs no policy change
 /// from anyone.
 ///
-/// `<base>` is emitted only when it does something.
-///
-/// It fixes where `./boot.js` and `./app.wasm` resolve from, and it is needed in
-/// exactly two cases: an application served under a sub-path, and a prerendered
-/// route, where THE SAME page is installed at `/gallery/index.html` and would
-/// otherwise look for its script one directory down. A page served from the root
-/// with no prerendered copies needs none of that, and `base-uri 'none'` refuses
-/// the tag, so emitting it there buys a policy violation on every load and
-/// nothing else.
+/// The boot script is loaded from `base_path` by a root-absolute url, so the
+/// same shell boots at "/", at "/docs/intro" and under a sub-path site. A
+/// `<base>` tag would do the same for a relative url, but `base-uri 'none'`
+/// refuses it. The boot script finds the wasm and runtime from its own url.
 fn buildIndexHtml(
     b: *std.Build,
-    base_path: []const u8,
-    prerendered: bool,
+    base_html: []const u8,
     name_html: []const u8,
     summary_html: []const u8,
 ) []const u8 {
-    const base_tag = if (std.mem.eql(u8, base_path, "/") and !prerendered)
-        ""
-    else
-        b.fmt("\n    <base href=\"{s}\" />", .{base_path});
     return b.fmt(
         \\<!DOCTYPE html>
         \\<html>
         \\  <head>
-        \\    <meta charset="utf-8" />{s}
+        \\    <meta charset="utf-8" />
         \\    <title>{s}</title>
         \\    <meta name="description" content="{s}" />
         \\  </head>
         \\  <body>
-        \\    <script type="module" src="./boot.js"></script>
+        \\    <script type="module" src="{s}boot.js"></script>
         \\  </body>
         \\</html>
-    , .{ base_tag, name_html, summary_html });
+    , .{ name_html, summary_html, base_html });
 }
 
 /// Everything the page does, as a module served beside the wasm. See

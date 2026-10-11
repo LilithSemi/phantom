@@ -75,17 +75,45 @@ pub const AppOptions = struct {
     optimize: std.lang.Optimize,
     web_runtime: WebRuntime = .auto,
     url_strategy: UrlStrategy = .hash,
-    /// Paths that get their own copy of the page, so a refresh works on a static
-    /// host. Only read with the `.path` strategy. `/` is always written.
+    /// Routes that `zig build` renders to static pages, such as "/" or
+    /// "/docs/intro". Each page holds the first frame of that route at
+    /// `default_size`, so a static host shows it before the wasm boots and
+    /// answers a refresh with 200. A route other than "/" needs the `.path`
+    /// strategy. The root page is a plain shell when "/" is not listed.
     prerender_routes: []const []const u8 = &.{},
-    /// The site root the generated page's assets resolve against, emitted as
-    /// `<base href="...">`. A prerendered copy is reachable as both
-    /// "/gallery" and "/gallery/", and a browser resolves a relative URL
-    /// differently for each, so no relative prefix works for both; a fixed
-    /// base does. Set this when the site is hosted under a subdirectory.
-    /// Must start and end with '/'. Validate with `validateBasePath`.
+    /// The size in phantom px that prerendered pages are laid out at.
+    default_size: Size = .{ .width = 1280, .height = 800 },
+    /// The site path that the page is served at. Every url the page holds goes
+    /// under it as a root-absolute url, so a nested route boots without a
+    /// `<base>` tag. Must start and end with '/'. Validate with
+    /// `validateBasePath`.
     base_path: []const u8 = "/",
 };
+
+pub const Size = struct { width: u32, height: u32 };
+
+pub const PrerenderError = error{ HashRoute, InvalidRoute };
+
+/// Check the routes to prerender. A `.hash` route lives after the '#', which a
+/// host never sees, so only "/" is allowed with `.hash`. A route starts with
+/// '/' and has no query, fragment or ".." segment.
+pub fn checkPrerender(strategy: UrlStrategy, routes: []const []const u8) PrerenderError!void {
+    for (routes) |route| {
+        if (route.len == 0 or route[0] != '/') return error.InvalidRoute;
+        if (std.mem.indexOfAny(u8, route, "?#\\") != null) return error.InvalidRoute;
+        var it = std.mem.splitScalar(u8, route, '/');
+        while (it.next()) |part| {
+            if (std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".")) return error.InvalidRoute;
+        }
+        if (strategy == .hash and pageDir(route).len != 0) return error.HashRoute;
+    }
+}
+
+/// The directory of the page for `route` under the dist root: "" for "/",
+/// "docs/intro" for "/docs/intro/".
+pub fn pageDir(route: []const u8) []const u8 {
+    return std.mem.trim(u8, route, "/");
+}
 
 /// Check a `base_path`: it must start and end with '/', so a relative asset
 /// URL always resolves from the site root. A caller passes a bad value only
@@ -432,4 +460,24 @@ test "resolveExecName rejects an id with a trailing dot rather than returning em
     // An empty binary name produces an unrunnable artifact and a broken Exec=
     // line in the desktop file, so the fallback must never yield one.
     try std.testing.expectEqualStrings("app", resolveExecName("org.example.", null));
+}
+
+test "checkPrerender allows only the root route with the hash strategy" {
+    try checkPrerender(.hash, &.{"/"});
+    try checkPrerender(.path, &.{ "/", "/text", "/docs/intro/" });
+    try std.testing.expectError(error.HashRoute, checkPrerender(.hash, &.{ "/", "/text" }));
+}
+
+test "checkPrerender rejects a route that leaves the dist root or is no path" {
+    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"text"}));
+    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{""}));
+    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"/a/../../b"}));
+    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"/a?b"}));
+    try std.testing.expectError(error.InvalidRoute, checkPrerender(.path, &.{"/a#b"}));
+}
+
+test "pageDir puts the root page at the dist root" {
+    try std.testing.expectEqualStrings("", pageDir("/"));
+    try std.testing.expectEqualStrings("text", pageDir("/text"));
+    try std.testing.expectEqualStrings("docs/intro", pageDir("/docs/intro/"));
 }

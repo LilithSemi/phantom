@@ -6,6 +6,8 @@ function mime(p) {
   if (p.endsWith('.wasm')) return 'application/wasm';
   if (p.endsWith('.js')) return 'text/javascript';
   if (p.endsWith('.html')) return 'text/html';
+  if (p.endsWith('.css')) return 'text/css';
+  if (p.endsWith('.otf')) return 'font/otf';
   return 'application/octet-stream';
 }
 const host = process.env.PHANTOM_SERVE_HOST || '0.0.0.0';
@@ -14,16 +16,19 @@ const server = Bun.serve({
   hostname: host,
   async fetch(req) {
     const url = new URL(req.url);
-    let pathname = url.pathname === '/' ? '/index.html' : url.pathname;
-    if (!/\.[^/]*$/.test(pathname)) pathname += '/index.html';
+    let pathname = url.pathname;
+    const route = !/\.[^/]*$/.test(pathname);
+    if (route) pathname += '/index.html';
     const file = path.join(root, pathname);
     console.log(req.method + ' ' + url.pathname);
     if (file !== root && !file.startsWith(root + path.sep)) {
       return new Response('not found', { status: 404 });
     }
-    const f = Bun.file(file);
-    if (!(await f.exists())) return new Response('not found', { status: 404 });
-    return new Response(f, { headers: { 'Content-Type': mime(file) } });
+    for (const name of route ? [file, path.join(root, 'index.html')] : [file]) {
+      const f = Bun.file(name);
+      if (await f.exists()) return new Response(f, { headers: { 'Content-Type': mime(name) } });
+    }
+    return new Response('not found', { status: 404 });
   },
 });
 console.log('phantom serve: http://localhost:' + server.port + ' serving ' + dir);

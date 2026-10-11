@@ -9,13 +9,15 @@ function mime(p) {
   if (p.endsWith('.wasm')) return 'application/wasm';
   if (p.endsWith('.js')) return 'text/javascript';
   if (p.endsWith('.html')) return 'text/html';
+  if (p.endsWith('.css')) return 'text/css';
+  if (p.endsWith('.otf')) return 'font/otf';
   return 'application/octet-stream';
 }
 http.createServer(function(req, res) {
   let pathname;
   try { pathname = decodeURIComponent(req.url.split('?')[0]); } catch { pathname = req.url.split('?')[0]; }
-  if (pathname === '/') pathname = '/index.html';
-  else if (!path.extname(pathname)) pathname += '/index.html';
+  const route = !path.extname(pathname);
+  if (route) pathname += '/index.html';
   const file = path.join(root, pathname);
   process.stdout.write(req.method + ' ' + req.url + '\n');
   if (file !== root && !file.startsWith(root + path.sep)) {
@@ -23,11 +25,15 @@ http.createServer(function(req, res) {
     res.end('not found');
     return;
   }
-  fs.readFile(file, function(err, data) {
-    if (err) { res.writeHead(404); res.end('not found'); return; }
-    res.writeHead(200, { 'Content-Type': mime(file) });
-    res.end(data);
-  });
+  function send(f) {
+    fs.readFile(f, function(err, data) {
+      if (err && route && f !== path.join(root, 'index.html')) return send(path.join(root, 'index.html'));
+      if (err) { res.writeHead(404); res.end('not found'); return; }
+      res.writeHead(200, { 'Content-Type': mime(f) });
+      res.end(data);
+    });
+  }
+  send(file);
 }).listen(8080, host, function() {
   process.stdout.write('phantom serve: http://localhost:8080 serving ' + dir + '\n');
 });

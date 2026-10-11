@@ -331,7 +331,7 @@ const imports = {
     __phantom_event_source_close: closeSource,
   },
 };
-({ instance } = await WebAssembly.instantiateStreaming(fetch("./@wasm_name@.wasm"), imports));
+({ instance } = await WebAssembly.instantiateStreaming(fetch(new URL("./@wasm_name@.wasm", import.meta.url)), imports));
 host.attach(instance);
 
 // Under JSPI an export that can reach a suspending import has to be

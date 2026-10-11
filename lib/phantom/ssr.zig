@@ -83,8 +83,9 @@ pub const Document = struct {
     /// Write the whole page. `shell` is the index.html of the application
     /// that `addApp` writes. The page keeps the shell and its boot script, and
     /// gets a link to the stylesheet, the body content first in the body, and
-    /// the layout size in `data-phantom-size`. A shell with no `<base>` gets
-    /// one, so its relative urls resolve on a nested route.
+    /// the layout size in `data-phantom-size`. No `<base>` is added: a policy
+    /// with `base-uri 'none'` refuses it, so the shell must use root-absolute
+    /// urls to boot on a nested route. The `addApp` shell does.
     ///
     /// `shell` must be plain, lowercase HTML: this finds `</head>` and `<body`
     /// by a literal text search, not by parsing markup, so neither tag name
@@ -96,9 +97,6 @@ pub const Document = struct {
         if (shell[body_end - 1] == '/') return error.InvalidShell;
 
         try w.writeAll(shell[0..head_end]);
-        if (std.mem.indexOf(u8, shell[0..head_end], "<base") == null) {
-            try w.print("<base href=\"{s}\" />", .{self.base});
-        }
         try w.print("<link rel=\"stylesheet\" href=\"{s}{s}\" />", .{ self.base, self.css_path });
         try w.writeAll(shell[head_end..body_end]);
         try w.print(" data-phantom-size=\"{d}x{d}\">", .{ self.size.width, self.size.height });
@@ -153,6 +151,45 @@ pub fn render(gpa: std.mem.Allocator, opts: Options) !Document {
         .size = opts.viewport,
         .base = try gpa.dupe(u8, opts.base),
     };
+}
+
+/// Render `opts` and write the page, its stylesheet and its font files under
+/// `out`, each at the path the page uses for it under `opts.base`. The page of
+/// "/app/docs/intro" with base "/app/" goes to "docs/intro/index.html", and
+/// the page of the base itself to "index.html". This is how `addApp` writes
+/// its prerendered routes.
+pub fn writePage(gpa: std.mem.Allocator, out: std.Io.Dir, shell: []const u8, opts: Options) !void {
+    if (!dom.validBase(opts.base)) return error.InvalidBase;
+    if (!std.mem.startsWith(u8, opts.path, opts.base) and !std.mem.eql(u8, opts.path, opts.base[0 .. opts.base.len - 1])) {
+        return error.PathOutsideBase;
+    }
+    const dir = std.mem.trim(u8, opts.path[@min(opts.path.len, opts.base.len)..], "/");
+    var parts = std.mem.splitScalar(u8, dir, '/');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, "..")) return error.PathOutsideBase;
+    }
+
+    var doc = try render(gpa, opts);
+    defer doc.deinit(gpa);
+
+    var page: std.Io.Writer.Allocating = .init(gpa);
+    defer page.deinit();
+    try doc.writeHtml(&page.writer, shell);
+
+    const page_path = try std.fs.path.join(gpa, &.{ dir, "index.html" });
+    defer gpa.free(page_path);
+    try writeFile(opts.io, out, page_path, page.written());
+    try writeFile(opts.io, out, doc.css_path, doc.css);
+    for (doc.fonts) |font| {
+        try writeFile(opts.io, out, font.path, font.bytes);
+    }
+}
+
+fn writeFile(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, data: []const u8) !void {
+    if (std.fs.path.dirname(sub_path)) |parent| {
+        try dir.createDirPath(io, parent);
+    }
+    try dir.writeFile(io, .{ .sub_path = sub_path, .data = data });
 }
 
 /// Mount the application the way the page does, with the location, query,
@@ -406,7 +443,7 @@ const test_shell =
     \\    <title>t</title>
     \\  </head>
     \\  <body>
-    \\    <script type="module" src="./boot.js"></script>
+    \\    <script type="module" src="/app/boot.js"></script>
     \\  </body>
     \\</html>
 ;
@@ -425,7 +462,7 @@ test "writeHtml puts the page in the shell and keeps the boot script" {
         \\  <head>
         \\    <meta charset="utf-8" />
         \\    <title>t</title>
-        \\  <base href="/app/" /><link rel="stylesheet" href="/app/
+        \\  <link rel="stylesheet" href="/app/
         ,
         doc.css_path,
         \\" /></head>
@@ -433,7 +470,7 @@ test "writeHtml puts the page in the shell and keeps the boot script" {
         ,
         doc.html,
         \\
-        \\    <script type="module" src="./boot.js"></script>
+        \\    <script type="module" src="/app/boot.js"></script>
         \\  </body>
         \\</html>
     });
@@ -443,14 +480,14 @@ test "writeHtml puts the page in the shell and keeps the boot script" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "style=") == null);
 }
 
-test "writeHtml keeps the base of a shell that has one" {
+test "writeHtml adds no base and keeps the attributes of the body" {
     const gpa = std.testing.allocator;
     var doc = try renderAt("/", "/");
     defer doc.deinit(gpa);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try doc.writeHtml(&out.writer, "<html><head><base href=\"/\" /></head><body class=\"x\"></body></html>");
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.written(), "<base"));
+    try doc.writeHtml(&out.writer, "<html><head></head><body class=\"x\"></body></html>");
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<base") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "<body class=\"x\" data-phantom-size=\"120x80\"><div class=\"p0\">") != null);
 }
 
@@ -606,4 +643,68 @@ test "dpr reaches a mounted app the same way the browser's devicePixelRatio does
     var doc = try render(gpa, .{ .root = phantom.Root.plain(DprProbe.root), .path = "/", .viewport = test_size, .dpr = 2, .io = std.testing.io });
     defer doc.deinit(gpa);
     try std.testing.expect(std.mem.indexOf(u8, doc.html, ">2x<") != null);
+}
+
+fn writeAt(out: std.Io.Dir, root: phantom.Root, path: []const u8, base: []const u8) !void {
+    try writePage(std.testing.allocator, out, test_shell, .{ .root = root, .path = path, .viewport = test_size, .base = base, .io = std.testing.io });
+}
+
+fn readAt(dir: std.Io.Dir, path: []const u8) ![]u8 {
+    return dir.readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(1 << 20));
+}
+
+test "writePage puts each route where a static host finds it, with its stylesheet" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = phantom.Root.plain(routerRoot);
+
+    for ([_][]const u8{ "/app/", "/app/about", "/app/docs/text/" }) |path| {
+        try writeAt(tmp.dir, root, path, "/app/");
+    }
+    for ([_][]const u8{ "index.html", "about/index.html", "docs/text/index.html" }) |page_path| {
+        const page = try readAt(tmp.dir, page_path);
+        defer gpa.free(page);
+        const link = "<link rel=\"stylesheet\" href=\"/app/";
+        const at = (std.mem.indexOf(u8, page, link) orelse return error.TestNoLink) + link.len;
+        const end = std.mem.indexOfScalarPos(u8, page, at, '"') orelse return error.TestNoLink;
+        const css = try readAt(tmp.dir, page[at..end]);
+        defer gpa.free(css);
+        try std.testing.expect(std.mem.startsWith(u8, css, "html,body{"));
+        try std.testing.expect(std.mem.indexOf(u8, page, "<script type=\"module\" src=\"/app/boot.js\">") != null);
+    }
+    const about = try readAt(tmp.dir, "about/index.html");
+    defer gpa.free(about);
+    var doc = try renderAt("/app/about", "/app/");
+    defer doc.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, about, doc.html) != null);
+}
+
+test "writePage writes the font files the stylesheet names" {
+    const gpa = std.testing.allocator;
+    const Fixture = struct {
+        font: phantom.text.Font,
+
+        fn build(b: *phantom.BuildContext, self: *@This()) phantom.Widget {
+            return b.new(phantom.Text{ .text = "hi", .font = &self.font }).widget();
+        }
+    };
+    var fixture: Fixture = .{ .font = try phantom.text.Font.load(gpa, phantom.text.builtin.neuropol_bytes) };
+    defer fixture.font.deinit(gpa);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeAt(tmp.dir, phantom.Root.of(Fixture, Fixture.build, &fixture), "/", "/");
+    const font = try readAt(tmp.dir, "fonts/pf-0b107d216918b3e5.otf");
+    defer gpa.free(font);
+    try std.testing.expectEqualSlices(u8, phantom.text.builtin.neuropol_bytes, font);
+}
+
+test "writePage refuses a path outside the base" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = phantom.Root.plain(routerRoot);
+    try std.testing.expectError(error.PathOutsideBase, writeAt(tmp.dir, root, "/other/about", "/app/"));
+    try std.testing.expectError(error.PathOutsideBase, writeAt(tmp.dir, root, "/app/../x", "/app/"));
+    try std.testing.expectError(error.InvalidBase, writeAt(tmp.dir, root, "/", ""));
 }
