@@ -316,9 +316,14 @@ const RegionFrame = struct {
 /// visitor arriving at a new route expects its top, not wherever the
 /// previous route happened to be scrolled to, so this render drops `mem`'s
 /// saved offsets instead of applying them and moves the views to the top.
+/// A region that phantom moved since the last render keeps phantom's offset,
+/// even on a navigation.
 ///
-/// After this call each tracked view has the offset that its div shows. A
-/// view that `render` had to move sets `mem.synced`.
+/// When the host can read a region's offset back, a matched region then has
+/// the offset its div shows. A read that is missing or fails leaves that
+/// region, and every later region this call tracks, with no saved offset to
+/// give them: `render` writes nothing for them and `mem` can fall behind what
+/// their divs show. A view that `render` had to move sets `mem.synced`.
 pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink, mem: ?*ScrollMemory, reset_scroll: bool) !void {
     // Read every remembered region's live offset before its div is destroyed
     // below. Skipped on a navigation (the new page starts at the top) and
@@ -1569,6 +1574,37 @@ test "dom_calls: a region that phantom moved gets phantom's offset, once" {
     rec.setScrollOffset(105, .{ .x = 0, .y = 90 });
     try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
     try std.testing.expect(contains(rec.log.items, "writeScrollOffset(108,0,90)"));
+}
+
+test "dom_calls: a phantom move in the same render as a navigation wins over the reset" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var mem = ScrollMemory{};
+    var target: u8 = 0;
+    var handlers = pointer.PointerHandlers{ .ctx = &target };
+
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .push_scroll = .{
+        .viewport = geometry.PhysicalRect{ .x = 0, .y = 0, .width = 100, .height = 50 },
+        .offset = geometry.PhysicalOffset{ .x = 0, .y = 0 },
+        .content = geometry.PhysicalSize{ .width = 100, .height = 300 },
+        .handlers = &handlers,
+    } });
+    try list.append(gpa, .{ .pop_scroll = {} });
+
+    // Container 101, outer 102.
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+
+    // Phantom moves the region to 120 in the same render as a navigation.
+    // Container 104, outer 105.
+    list.primitives.items[0].push_scroll.offset.y = 120;
+    list.primitives.items[0].push_scroll.moved = 1;
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, true);
+
+    // The move wins: the div gets phantom's offset, not the navigation's zero.
+    try std.testing.expect(contains(rec.log.items, "writeScrollOffset(105,0,120)"));
 }
 
 test "dom_calls: a navigation clears a scroll region's offset instead of carrying it to the new page" {

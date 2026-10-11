@@ -482,8 +482,10 @@ const drainScrolls = async () => {
 };
 const frame = (t) => {
   enter(async () => {
-    await drainEvents();
+    // Scroll reports drain first, so a server event handler that reads the
+    // scroll offset this frame sees where the user scrolled, not stale state.
     await drainScrolls();
+    await drainEvents();
     return w.tick(app, Date.now(), t);
   });
   requestAnimationFrame(frame);

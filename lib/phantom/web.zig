@@ -166,6 +166,9 @@ pub const WebApp = struct {
     /// Called by the page when the browser scrolled region `index` of the last
     /// frame to `x`, `y`. The view of that region takes the same offset.
     ///
+    /// Reports are applied before server events in a frame, so a handler that
+    /// reads the offset here sees where the user just scrolled.
+    ///
     /// The browser already shows the new offset, so the DOM is not built again
     /// here. A paint runs instead, which lets a `ListView` see the offset and
     /// ask for new rows. The next tick then draws what was asked for. A DOM
@@ -1341,6 +1344,38 @@ test "a rebuild with no phantom move keeps the browser's offset" {
     app.render();
     try std.testing.expect(writtenOffset(&rec, before, app.scroll_mem.handles[0], 400));
     try std.testing.expect(app.sink.ok());
+}
+
+const ScrollReadSpy = struct {
+    seen_y: f32 = -1,
+
+    fn sink(self: *ScrollReadSpy) phantom.ServerEventSink {
+        return .{ .ctx = self, .on_event = onEvent };
+    }
+
+    fn onEvent(ctx: *anyopaque, event: phantom.ServerEvent) void {
+        const self: *ScrollReadSpy = @ptrCast(@alignCast(ctx));
+        if (event == .message) self.seen_y = scroll_ctl.offset().?.y;
+    }
+};
+
+test "a server event handler reads a scroll report applied earlier in the frame" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    scroll_ctl = .{};
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(tallScrollRoot), .{ .width = 200, .height = 200 }, 1.0, .path);
+    defer destroyWebApp(gpa, app);
+
+    var spy = ScrollReadSpy{};
+    const source = app.owner.platform.openEventSource("/api/events", &.{"line"}, spy.sink()).?;
+
+    // The host must call scrollChanged before serverEvent in a frame, so a
+    // handler reads the offset the user just scrolled to, not the one the
+    // last render drew.
+    app.scrollChanged(0, 0, 300);
+    app.serverEvent(source.id, .{ .message = .{ .type = "line", .data = "x", .last_event_id = "1" } });
+    try std.testing.expectEqual(@as(f32, 300), spy.seen_y);
 }
 
 fn focusScrollRoot(b: *phantom.BuildContext) phantom.Widget {
