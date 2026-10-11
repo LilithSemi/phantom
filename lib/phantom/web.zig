@@ -173,8 +173,8 @@ pub const WebApp = struct {
     ///
     /// The browser already shows the new offset, so the DOM is not built again
     /// here. A paint runs instead, which lets a `ListView` see the offset and
-    /// ask for new rows. The next tick then draws what was asked for. A DOM
-    /// rebuild on each scroll would replace the div under a scrollbar drag.
+    /// ask for new rows. The next tick then draws what was asked for, so a
+    /// scroll event does not cost a full render.
     pub fn scrollChanged(self: *WebApp, index: u32, x: f32, y: f32) void {
         if (index >= self.scroll_mem.count) return;
         const h = self.scroll_mem.targets[index] orelse return;
@@ -228,6 +228,8 @@ pub const WebApp = struct {
             self.dropScrollTargets();
             // The page still shows the old route, so the next render resets it.
             if (reset_scroll) self.owner.route_changed = true;
+            // Try again on the next tick, so scroll reports reach a view again.
+            self.owner.repaint = true;
         };
         if (self.scroll_mem.synced) self.paintOffsets();
         _ = self.arena.reset(.retain_capacity);
@@ -1312,7 +1314,9 @@ test "a render that fails drops the scroll targets and keeps the navigation rese
     app.render();
     app.gpa = gpa;
     try std.testing.expect(app.owner.route_changed);
+    try std.testing.expect(app.owner.repaint);
     app.scrollChanged(0, 0, 300);
+    try std.testing.expectEqual(@as(f32, 0), scroll_ctl.offset().?.y);
     const start = rec.log.items.len;
     app.render();
     try std.testing.expect(writtenOffset(&rec, start, div, 0));
