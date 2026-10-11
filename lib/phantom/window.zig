@@ -683,14 +683,10 @@ test "a step that drew and a step that did not are told apart" {
 /// build, and this is what reports which frame's numbers it saw.
 var seen_width: f32 = 0;
 
-var reader_state: ?*SizeReader.State = null;
-
 const SizeReader = struct {
     pub const State = struct {
         base: phantom.StateBase = .{},
-        pub fn build(s: *State, bctx: *phantom.BuildContext) anyerror!phantom.Widget {
-            // The framework owns the state, so the test reaches it through here.
-            reader_state = s;
+        pub fn build(_: *State, bctx: *phantom.BuildContext) anyerror!phantom.Widget {
             seen_width = phantom.MediaQuery.of(bctx).size.width;
             return (phantom.ColoredBox{ .color = phantom.Color.rgb(0, 0, 0) }).widget();
         }
@@ -730,9 +726,7 @@ test "a build sees the size of the frame it is building, not the one before" {
     // The surface is now wider, which is what a compositor resize looks like
     // from the render target's side.
     f.h.tw = 1024;
-    // Dirty the tree so the next frame rebuilds. Without this `flushDirty` has
-    // nothing to do and the test would pass whatever the order was.
-    phantom.markNeedsBuild(reader_state.?);
+    // The new metrics schedule the reader, because its build read them.
     seen_width = 0;
     _ = try f.session.step();
     try std.testing.expectEqual(@as(f32, 1024), seen_width);

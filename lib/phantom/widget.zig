@@ -84,6 +84,8 @@ pub const Element = struct {
     state: ?*anyopaque = null,
     state_vtable: ?*const StateVTable = null,
     dirty: bool = false,
+    /// Set while the owner lists this element as a `MediaQuery.of` reader.
+    media_dependent: bool = false,
     depth: u32 = 0,
     /// Number of times this element has rebuilt. Test harness reads it to prove
     /// reconciliation granularity (an untouched ancestor's count does not move).
@@ -108,6 +110,7 @@ pub const Element = struct {
     /// that child's deinit, so no double free.
     pub fn deinit(self: *Element, gpa: std.mem.Allocator) void {
         self.owner.removeFromDirty(self);
+        self.owner.forgetMediaDependent(self);
         self.owner.forgetPointer(self);
         if (self.render_object) |ro| {
             if (ro.focus) |h| self.owner.forgetFocus(h);

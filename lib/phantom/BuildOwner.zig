@@ -27,6 +27,9 @@ sink: *FaultSink,
 /// clocks, before the tree is mounted so every initState reads the real one.
 io: std.Io = std.Io.failing,
 dirty: std.ArrayList(*Element) = .empty,
+/// The elements whose build read `MediaQuery.of`. `setActiveViewMetrics`
+/// rebuilds them when the metrics change.
+media_dependents: std.ArrayList(*Element) = .empty,
 /// Lazily loaded default theme. Null until the first defaultTheme call on this owner.
 default_theme: ?theme_mod.ThemeData = null,
 /// Lazily loaded built-in heading font (Neuropol). Freed on deinit.
@@ -128,6 +131,7 @@ pub fn deinit(self: *BuildOwner) void {
     while (it.next()) |v| self.gpa.destroy(v.*);
     self.views.deinit(self.gpa);
     self.dirty.deinit(self.gpa);
+    self.media_dependents.deinit(self.gpa);
 }
 
 /// Return the active view, or null if no view has been opened on this owner.
@@ -200,13 +204,39 @@ pub fn removeFromDirty(self: *BuildOwner, el: *Element) void {
     }
 }
 
+/// Record that the build of `el` read `MediaQuery.of`. Deduplicated by the flag
+/// on the element. On OOM the element is not recorded and a fault is reported.
+pub fn addMediaDependent(self: *BuildOwner, el: *Element) void {
+    if (el.media_dependent) return;
+    self.media_dependents.append(self.gpa, el) catch {
+        self.sink.report(.oom, "a MediaQuery reader was not recorded, so a metrics change does not rebuild it");
+        return;
+    };
+    el.media_dependent = true;
+}
+
+/// Called by Element.deinit, so a freed element is never scheduled.
+pub fn forgetMediaDependent(self: *BuildOwner, el: *Element) void {
+    if (!el.media_dependent) return;
+    el.media_dependent = false;
+    for (self.media_dependents.items, 0..) |e, idx| {
+        if (e == el) {
+            _ = self.media_dependents.swapRemove(idx);
+            return;
+        }
+    }
+}
+
 /// Overwrite the active View's metrics in place. Because the View is boxed (gpa-owned
 /// pointer), &view.metrics is stable; the installed MediaQuery widget already holds that
 /// pointer, so callers see the updated data on the next layout/build pass.
-/// No-op when no view is active.
+/// When the metrics change, each element that read `MediaQuery.of` is scheduled
+/// for a build. No-op when no view is active.
 pub fn setActiveViewMetrics(self: *BuildOwner, m: view_mod.MediaQueryData) void {
     const v = self.activeView() orelse return;
+    if (std.meta.eql(v.metrics, m)) return;
     v.metrics = m;
+    for (self.media_dependents.items) |el| self.scheduleBuildFor(el);
 }
 
 /// Re-run layout on the entire render tree from `root`, using the given physical
@@ -280,4 +310,73 @@ test "forceRelayoutWholeTree re-lays-out at a new scale, setActiveViewMetrics up
     // Verify the metrics were actually updated on the view.
     try std.testing.expectEqual(@as(f32, 2.0), owner.activeView().?.metrics.dpr);
     try std.testing.expect(sink.ok());
+}
+
+/// Builds a box on a narrow view and a padded box on a wide one.
+const WidthSwitch = struct {
+    pub const State = struct {
+        base: phantom_mod.StateBase = .{},
+        box: phantom_mod.ColoredBox = .{ .color = geom_mod.Color.rgb(1, 0, 0) },
+        pad: phantom_mod.Padding = undefined,
+        pub fn build(s: *@This(), b: *BuildContext) anyerror!phantom_mod.Widget {
+            if (phantom_mod.MediaQuery.of(b).size.width < 500) return s.box.widget();
+            s.pad = .{ .insets = geom_mod.LogicalEdgeInsets.all(4), .child = s.box.widget() };
+            return s.pad.widget();
+        }
+    };
+    pub fn widget(self: *const WidthSwitch) phantom_mod.Widget {
+        return phantom_mod.StatefulWidget(WidthSwitch, self);
+    }
+};
+
+fn openTestView(owner: *BuildOwner, width: f32) !*View {
+    _ = try view_mod.View.open(owner, .{ .title = "test", .size = .{ .width = width, .height = 300 }, .dpr = 1.0, .text_scale = 1.0 });
+    return owner.activeView().?;
+}
+
+test "a metrics change rebuilds a widget that read MediaQuery, and equal metrics rebuild nothing" {
+    const gpa = std.testing.allocator;
+    var sink = FaultSink{};
+    var owner = BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var bctx = BuildContext{ .arena = arena.allocator(), .owner = &owner };
+    const view = try openTestView(&owner, 800);
+    const switcher = WidthSwitch{};
+    var mq = phantom_mod.MediaQuery{ .data = &view.metrics, .child = switcher.widget() };
+    const root = try mq.widget().mount(&bctx, null);
+    defer root.deinit(gpa);
+    const reader = root.child.?;
+    try std.testing.expectEqualStrings(@typeName(phantom_mod.Padding), reader.child.?.type_name);
+    try std.testing.expectEqual(@as(usize, 1), owner.media_dependents.items.len);
+
+    owner.setActiveViewMetrics(view.metrics);
+    try std.testing.expectEqual(@as(usize, 0), owner.dirty.items.len);
+
+    owner.setActiveViewMetrics(.{ .size = .{ .width = 320, .height = 300 }, .dpr = 1.0 });
+    try std.testing.expectEqual(@as(usize, 1), owner.dirty.items.len);
+    owner.flushDirty(&bctx);
+    try std.testing.expectEqualStrings(@typeName(phantom_mod.ColoredBox), reader.child.?.type_name);
+    try std.testing.expect(sink.ok());
+}
+
+test "an unmounted MediaQuery reader is never scheduled" {
+    const gpa = std.testing.allocator;
+    var sink = FaultSink{};
+    var owner = BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var bctx = BuildContext{ .arena = arena.allocator(), .owner = &owner };
+    const view = try openTestView(&owner, 800);
+    const switcher = WidthSwitch{};
+    var mq = phantom_mod.MediaQuery{ .data = &view.metrics, .child = switcher.widget() };
+    const root = try mq.widget().mount(&bctx, null);
+    try std.testing.expectEqual(@as(usize, 1), owner.media_dependents.items.len);
+    root.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), owner.media_dependents.items.len);
+
+    owner.setActiveViewMetrics(.{ .size = .{ .width = 320, .height = 300 }, .dpr = 1.0 });
+    try std.testing.expectEqual(@as(usize, 0), owner.dirty.items.len);
 }

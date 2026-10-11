@@ -2706,3 +2706,35 @@ test "a server page registers no font its sheet declares, and no data url for a 
     try std.testing.expect(logHas(rec.log.items, try std.fmt.bufPrint(&want, "addFont({s},url(\"/fonts/{s}.otf\") format(\"opentype\"))", .{ family, family })));
     try std.testing.expectEqual(@as(usize, 0), countOccurrences(rec.log.items, "data:"));
 }
+
+/// Shows "wide" or "narrow" by the width it reads in build.
+const WidthLabel = struct {
+    pub const State = struct {
+        base: phantom.StateBase = .{},
+        pub fn build(_: *State, b: *phantom.BuildContext) anyerror!phantom.Widget {
+            const narrow = phantom.MediaQuery.of(b).size.width < 500;
+            return b.new(phantom.Text{ .text = if (narrow) "narrow" else "wide" }).widget();
+        }
+    };
+    pub fn widget(self: *const WidthLabel) phantom.Widget {
+        return phantom.StatefulWidget(WidthLabel, self);
+    }
+};
+
+const width_label = WidthLabel{};
+
+fn widthLabelRoot(_: *phantom.BuildContext) phantom.Widget {
+    return width_label.widget();
+}
+
+test "a resize rebuilds a widget that reads the width in its build" {
+    const gpa = std.testing.allocator;
+    var rec = phantom.backend.dom_calls.Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    const app = try init(gpa, rec.ops(), phantom.Root.plain(widthLabelRoot), .{ .width = 800, .height = 300 }, 1.0, .path);
+    defer app.deinit();
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(rec.log.items, ",wide)"));
+
+    app.resize(.{ .width = 320, .height = 300 }, 1.0);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(rec.log.items, ",narrow)"));
+}

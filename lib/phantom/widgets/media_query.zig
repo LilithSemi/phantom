@@ -34,7 +34,10 @@ pub const MediaQuery = struct {
     }
 
     /// Return the nearest ancestor MediaQueryData, or the immutable default if none.
+    /// The element that is building is recorded, so a metrics change rebuilds it.
+    /// See `BuildOwner.setActiveViewMetrics`.
     pub fn of(bctx: *BuildContext) *const MediaQueryData {
+        if (bctx.element) |el| bctx.owner.addMediaDependent(el);
         return inheritedOf(bctx.element, MediaQueryData) orelse &default_media_query;
     }
 
