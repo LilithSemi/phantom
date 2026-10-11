@@ -121,6 +121,9 @@ pub const DomOps = struct {
     /// write it; `render` then leaves a rebuilt region wherever a fresh
     /// element starts, which is today's behaviour.
     write_scroll_offset: ?*const fn (ctx: *anyopaque, node: u32, offset: geometry.PhysicalOffset) void = null,
+    /// Drops the host's reference to a node handle. The node stays in the
+    /// document. Null on a host that keeps no handle table.
+    release: ?*const fn (ctx: *anyopaque, node: u32) void = null,
 
     pub fn createElement(self: DomOps, tag: []const u8) u32 {
         return self.create_element(self.ctx, tag);
@@ -145,11 +148,15 @@ pub const DomOps = struct {
     /// Add CSS to the page. Prefers the elementless hook, which a strict policy
     /// permits, and falls back to a `<style>` element, which it does not. See
     /// `add_rule`.
+    ///
+    /// The fallback element goes in the head, because `render` clears the body
+    /// and a rule is added only once for the page.
     pub fn addRule(self: DomOps, css: []const u8) void {
         if (self.add_rule) |f| return f(self.ctx, css);
         const node = self.createElement("style");
         self.setTextContent(node, css);
-        self.appendChild(self.body, node);
+        self.appendChild(self.head, node);
+        self.releaseNode(node);
     }
     /// Register one font face. Prefers the elementless hook; falls back to an
     /// `@font-face` rule, which goes wherever `addRule` goes. `buf` holds the
@@ -178,6 +185,10 @@ pub const DomOps = struct {
     pub fn writeScrollOffset(self: DomOps, node: u32, offset: geometry.PhysicalOffset) void {
         const f = self.write_scroll_offset orelse return;
         f(self.ctx, node, offset);
+    }
+    pub fn releaseNode(self: DomOps, node: u32) void {
+        const f = self.release orelse return;
+        f(self.ctx, node);
     }
 };
 
@@ -284,6 +295,35 @@ pub const ScrollMemory = struct {
     synced: bool = false,
 };
 
+/// Host state that `render` keeps between frames. A caller (`WebApp`) owns one
+/// for the life of the page and passes it to every `render` call. A null
+/// pointer turns off handle release and rule reuse.
+pub const PageState = struct {
+    /// The node handles that the last `render` created.
+    nodes: std.ArrayList(u32) = .empty,
+    /// The hashes of the interactive rules the page sheet already holds.
+    rules: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    pub fn deinit(self: *PageState, gpa: std.mem.Allocator) void {
+        self.nodes.deinit(gpa);
+        self.rules.deinit(gpa);
+    }
+};
+
+/// The most node handles one primitive creates: an icon makes an svg, a
+/// title and a path.
+const max_nodes_per_primitive = 3;
+
+/// Records each handle `render` creates, when the caller keeps them.
+const Made = struct {
+    nodes: ?*std.ArrayList(u32),
+
+    fn add(self: Made, node: u32) u32 {
+        if (self.nodes) |n| n.appendAssumeCapacity(node);
+        return node;
+    }
+};
+
 /// The index of last frame's region with the handlers `h`. A region with no
 /// handlers can only match the region at its own index.
 fn previousRegion(targets: []const ?*pointer.PointerHandlers, index: usize, h: ?*pointer.PointerHandlers) ?usize {
@@ -324,7 +364,11 @@ const RegionFrame = struct {
 /// region, and every later region this call tracks, with no saved offset to
 /// give them: `render` writes nothing for them and `mem` can fall behind what
 /// their divs show. A view that `render` had to move sets `mem.synced`.
-pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink, mem: ?*ScrollMemory, reset_scroll: bool) !void {
+///
+/// `page`, if given, gets the handles this frame creates. The next call
+/// releases them before it clears the body. It also keeps each interactive
+/// rule in the page sheet once, so a rule is added only for a new class.
+pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayList, viewport: geometry.PhysicalSize, bg: geometry.Color, sink: ?*FaultSink, mem: ?*ScrollMemory, page: ?*PageState, reset_scroll: bool) !void {
     // Read every remembered region's live offset before its div is destroyed
     // below. Skipped on a navigation (the new page starts at the top) and
     // when the host cannot read scroll position at all.
@@ -349,6 +393,17 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
         m.count = 0;
     }
 
+    // After the offset reads above, which use last frame's handles. Room for
+    // every handle of this frame is reserved first, so recording one cannot
+    // fail in the middle of the build.
+    var made: Made = .{ .nodes = null };
+    if (page) |pg| {
+        for (pg.nodes.items) |h| ops.releaseNode(h);
+        pg.nodes.clearRetainingCapacity();
+        try pg.nodes.ensureTotalCapacity(gpa, 1 + max_nodes_per_primitive * list.primitives.items.len);
+        made.nodes = &pg.nodes;
+    }
+
     ops.clearChildren(ops.body);
 
     // Collect distinct fonts once; used for text primitive font-family index lookups.
@@ -356,7 +411,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
     defer gpa.free(fonts);
 
     // Layout container: position:relative, viewport-sized, branded bg.
-    const container = ops.createElement("div");
+    const container = made.add(ops.createElement("div"));
     {
         const style = try gpa.print("position:relative;width:{d}px;height:{d}px;background:rgb({d},{d},{d})", .{ viewport.width, viewport.height, dom.ch(bg.r), dom.ch(bg.g), dom.ch(bg.b) });
         defer gpa.free(style);
@@ -376,10 +431,12 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
     // never recorded and must not touch `region_stack`.
     var region_skipped: usize = 0;
 
-    // Accumulate :hover/:active rules for interactive rrects; injected as a <style> after the loop.
+    // The :hover and :active rules of classes new to the page, added after the
+    // loop, and the hashes of those classes.
     var rules: std.ArrayList(u8) = .empty;
     defer rules.deinit(gpa);
-    var cls: u32 = 0;
+    var fresh: std.ArrayList(u64) = .empty;
+    defer fresh.deinit(gpa);
 
     for (list.primitives.items) |p| switch (p) {
         .rrect => |r| {
@@ -393,65 +450,66 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                     // Stroke rrect: border ring, no fill.
                     const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
-                    const node = ops.createElement("div");
+                    const node = made.add(ops.createElement("div"));
                     ops.setStyle(node, style);
                     ops.appendChild(parent, node);
                 } else {
                     // Plain fill rrect (kept identical to Task 1).
                     const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;background:rgba({d},{d},{d},{s})", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
-                    const node = ops.createElement("div");
+                    const node = made.add(ops.createElement("div"));
                     ops.setStyle(node, style);
                     ops.appendChild(parent, node);
                 }
             } else {
-                // Interactive rrect: base div carries a pb{n} class; state colors go to rules buffer.
-                const c = cls;
-                cls += 1;
-                const node = ops.createElement("div");
-                const cls_val = try gpa.print("pb{d}", .{c});
-                defer gpa.free(cls_val);
+                // Interactive rrect. The class name is a hash of the rule text,
+                // so the same colours give the same class on every frame and
+                // the page sheet gets each rule once.
+                const prop = if (r.stroke_width > 0) "border-color" else "background";
+                var hover_buf: [state_decl_len]u8 = undefined;
+                var active_buf: [state_decl_len]u8 = undefined;
+                const hover = if (r.hover_color) |h| stateDecl(&hover_buf, prop, h) else "";
+                const active = if (r.active_color) |ac| stateDecl(&active_buf, prop, ac) else "";
+                var hasher = std.hash.Wyhash.init(0);
+                hasher.update(hover);
+                hasher.update("|");
+                hasher.update(active);
+                const key = hasher.final();
+                var cls_buf: [class_len]u8 = undefined;
+                const cls_val = std.fmt.bufPrint(&cls_buf, "pb-{x}", .{key}) catch unreachable;
+
+                const node = made.add(ops.createElement("div"));
                 ops.setAttribute(node, "class", cls_val);
                 if (r.stroke_width > 0) {
                     const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;box-sizing:border-box;border:{d}px solid rgba({d},{d},{d},{s});background:transparent", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, r.stroke_width, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
                     ops.setStyle(node, style);
-                    ops.appendChild(parent, node);
-                    if (r.hover_color) |h| {
-                        var hbuf: [8]u8 = undefined;
-                        const rule = try gpa.print(".pb{d}:hover{{border-color:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(h.r), dom.ch(h.g), dom.ch(h.b), dom.alpha(&hbuf, h.a) });
-                        defer gpa.free(rule);
-                        try rules.appendSlice(gpa, rule);
-                    }
-                    if (r.active_color) |ac| {
-                        var pbuf: [8]u8 = undefined;
-                        const rule = try gpa.print(".pb{d}:active{{border-color:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(ac.r), dom.ch(ac.g), dom.ch(ac.b), dom.alpha(&pbuf, ac.a) });
-                        defer gpa.free(rule);
-                        try rules.appendSlice(gpa, rule);
-                    }
                 } else {
                     const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;background:rgba({d},{d},{d},{s})", .{ r.rect.x - ox, r.rect.y - oy, r.rect.width, r.rect.height, r.radius, dom.ch(r.color.r), dom.ch(r.color.g), dom.ch(r.color.b), dom.alpha(&abuf, r.color.a) });
                     defer gpa.free(style);
                     ops.setStyle(node, style);
-                    ops.appendChild(parent, node);
-                    if (r.hover_color) |h| {
-                        var hbuf: [8]u8 = undefined;
-                        const rule = try gpa.print(".pb{d}:hover{{background:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(h.r), dom.ch(h.g), dom.ch(h.b), dom.alpha(&hbuf, h.a) });
-                        defer gpa.free(rule);
-                        try rules.appendSlice(gpa, rule);
-                    }
-                    if (r.active_color) |ac| {
-                        var pbuf: [8]u8 = undefined;
-                        const rule = try gpa.print(".pb{d}:active{{background:rgba({d},{d},{d},{s})}}", .{ c, dom.ch(ac.r), dom.ch(ac.g), dom.ch(ac.b), dom.alpha(&pbuf, ac.a) });
-                        defer gpa.free(rule);
-                        try rules.appendSlice(gpa, rule);
-                    }
                 }
-                // A pointer cursor is the browser's own affordance for "this
-                // responds to a tap", so every interactive rectangle gets one.
-                const cursor_rule = try gpa.print(".pb{d}{{cursor:pointer}}", .{c});
-                defer gpa.free(cursor_rule);
-                try rules.appendSlice(gpa, cursor_rule);
+                ops.appendChild(parent, node);
+
+                const known = if (page) |pg| pg.rules.contains(key) else false;
+                if (!known and std.mem.indexOfScalar(u64, fresh.items, key) == null) {
+                    try fresh.append(gpa, key);
+                    if (hover.len > 0) {
+                        const rule = try gpa.print(".{s}:hover{{{s}}}", .{ cls_val, hover });
+                        defer gpa.free(rule);
+                        try rules.appendSlice(gpa, rule);
+                    }
+                    if (active.len > 0) {
+                        const rule = try gpa.print(".{s}:active{{{s}}}", .{ cls_val, active });
+                        defer gpa.free(rule);
+                        try rules.appendSlice(gpa, rule);
+                    }
+                    // A pointer cursor is the browser's own affordance for "this
+                    // responds to a tap", so every interactive rectangle gets one.
+                    const cursor_rule = try gpa.print(".{s}{{cursor:pointer}}", .{cls_val});
+                    defer gpa.free(cursor_rule);
+                    try rules.appendSlice(gpa, cursor_rule);
+                }
             }
         },
         .image => |img| {
@@ -467,7 +525,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             _ = enc.encode(b64, im.bytes);
             const src = try gpa.print("data:{s};base64,{s}", .{ image_mod.Image.mime(im.format), b64 });
             defer gpa.free(src);
-            const node = ops.createElement("img");
+            const node = made.add(ops.createElement("img"));
             ops.setStyle(node, style);
             ops.setAttribute(node, "src", src);
             ops.appendChild(parent, node);
@@ -492,7 +550,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             const style = try gpa.print("position:absolute;left:{d}px;top:{d}px", .{ ic.origin.x - ox, ic.origin.y - oy });
             defer gpa.free(style);
 
-            const svg = ops.createElementNs(svg_ns, "svg");
+            const svg = made.add(ops.createElementNs(svg_ns, "svg"));
             ops.setAttribute(svg, "viewBox", view_box);
             // See `dom.zig`: without this the browser centres the square grid in
             // a box that is not square and the mark comes out short.
@@ -507,7 +565,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             // takes the name slot and then announces nothing, which is worse
             // than a mark with no title at all.
             if (ic.label) |name| {
-                const title = ops.createElementNs(svg_ns, "title");
+                const title = made.add(ops.createElementNs(svg_ns, "title"));
                 ops.setTextContent(title, name);
                 ops.appendChild(svg, title);
             }
@@ -521,7 +579,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
             defer gpa.free(stroke);
             var sbuf: [svg_path.coord_len]u8 = undefined;
 
-            const node = ops.createElementNs(svg_ns, "path");
+            const node = made.add(ops.createElementNs(svg_ns, "path"));
             ops.setAttribute(node, "d", d);
             // A centreline filled rather than stroked draws as a solid blob.
             ops.setAttribute(node, "fill", "none");
@@ -563,7 +621,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 if (run.underline) ";text-decoration:underline" else "",
             });
             defer gpa.free(decl);
-            const node = ops.createElement("div");
+            const node = made.add(ops.createElement("div"));
             ops.setStyle(node, decl);
             ops.setTextContent(node, run.text);
             ops.appendChild(parent, node);
@@ -579,13 +637,13 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 // size, relative to whatever region this one is nested inside.
                 const outer_style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;overflow:scroll", .{ sr.viewport.x - ox, sr.viewport.y - oy, sr.viewport.width, sr.viewport.height });
                 defer gpa.free(outer_style);
-                const outer = ops.createElement("div");
+                const outer = made.add(ops.createElement("div"));
                 ops.setStyle(outer, outer_style);
                 ops.appendChild(parent, outer);
                 // Inner div: the full content area that scrolls inside the outer.
                 const inner_style = try gpa.print("position:relative;width:{d}px;height:{d}px", .{ sr.content.width, sr.content.height });
                 defer gpa.free(inner_style);
-                const inner = ops.createElement("div");
+                const inner = made.add(ops.createElement("div"));
                 ops.setStyle(inner, inner_style);
                 ops.appendChild(outer, inner);
                 // Give the region the saved offset of last frame's region with
@@ -676,7 +734,7 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
                 // primitive here.
                 const style = try gpa.print("position:absolute;left:{d}px;top:{d}px;width:{d}px;height:{d}px;border-radius:{d}px;overflow:hidden", .{ cr.rect.x - ox, cr.rect.y - oy, cr.rect.width, cr.rect.height, cr.radius });
                 defer gpa.free(style);
-                const node = ops.createElement("div");
+                const node = made.add(ops.createElement("div"));
                 ops.setStyle(node, style);
                 ops.appendChild(parent, node);
                 // Children now append inside the clip; coords subtract its origin.
@@ -706,6 +764,25 @@ pub fn render(gpa: std.mem.Allocator, ops: DomOps, list: display_list.DisplayLis
     // strict policy the moment it enters the document, even empty, so the rules
     // go to a sheet that has no element at all. See `DomOps.add_rule`.
     if (rules.items.len > 0) ops.addRule(rules.items);
+    if (page) |pg| {
+        pg.rules.ensureUnusedCapacity(gpa, @intCast(fresh.items.len)) catch {
+            if (sink) |s| s.report(.oom, "interactive rules were not remembered, so the next frame adds them again");
+            return;
+        };
+        for (fresh.items) |key| pg.rules.putAssumeCapacity(key, {});
+    }
+}
+
+/// Room for "border-color:rgba(255,255,255," and an alpha from `dom.alpha`.
+const state_decl_len = 64;
+/// "pb-" and a u64 in hex.
+const class_len = 3 + 16;
+
+/// The declaration a :hover or :active rule sets, such as
+/// `background:rgba(1,2,3,0.5)`.
+fn stateDecl(buf: *[state_decl_len]u8, prop: []const u8, c: geometry.Color) []const u8 {
+    var abuf: [8]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}:rgba({d},{d},{d},{s})", .{ prop, dom.ch(c.r), dom.ch(c.g), dom.ch(c.b), dom.alpha(&abuf, c.a) }) catch unreachable;
 }
 
 // Recording mock for tests. No global mutable state: each fn casts ctx to *Recorder.
@@ -923,6 +1000,11 @@ pub const Recorder = struct {
         self.rec("clearChildren({d})", .{node});
     }
 
+    fn release(ctx: *anyopaque, node: u32) void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.rec("release({d})", .{node});
+    }
+
     pub fn ops(self: *Recorder) DomOps {
         return .{
             .ctx = self,
@@ -948,6 +1030,7 @@ pub const Recorder = struct {
             .http_send = httpSend,
             .open_event_source = openEventSource,
             .close_event_source = closeEventSource,
+            .release = release,
         };
     }
 };
@@ -955,6 +1038,26 @@ pub const Recorder = struct {
 fn contains(log: []const []u8, needle: []const u8) bool {
     for (log) |l| if (std.mem.indexOf(u8, l, needle) != null) return true;
     return false;
+}
+
+/// The class value of the `n`th recorded `class` attribute, or null.
+fn classAt(log: []const []u8, n: usize) ?[]const u8 {
+    var seen: usize = 0;
+    for (log) |l| {
+        const at = std.mem.indexOf(u8, l, ",class,") orelse continue;
+        if (seen == n) return l[at + ",class,".len .. l.len - 1];
+        seen += 1;
+    }
+    return null;
+}
+
+/// How many recorded lines hold `needle`.
+fn countLines(log: []const []u8, needle: []const u8) usize {
+    var n: usize = 0;
+    for (log) |l| {
+        if (std.mem.indexOf(u8, l, needle) != null) n += 1;
+    }
+    return n;
 }
 
 /// Index of the first recorded line holding `needle`, for tests that pin the
@@ -975,7 +1078,7 @@ test "dom_calls: fill rrect creates a styled div appended to the container" {
         .radius = 4,
         .color = geometry.Color.rgb(1, 0, 0),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     // clears body, builds the container, then the rrect div with the right style + append.
     try std.testing.expect(contains(rec.log.items, "clearChildren(1)"));
     try std.testing.expect(contains(rec.log.items, "position:relative;width:200px"));
@@ -999,7 +1102,7 @@ test "dom_calls: a text primitive names its font the same way the font-face does
         .color = geometry.Color.rgb(1, 1, 1),
         .origin = geometry.PhysicalOffset{ .x = 5, .y = 8 },
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     // The raw string is passed directly (browser handles escaping).
     try std.testing.expect(contains(rec.log.items, "setTextContent") and contains(rec.log.items, "<b>hi</b>"));
     // The family the run asks for must be the one the face was declared under.
@@ -1035,7 +1138,7 @@ test "dom_calls: an italic underlined run asks the browser for both" {
         .italic = true,
         .underline = true,
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     try std.testing.expect(contains(rec.log.items, "font-style:italic"));
     try std.testing.expect(contains(rec.log.items, "text-decoration:underline"));
 }
@@ -1052,7 +1155,7 @@ test "dom_calls: stroke rrect records a border:...solid rgba style" {
         .color = geometry.Color.rgb(0, 1, 0),
         .stroke_width = 2,
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     // Must have border-radius, box-sizing, and the border solid rgba style.
     try std.testing.expect(contains(rec.log.items, "box-sizing:border-box"));
     try std.testing.expect(contains(rec.log.items, "border:2px solid rgba("));
@@ -1072,15 +1175,16 @@ test "dom_calls: an interactive rrect gets its hover rule with no style element 
         .hover_color = geometry.Color.rgb(0, 0, 0.9),
         .active_color = geometry.Color.rgb(0, 0, 0.8),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
-    // The div must carry class="pb0" via setAttribute.
-    try std.testing.expect(contains(rec.log.items, "setAttribute(") and contains(rec.log.items, "class,pb0"));
-    // A style element must be created and its textContent must contain the hover rule.
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
+    // The div carries a class, and the hover rule names that class.
+    const cls = classAt(rec.log.items, 0).?;
+    try std.testing.expect(std.mem.startsWith(u8, cls, "pb-"));
     // No style element at all. A strict policy refuses one the moment it enters
     // the document, even while it is still empty, so the rule goes to a sheet
     // that has no element for a policy to refuse.
     try std.testing.expect(!contains(rec.log.items, "createElement(style)"));
-    try std.testing.expect(contains(rec.log.items, ".pb0:hover{background:"));
+    var want: [64]u8 = undefined;
+    try std.testing.expect(contains(rec.log.items, try std.fmt.bufPrint(&want, ".{s}:hover{{background:", .{cls})));
 }
 
 test "an interactive rectangle gets a pointer cursor and a plain one does not" {
@@ -1101,9 +1205,11 @@ test "an interactive rectangle gets a pointer cursor and a plain one does not" {
         .radius = 0,
         .color = geometry.Color.rgb(1, 0, 0),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
-    try std.testing.expect(contains(rec.log.items, ".pb0{cursor:pointer}"));
-    try std.testing.expect(!contains(rec.log.items, ".pb1"));
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
+    const cls = classAt(rec.log.items, 0).?;
+    var want: [64]u8 = undefined;
+    try std.testing.expect(contains(rec.log.items, try std.fmt.bufPrint(&want, ".{s}{{cursor:pointer}}", .{cls})));
+    try std.testing.expectEqual(@as(?[]const u8, null), classAt(rec.log.items, 1));
 }
 
 test "dom_calls: a wrapped paragraph's three text runs each set a different line, never the whole paragraph" {
@@ -1134,7 +1240,7 @@ test "dom_calls: a wrapped paragraph's three text runs each set a different line
         } });
         y += l.height;
     }
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
 
     // Three distinct setTextContent calls, one per line, exactly matching the
     // line each was drawn for.
@@ -1165,7 +1271,7 @@ test "dom_calls: push_scroll creates outer+inner divs and adjusts child coords" 
         .color = geometry.Color.rgb(1, 0, 0),
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
-    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     // Outer div has overflow:scroll and the viewport position/size.
     try std.testing.expect(contains(rec.log.items, "overflow:scroll"));
     try std.testing.expect(contains(rec.log.items, "left:10px;top:20px;width:100px;height:50px;overflow:scroll"));
@@ -1194,7 +1300,7 @@ test "dom_calls: a clip nested in a scroll positions itself relative to the scro
     } });
     try list.append(gpa, .{ .pop_clip = {} });
     try list.append(gpa, .{ .pop_scroll = {} });
-    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     try std.testing.expect(contains(rec.log.items, "left:20px;top:30px;width:40px;height:40px"));
     // The un-adjusted absolute position must not appear: that would place the
     // clip twice as far from the scroll's own corner as it should be.
@@ -1231,7 +1337,7 @@ test "dom_calls: after a clip inside a scroll pops, later primitives return to t
         .color = geometry.Color.rgb(0, 1, 0),
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
-    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     // container=101, scroll outer=102, scroll inner=103, clip div=104, first
     // rrect div=105, second rrect div=106.
     try std.testing.expect(contains(rec.log.items, "appendChild(103,106)"));
@@ -1270,7 +1376,7 @@ test "dom_calls: after a scroll nested inside another scroll pops, later primiti
         .color = geometry.Color.rgb(0, 1, 0),
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
-    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 500 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 500 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     // container=101, outer scroll outer/inner=102/103, inner scroll outer/inner=104/105,
     // first rrect div=106, second rrect div=107.
     try std.testing.expect(contains(rec.log.items, "appendChild(103,107)"));
@@ -1304,7 +1410,7 @@ test "dom_calls: a region nested past max_region_depth is skipped and reports a 
         .radius = 0,
         .color = geometry.Color.rgb(1, 0, 0),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), &sink, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 300, .height = 200 }, geometry.Color.rgb(0, 0, 0), &sink, null, null, false);
     try std.testing.expect(!sink.ok());
     try std.testing.expectEqual(FaultSink.FaultCode.region_overflow, sink.first.?.code);
     // container=101, then one div per honoured push (max_region_depth of them,
@@ -1330,7 +1436,7 @@ test "dom_calls: image with encoded bytes emits createElement(img), style, and d
         .rect = .{ .x = 5, .y = 15, .width = 64, .height = 32 },
         .opacity = 1,
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     // A createElement("img") call must be recorded.
     try std.testing.expect(contains(rec.log.items, "createElement(img)"));
     // The style attribute must include left/top/width/height.
@@ -1374,7 +1480,7 @@ test "dom_calls: an icon creates an svg in the SVG namespace holding one stroked
         .color = geometry.Color.rgb(1, 0, 0),
         .origin = .{ .x = 6, .y = 9 },
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
 
     // createElement("svg") builds an HTML unknown element that never paints, so
     // the namespaced call is the fact this pins.
@@ -1412,7 +1518,7 @@ test "dom_calls: a labelled icon appends a namespaced title node holding the nam
         .origin = .{ .x = 0, .y = 0 },
         .label = "Genesis",
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
 
     try std.testing.expect(contains(rec.log.items, "createElementNS(http://www.w3.org/2000/svg,title)"));
     try std.testing.expect(contains(rec.log.items, "setTextContent") and contains(rec.log.items, "Genesis"));
@@ -1437,7 +1543,7 @@ test "dom_calls: an icon with no label creates no title node" {
         .color = geometry.Color.rgb(1, 1, 1),
         .origin = .{ .x = 0, .y = 0 },
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     try std.testing.expect(!contains(rec.log.items, ",title)"));
     // The svg is still built, so this is not passing because nothing was drawn.
     try std.testing.expect(contains(rec.log.items, "createElementNS(http://www.w3.org/2000/svg,path)"));
@@ -1460,7 +1566,7 @@ test "dom_calls: a host with no namespaced creator still builds the icon through
     } });
     var ops = rec.ops();
     ops.create_element_ns = null;
-    try render(gpa, ops, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, ops, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     try std.testing.expect(contains(rec.log.items, "createElement(svg)"));
     try std.testing.expect(contains(rec.log.items, "createElement(path)"));
     try std.testing.expect(!contains(rec.log.items, "createElementNS("));
@@ -1479,7 +1585,7 @@ test "dom_calls: image fromRgba (no encoded bytes) emits no img element" {
         .rect = .{ .x = 0, .y = 0, .width = 4, .height = 4 },
         .opacity = 1,
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
     // No img element should be created (fromRgba has no encoded bytes).
     try std.testing.expect(!contains(rec.log.items, "createElement(img)"));
 }
@@ -1496,7 +1602,7 @@ test "a text run keeps its own spacing instead of letting the browser collapse i
     defer h.deinit();
     try h.pump();
 
-    try render(gpa, rec.ops(), h.canvas.list, .{ .width = 200, .height = 100 }, .{ .r = 0, .g = 0, .b = 0, .a = 1 }, null, null, false);
+    try render(gpa, rec.ops(), h.canvas.list, .{ .width = 200, .height = 100 }, .{ .r = 0, .g = 0, .b = 0, .a = 1 }, null, null, null, false);
 
     // Without this rule a browser drops the leading spaces of a run and
     // collapses every other stretch of them, so indented source loses its
@@ -1526,7 +1632,7 @@ test "dom_calls: a scroll region's offset survives a second render at the same o
     try list.append(gpa, .{ .pop_scroll = {} });
 
     // First render: container=101, scroll outer=102, inner=103.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     try std.testing.expectEqual(@as(usize, 1), mem.count);
     try std.testing.expectEqual(@as(u32, 102), mem.handles[0]);
 
@@ -1535,7 +1641,7 @@ test "dom_calls: a scroll region's offset survives a second render at the same o
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
 
     // A tap: the whole tree rebuilds again. New container=104, new outer=105.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
 
     // The new region was handed back the offset the old one held.
     try std.testing.expect(contains(rec.log.items, "writeScrollOffset(105,0,77)"));
@@ -1561,18 +1667,18 @@ test "dom_calls: a region that phantom moved gets phantom's offset, once" {
     try list.append(gpa, .{ .pop_scroll = {} });
 
     // Container 101, outer 102. The browser then scrolls to 77.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
 
     // Phantom moves the region to 120. Container 104, outer 105.
     list.primitives.items[0].push_scroll.offset.y = 120;
     list.primitives.items[0].push_scroll.moved = 1;
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     try std.testing.expect(contains(rec.log.items, "writeScrollOffset(105,0,120)"));
 
     // No new phantom move, so the browser's offset wins. Container 107, outer 108.
     rec.setScrollOffset(105, .{ .x = 0, .y = 90 });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     try std.testing.expect(contains(rec.log.items, "writeScrollOffset(108,0,90)"));
 }
 
@@ -1595,13 +1701,13 @@ test "dom_calls: a phantom move in the same render as a navigation wins over the
     try list.append(gpa, .{ .pop_scroll = {} });
 
     // Container 101, outer 102.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
 
     // Phantom moves the region to 120 in the same render as a navigation.
     // Container 104, outer 105.
     list.primitives.items[0].push_scroll.offset.y = 120;
     list.primitives.items[0].push_scroll.moved = 1;
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, true);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, true);
 
     // The move wins: the div gets phantom's offset, not the navigation's zero.
     try std.testing.expect(contains(rec.log.items, "writeScrollOffset(105,0,120)"));
@@ -1626,11 +1732,11 @@ test "dom_calls: a navigation clears a scroll region's offset instead of carryin
     try list.append(gpa, .{ .pop_scroll = {} });
 
     // First render: outer=102. The visitor scrolls it.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
 
     // A navigation to a new route: new outer=105, reset_scroll=true.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, true);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, true);
 
     // The old offset is never read back and never written onto the new
     // region: it is left at the browser's own default of zero for a freshly
@@ -1681,7 +1787,7 @@ test "dom_calls: a region keeps its offset when a new region comes before it" {
     try list.append(gpa, .{ .pop_scroll = {} });
 
     // Container 101, outer 102. The browser scrolls it and tells the view.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
     page.offset.y = 77;
 
@@ -1692,7 +1798,7 @@ test "dom_calls: a region keeps its offset when a new region comes before it" {
         try list.append(gpa, testRegion(v));
         try list.append(gpa, .{ .pop_scroll = {} });
     }
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     try std.testing.expect(contains(rec.log.items, "writeScrollOffset(107,0,77)"));
     try std.testing.expect(!contains(rec.log.items, "writeScrollOffset(105"));
     try std.testing.expectEqual(@as(f32, 77), page.offset.y);
@@ -1714,9 +1820,9 @@ test "dom_calls: a view that the browser scrolled before its event came takes th
     try list.append(gpa, testRegion(&page));
     try list.append(gpa, .{ .pop_scroll = {} });
 
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     try std.testing.expectEqual(@as(f32, 77), page.offset.y);
     try std.testing.expect(mem.synced);
 }
@@ -1734,12 +1840,12 @@ test "dom_calls: a navigation moves a view that stays on the page back to the to
     try list.append(gpa, testRegion(&page));
     try list.append(gpa, .{ .pop_scroll = {} });
 
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     rec.setScrollOffset(102, .{ .x = 0, .y = 77 });
     page.offset.y = 77;
     list.primitives.items[0].push_scroll.offset.y = 77;
 
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, true);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, true);
     try std.testing.expect(!contains(rec.log.items, "writeScrollOffset(105"));
     try std.testing.expectEqual(@as(f32, 0), page.offset.y);
     try std.testing.expect(mem.synced);
@@ -1758,7 +1864,7 @@ test "dom_calls: a region new to the page shows the offset its view already has"
     try list.append(gpa, testRegion(&page));
     try list.append(gpa, .{ .pop_scroll = {} });
 
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     try std.testing.expect(contains(rec.log.items, "writeScrollOffset(102,0,40)"));
     try std.testing.expect(!mem.synced);
 }
@@ -1784,7 +1890,7 @@ test "dom_calls: a host with no scroll offset hooks still renders a scroll regio
     } });
     try list.append(gpa, .{ .pop_scroll = {} });
 
-    try render(gpa, ops, list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, ops, list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
 
     // The region still builds normally.
     try std.testing.expect(contains(rec.log.items, "overflow:scroll"));
@@ -1819,7 +1925,7 @@ test "dom_calls: each scroll region div names its index, and the memory keeps it
     }
 
     // Container 101, then outer 102 and inner 103, then outer 104 and inner 105.
-    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, &mem, null, false);
     try std.testing.expect(contains(rec.log.items, "setAttribute(102,data-phantom-scroll,0)"));
     try std.testing.expect(contains(rec.log.items, "setAttribute(104,data-phantom-scroll,1)"));
     try std.testing.expect(!contains(rec.log.items, "setAttribute(103,data-phantom-scroll"));
@@ -1841,7 +1947,7 @@ test "dom_calls: a rendered frame sets no style ATTRIBUTE anywhere, because a st
         .color = geometry.Color.rgb(1, 0, 0),
         .hover_color = geometry.Color.rgb(0, 1, 0),
     } });
-    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
 
     // The whole point of the change, stated as the thing that must not happen.
     // A single one of these blanks the page under `style-src` without
@@ -1877,7 +1983,7 @@ test "dom_calls: a host with no CSSOM hooks still renders, through the attribute
         .color = geometry.Color.rgb(1, 0, 0),
         .hover_color = geometry.Color.rgb(0, 1, 0),
     } });
-    try render(gpa, ops_no_cssom, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, false);
+    try render(gpa, ops_no_cssom, list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
 
     try std.testing.expect(contains(rec.log.items, ",style,position:absolute"));
     try std.testing.expect(contains(rec.log.items, "setTextContent"));
@@ -1932,4 +2038,133 @@ test "dom_calls: two fonts get two different families, so neither can answer for
     defer gpa.free(other);
     try std.testing.expect(std.mem.indexOf(u8, one, fontFamily(&fam_a, &a)) != null);
     try std.testing.expect(std.mem.indexOf(u8, other, fontFamily(&fam_a, &a)) != null);
+}
+
+/// The handle a recorded `createElement` or `createElementNS` line returned.
+fn createdHandle(line: []const u8) ?u32 {
+    if (!std.mem.startsWith(u8, line, "createElement")) return null;
+    const at = std.mem.lastIndexOf(u8, line, "->") orelse return null;
+    return std.fmt.parseInt(u32, line[at + 2 ..], 10) catch null;
+}
+
+test "dom_calls: the next render releases every node of the last one once, and never the body or head" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    try list.append(gpa, .{ .rrect = .{
+        .rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+        .radius = 0,
+        .color = geometry.Color.rgb(1, 0, 0),
+        .hover_color = geometry.Color.rgb(0, 1, 0),
+    } });
+    try list.append(gpa, .{ .push_scroll = .{
+        .viewport = .{ .x = 0, .y = 20, .width = 50, .height = 50 },
+        .offset = .{ .x = 0, .y = 0 },
+        .content = .{ .width = 50, .height = 200 },
+    } });
+    try list.append(gpa, .{ .push_clip = .{ .rect = .{ .x = 0, .y = 20, .width = 20, .height = 20 }, .radius = 2 } });
+    try list.append(gpa, .{ .icon = .{
+        .id = .torii,
+        .size = .{ .width = 16, .height = 16 },
+        .color = geometry.Color.rgb(1, 1, 1),
+        .origin = .{ .x = 0, .y = 20 },
+        .label = "Gate",
+    } });
+    try list.append(gpa, .{ .pop_clip = {} });
+    try list.append(gpa, .{ .pop_scroll = {} });
+
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    var first: [16]u32 = undefined;
+    var first_len: usize = 0;
+    for (rec.log.items) |l| {
+        const h = createdHandle(l) orelse continue;
+        first[first_len] = h;
+        first_len += 1;
+    }
+    // A container, the rrect, two scroll divs, the clip, and an svg, title and path.
+    try std.testing.expectEqual(@as(usize, 8), first_len);
+    try std.testing.expectEqual(@as(usize, 0), countLines(rec.log.items, "release("));
+
+    const second_start = rec.log.items.len;
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    const after = rec.log.items[second_start..];
+    const clear = indexOfLine(after, "clearChildren(1)").?;
+    var buf: [32]u8 = undefined;
+    for (first[0..first_len]) |h| {
+        const line = try std.fmt.bufPrint(&buf, "release({d})", .{h});
+        var n: usize = 0;
+        for (after) |l| {
+            if (std.mem.eql(u8, l, line)) n += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), n);
+        // Released before the clear removes the node from the page.
+        try std.testing.expect(indexOfLine(after, line).? < clear);
+    }
+    try std.testing.expectEqual(first_len, countLines(after, "release("));
+    for (rec.log.items) |l| {
+        try std.testing.expect(!std.mem.eql(u8, l, "release(1)"));
+        try std.testing.expect(!std.mem.eql(u8, l, "release(2)"));
+    }
+    try std.testing.expectEqual(@as(usize, first_len), page.nodes.items.len);
+}
+
+test "dom_calls: the same interactive colours add their rule once, and a new colour adds a second rule" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var page: PageState = .{};
+    defer page.deinit(gpa);
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    const button: display_list.Primitive = .{ .rrect = .{
+        .rect = .{ .x = 0, .y = 0, .width = 80, .height = 40 },
+        .radius = 4,
+        .color = geometry.Color.rgb(0, 0, 1),
+        .hover_color = geometry.Color.rgb(0, 0, 0.9),
+        .active_color = geometry.Color.rgb(0, 0, 0.8),
+    } };
+    // Two buttons of one colour in one frame share a class and a rule.
+    try list.append(gpa, button);
+    try list.append(gpa, button);
+
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    try std.testing.expectEqual(@as(usize, 1), countLines(rec.log.items, "addRule("));
+    try std.testing.expectEqual(@as(usize, 1), countLines(rec.log.items, ":hover{"));
+    try std.testing.expectEqualStrings(classAt(rec.log.items, 0).?, classAt(rec.log.items, 3).?);
+
+    var other = button;
+    other.rrect.hover_color = geometry.Color.rgb(1, 0, 0);
+    try list.append(gpa, other);
+    try render(gpa, rec.ops(), list, .{ .width = 200, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, &page, false);
+    try std.testing.expectEqual(@as(usize, 2), countLines(rec.log.items, "addRule("));
+    try std.testing.expectEqual(@as(usize, 2), countLines(rec.log.items, ":hover{"));
+    try std.testing.expect(!std.mem.eql(u8, classAt(rec.log.items, 0).?, classAt(rec.log.items, 6).?));
+    try std.testing.expectEqual(@as(u32, 2), page.rules.count());
+}
+
+test "dom_calls: a stroke and a fill with the same state colours get different classes" {
+    const gpa = std.testing.allocator;
+    var rec = Recorder{ .gpa = gpa };
+    defer rec.deinit();
+    var list = display_list.DisplayList{};
+    defer list.deinit(gpa);
+    const fill: display_list.Primitive = .{ .rrect = .{
+        .rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+        .radius = 0,
+        .color = geometry.Color.rgb(0, 0, 1),
+        .hover_color = geometry.Color.rgb(0, 1, 0),
+    } };
+    var stroke = fill;
+    stroke.rrect.stroke_width = 1;
+    try list.append(gpa, fill);
+    try list.append(gpa, stroke);
+    try render(gpa, rec.ops(), list, .{ .width = 100, .height = 100 }, geometry.Color.rgb(0, 0, 0), null, null, null, false);
+    try std.testing.expect(!std.mem.eql(u8, classAt(rec.log.items, 0).?, classAt(rec.log.items, 1).?));
+    try std.testing.expect(contains(rec.log.items, ":hover{border-color:"));
+    try std.testing.expect(contains(rec.log.items, ":hover{background:"));
 }

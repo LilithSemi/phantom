@@ -50,6 +50,8 @@ pub const WebApp = struct {
     /// per render: `render` reads last frame's regions out of it before it
     /// clears the DOM, then repopulates it with this frame's regions.
     scroll_mem: phantom.backend.dom_calls.ScrollMemory = .{},
+    /// Node handles and interactive rules that `render` keeps between frames.
+    page: phantom.backend.dom_calls.PageState = .{},
     /// Nanoseconds since the Unix epoch, from the browser's `Date.now`. This is
     /// the settable clock: NTP and a timezone edit both move it, and it can move
     /// backwards. Only a time of day is read from it. Zero until the first tick.
@@ -222,7 +224,7 @@ pub const WebApp = struct {
         // render it causes, and this render is the only one that reads it.
         const reset_scroll = self.owner.route_changed;
         self.owner.route_changed = false;
-        phantom.backend.dom_calls.render(self.gpa, self.ops, canvas.list, physical, phantom.ColorScheme.tokyoNight().bg, self.sink, &self.scroll_mem, reset_scroll) catch |err| {
+        phantom.backend.dom_calls.render(self.gpa, self.ops, canvas.list, physical, phantom.ColorScheme.tokyoNight().bg, self.sink, &self.scroll_mem, &self.page, reset_scroll) catch |err| {
             self.sink.report(.render_failed, @errorName(err));
         };
         if (self.scroll_mem.synced) self.paintOffsets();
@@ -1170,6 +1172,7 @@ fn destroyWebApp(gpa: std.mem.Allocator, app: *WebApp) void {
     app.root.deinit(gpa);
     app.focus.deinit(gpa);
     app.net.deinit();
+    app.page.deinit(gpa);
     app.owner.deinit();
     gpa.destroy(app.owner);
     gpa.destroy(app.sink);
