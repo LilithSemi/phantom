@@ -1310,10 +1310,13 @@ test "the server answers over a socket on a port the system picks" {
 
 test "a slow reader that keeps reading gets the whole answer" {
     const io = std.testing.io;
+    // Each pause is far below the timeout, so a slow test machine cannot cut
+    // the answer, and the whole answer still takes longer than one timeout.
+    const timeout_ms = 2000;
     var live: LiveSite = undefined;
-    try live.start(.fromMilliseconds(300));
+    try live.start(.fromMilliseconds(timeout_ms));
     defer live.stop();
-    const big_len = 24 * 1024 * 1024;
+    const big_len = 8 * 1024 * 1024;
     const big = try std.testing.allocator.alloc(u8, big_len);
     defer std.testing.allocator.free(big);
     @memset(big, 'x');
@@ -1336,12 +1339,12 @@ test "a slow reader that keeps reading gets the whole answer" {
         }
         total += n;
         if (n < chunk.len) break;
-        try io.sleep(.fromMilliseconds(10), .awake);
+        try io.sleep(.fromMilliseconds(100), .awake);
     }
     try std.testing.expectEqual(head_len.? + big_len, total);
     // The answer took longer than one timeout, so a deadline for the whole
     // answer would have cut it.
-    try std.testing.expect(elapsedMs(start) > 300);
+    try std.testing.expect(elapsedMs(start) > timeout_ms);
 }
 
 test "a reader that stops reading is cut by the write timeout" {
