@@ -4,7 +4,9 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Rect;
+import android.graphics.Insets;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.Choreographer;
@@ -12,6 +14,9 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.WindowInsets;
+import android.view.WindowManager;
+import android.view.WindowMetrics;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
@@ -21,11 +26,11 @@ import java.nio.charset.StandardCharsets;
 public final class MainActivity extends Activity {
     static { System.loadLibrary("@LIBRARY@"); }
 
-    private static native long nativeCreate(int width, int height, float density);
+    private static native long nativeCreate(int width, int height, float density, float fontScale, int insetLeft, int insetTop, int insetRight, int insetBottom);
     private static native void nativeDestroy(long handle);
     private static native int nativeSurfaceCreated(long handle, android.view.Surface surface, int width, int height, float density);
     private static native void nativeSurfaceDestroyed(long handle);
-    private static native int nativeRender(long handle, int width, int height, float density, long frameNanos);
+    private static native int nativeRender(long handle, int width, int height, float density, float fontScale, int insetLeft, int insetTop, int insetRight, int insetBottom, long frameNanos);
     private static native int nativeTouch(long handle, int action, int pointerId, float x, float y);
     private static native void nativeCommitCodepoint(long handle, int codepoint);
     private static native void nativeBeginPreedit(long handle);
@@ -64,7 +69,9 @@ public final class MainActivity extends Activity {
             int height = frame.height();
             if (width == 0 || height == 0) return;
             float density = getResources().getDisplayMetrics().density;
-            if (handle == 0) handle = nativeCreate(width, height, density);
+            float fontScale = getResources().getConfiguration().fontScale;
+            Rect insets = systemBarInsets();
+            if (handle == 0) handle = nativeCreate(width, height, density, fontScale, insets.left, insets.top, insets.right, insets.bottom);
             surfaceAttached = handle != 0 && nativeSurfaceCreated(handle, holder.getSurface(), width, height, density) != 0;
             scheduleFrame();
         }
@@ -83,7 +90,18 @@ public final class MainActivity extends Activity {
         @Override public void doFrame(long frameNanos) {
             frameScheduled = false;
             if (!surfaceAttached || handle == 0) return;
-            nativeRender(handle, getWidth(), getHeight(), getResources().getDisplayMetrics().density, frameNanos);
+            Rect insets = systemBarInsets();
+            nativeRender(
+                    handle,
+                    getWidth(),
+                    getHeight(),
+                    getResources().getDisplayMetrics().density,
+                    getResources().getConfiguration().fontScale,
+                    insets.left,
+                    insets.top,
+                    insets.right,
+                    insets.bottom,
+                    frameNanos);
             scheduleFrame();
         }
 
@@ -91,6 +109,28 @@ public final class MainActivity extends Activity {
             if (!surfaceAttached || frameScheduled) return;
             frameScheduled = true;
             Choreographer.getInstance().postFrameCallback(this);
+        }
+
+        @SuppressWarnings("deprecation")
+        private Rect systemBarInsets() {
+            WindowInsets windowInsets;
+            if (Build.VERSION.SDK_INT >= 30) {
+                WindowManager manager = getContext().getSystemService(WindowManager.class);
+                WindowMetrics metrics = manager.getCurrentWindowMetrics();
+                windowInsets = metrics.getWindowInsets();
+                Insets value = windowInsets.getInsetsIgnoringVisibility(
+                        WindowInsets.Type.statusBars()
+                                | WindowInsets.Type.navigationBars()
+                                | WindowInsets.Type.displayCutout());
+                return new Rect(value.left, value.top, value.right, value.bottom);
+            }
+            windowInsets = getRootWindowInsets();
+            if (windowInsets == null) return new Rect();
+            return new Rect(
+                    windowInsets.getSystemWindowInsetLeft(),
+                    windowInsets.getSystemWindowInsetTop(),
+                    windowInsets.getSystemWindowInsetRight(),
+                    windowInsets.getSystemWindowInsetBottom());
         }
 
         @Override public boolean onTouchEvent(MotionEvent event) {

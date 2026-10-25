@@ -13,6 +13,8 @@ pub const MediaQueryData = struct {
     size: geom.LogicalSize,
     dpr: f32,
     text_scale: f32 = 1.0,
+    /// Logical space obscured by system UI or display cutouts.
+    view_padding: geom.LogicalEdgeInsets = .{},
 
     /// Convenience: the product that a native backend would apply to layout.
     /// Web entry points (Task 5) may supply only text_scale to layout and let
@@ -37,6 +39,7 @@ pub const View = struct {
         size: geom.LogicalSize,
         dpr: f32 = 1.0,
         text_scale: f32 = 1.0,
+        view_padding: geom.LogicalEdgeInsets = .{},
     }) !u32 {
         const id = owner.next_view_id;
         owner.next_view_id += 1;
@@ -50,6 +53,7 @@ pub const View = struct {
                 .size = opts.size,
                 .dpr = opts.dpr,
                 .text_scale = opts.text_scale,
+                .view_padding = opts.view_padding,
             },
         };
         try owner.views.put(owner.gpa, id, boxed);

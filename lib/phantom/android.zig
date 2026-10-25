@@ -42,13 +42,22 @@ pub const Session = struct {
     surface: lattice.Surface,
     renderer: phantom.backend.PrismBackend,
     scale: f32,
+    text_scale: f32,
     active_pointer: ?u32 = null,
     pointer_position: phantom.PhysicalOffset = .zero,
     touch_scroll: phantom.input.TouchScrollRecognizer = .{},
     preedit_buffer: std.ArrayList(u8) = .empty,
     open_url_request: OpenUrlRequest = .{},
 
-    pub fn create(gpa: std.mem.Allocator, root: phantom.Root, width: u32, height: u32, density: f32) !*Session {
+    pub fn create(
+        gpa: std.mem.Allocator,
+        root: phantom.Root,
+        width: u32,
+        height: u32,
+        density: f32,
+        text_scale: f32,
+        system_insets: phantom.PhysicalEdgeInsets,
+    ) !*Session {
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
 
@@ -68,14 +77,16 @@ pub const Session = struct {
         self.owner.io = self.threaded.io();
         self.owner.platform = .{ .ctx = self, .open_url = queueOpenUrl };
         self.scale = validDensity(density);
+        self.text_scale = validTextScale(text_scale);
         self.preedit_buffer = .empty;
         self.open_url_request = .{};
 
         _ = try phantom.View.open(&self.owner, .{
             .title = "Android",
-            .size = logicalSize(width, height, self.scale),
+            .size = logicalSize(width, height, self.scale * self.text_scale),
             .dpr = self.scale,
-            .text_scale = 1,
+            .text_scale = self.text_scale,
+            .view_padding = logicalInsets(system_insets, self.scale * self.text_scale),
         });
         const view = self.owner.activeView().?;
         var bctx = phantom.BuildContext{ .arena = self.arena.allocator(), .owner = &self.owner };
@@ -128,19 +139,30 @@ pub const Session = struct {
         self.host.detachNativeWindow(self.surface.id);
     }
 
-    pub fn render(self: *Session, width: u32, height: u32, density: f32, frame_nanos: i64) !void {
+    pub fn render(
+        self: *Session,
+        width: u32,
+        height: u32,
+        density: f32,
+        text_scale: f32,
+        system_insets: phantom.PhysicalEdgeInsets,
+        frame_nanos: i64,
+    ) !void {
         try self.host.resize(self.surface.id, width, height, density);
         try self.drainEvents();
         const target = try self.host.backend().surfaceRenderTarget(self.surface.id);
         self.scale = validDensity(density);
+        self.text_scale = validTextScale(text_scale);
+        const effective_scale = self.scale * self.text_scale;
         const physical = phantom.PhysicalSize{
             .width = @floatFromInt(width),
             .height = @floatFromInt(height),
         };
         self.owner.setActiveViewMetrics(.{
-            .size = logicalSize(width, height, self.scale),
+            .size = logicalSize(width, height, effective_scale),
             .dpr = self.scale,
-            .text_scale = 1,
+            .text_scale = self.text_scale,
+            .view_padding = logicalInsets(system_insets, effective_scale),
         });
 
         self.owner.scheduler.tick(@intCast(frame_nanos));
@@ -149,7 +171,7 @@ pub const Session = struct {
         try self.focus.collect(self.gpa, self.el);
         self.canvas.clear();
         const ro = self.el.renderObject() orelse return error.NoRootRenderObject;
-        _ = ro.layout(phantom.BoxConstraints.tightScaled(physical, self.scale));
+        _ = ro.layout(phantom.BoxConstraints.tightScaled(physical, effective_scale));
         try ro.paint(&self.canvas, phantom.PhysicalOffset.zero);
         try self.renderer.render(
             target.context.*,
@@ -360,10 +382,23 @@ fn validDensity(density: f32) f32 {
     return if (std.math.isFinite(density) and density > 0) density else 1;
 }
 
+fn validTextScale(scale: f32) f32 {
+    return if (std.math.isFinite(scale) and scale > 0) scale else 1;
+}
+
 fn logicalSize(width: u32, height: u32, density: f32) phantom.LogicalSize {
     return .{
         .width = @as(f32, @floatFromInt(width)) / density,
         .height = @as(f32, @floatFromInt(height)) / density,
+    };
+}
+
+fn logicalInsets(insets: phantom.PhysicalEdgeInsets, scale: f32) phantom.LogicalEdgeInsets {
+    return .{
+        .left = @max(0, insets.left) / scale,
+        .top = @max(0, insets.top) / scale,
+        .right = @max(0, insets.right) / scale,
+        .bottom = @max(0, insets.bottom) / scale,
     };
 }
 
@@ -381,4 +416,15 @@ test "Android URL requests own their UTF-8 bytes until consumed" {
     request.clear();
     try std.testing.expect(!request.pending);
     try std.testing.expectEqual(@as(usize, 0), request.bytes.items.len);
+}
+
+test "Android display scales reject invalid density and font scale values" {
+    try std.testing.expectEqual(@as(f32, 1), validDensity(0));
+    try std.testing.expectEqual(@as(f32, 1), validTextScale(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(f32, 1.5), validTextScale(1.5));
+    const size = logicalSize(1080, 2400, 3 * 1.5);
+    try std.testing.expectEqual(@as(f32, 240), size.width);
+    const insets = logicalInsets(.{ .top = 108, .bottom = 63 }, 3);
+    try std.testing.expectEqual(@as(f32, 36), insets.top);
+    try std.testing.expectEqual(@as(f32, 21), insets.bottom);
 }

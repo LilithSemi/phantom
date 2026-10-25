@@ -21,8 +21,6 @@ const pages = [_]Page{
     .{ .path = "/scrolling", .title = "Scrolling", .build = @import("pages/scrolling.zig").build },
 };
 
-const sidebar_width = 200;
-
 /// One route per page, and "/" shows the first page. The sidebar sits inside
 /// each route, because a `RouteLink` finds its router by looking up the tree.
 const routes = blk: {
@@ -40,24 +38,52 @@ pub fn root(b: *phantom.BuildContext) phantom.Widget {
 fn shellFor(comptime index: usize) *const fn (*phantom.BuildContext) phantom.Widget {
     return struct {
         fn build(b: *phantom.BuildContext) phantom.Widget {
-            return shell(b, index, pages[index].build(b));
+            return shell(b, index);
         }
     }.build;
 }
 
 fn notFound(b: *phantom.BuildContext) phantom.Widget {
-    return shell(b, null, page(b, "Not found", &.{
-        text(b, "No page has this address. Pick one from the list.", .{}),
-    }));
+    return shell(b, null);
 }
 
-fn shell(b: *phantom.BuildContext, selected: ?usize, content: phantom.Widget) phantom.Widget {
+fn shell(b: *phantom.BuildContext, comptime selected: ?usize) phantom.Widget {
     const theme = phantom.Theme.of(b);
-    const row = b.new(phantom.Row(.{ .children = b.newSlice(phantom.Widget, &.{
-        sidebar(b, selected),
-        b.new(phantom.Expanded(.{ .child = content })).widget(),
-    }) }));
-    return b.new(phantom.DecoratedBox{ .color = theme.colors.bg, .child = row.widget() }).widget();
+    const scaffold = b.new(phantom.NavigationScaffold{
+        .body = .{ .build = bodyBuilder(selected) },
+        .navigation = .{ .build = navigationBuilder(selected) },
+        .title = .{ .build = titleBuilder(selected) },
+    });
+    return b.new(phantom.DecoratedBox{ .color = theme.colors.bg, .child = scaffold.widget() }).widget();
+}
+
+fn bodyBuilder(comptime selected: ?usize) *const fn (?*anyopaque, *phantom.BuildContext) phantom.Widget {
+    return struct {
+        fn build(_: ?*anyopaque, b: *phantom.BuildContext) phantom.Widget {
+            if (selected) |index| return pages[index].build(b);
+            return page(b, "Not found", &.{
+                text(b, "No page has this address. Pick one from the list.", .{ .wrap = true }),
+            });
+        }
+    }.build;
+}
+
+fn navigationBuilder(comptime selected: ?usize) *const fn (?*anyopaque, *phantom.BuildContext) phantom.Widget {
+    return struct {
+        fn build(_: ?*anyopaque, b: *phantom.BuildContext) phantom.Widget {
+            return sidebar(b, selected);
+        }
+    }.build;
+}
+
+fn titleBuilder(comptime selected: ?usize) *const fn (?*anyopaque, *phantom.BuildContext) phantom.Widget {
+    return struct {
+        fn build(_: ?*anyopaque, b: *phantom.BuildContext) phantom.Widget {
+            const theme = phantom.Theme.of(b);
+            const title = if (selected) |index| pages[index].title else "Not found";
+            return text(b, title, .{ .font = theme.body_bold_font, .size = 20 });
+        }
+    }.build;
 }
 
 fn sidebar(b: *phantom.BuildContext, selected: ?usize) phantom.Widget {
@@ -88,10 +114,7 @@ fn sidebar(b: *phantom.BuildContext, selected: ?usize) phantom.Widget {
     const scroll = b.new(phantom.ScrollView{
         .child = b.new(phantom.Padding{ .insets = .all(12), .child = list.widget() }).widget(),
     });
-    return b.new(phantom.SizedBox{
-        .width = sidebar_width,
-        .child = b.new(phantom.DecoratedBox{ .color = theme.colors.bg_dark, .child = scroll.widget() }).widget(),
-    }).widget();
+    return b.new(phantom.DecoratedBox{ .color = theme.colors.bg_dark, .child = scroll.widget() }).widget();
 }
 
 // Helpers the pages share.
@@ -124,19 +147,22 @@ pub fn format(b: *phantom.BuildContext, comptime fmt: []const u8, args: anytype)
 /// A page: its title, then its sections in a padded column that scrolls.
 pub fn page(b: *phantom.BuildContext, title: []const u8, sections: []const phantom.Widget) phantom.Widget {
     const theme = phantom.Theme.of(b);
+    const compact = phantom.MediaQuery.of(b).size.width < 720;
     var children: std.ArrayList(phantom.Widget) = .empty;
-    children.ensureTotalCapacity(b.arena, sections.len + 1) catch {
+    children.ensureTotalCapacity(b.arena, sections.len + @intFromBool(!compact)) catch {
         b.sink().report(.oom, "out of memory building a gallery page");
         return text(b, title, .{});
     };
-    children.appendAssumeCapacity(b.new(phantom.Padding{
-        .insets = .{ .bottom = 24 },
-        .child = text(b, title, .{ .font = theme.heading_font, .size = 36 }),
-    }).widget());
+    if (!compact) {
+        children.appendAssumeCapacity(b.new(phantom.Padding{
+            .insets = .{ .bottom = 24 },
+            .child = text(b, title, .{ .font = theme.heading_font, .size = 36 }),
+        }).widget());
+    }
     children.appendSliceAssumeCapacity(sections);
     const column = b.new(phantom.Column(.{ .children = children.items }));
     return b.new(phantom.ScrollView{
-        .child = b.new(phantom.Padding{ .insets = .all(32), .child = column.widget() }).widget(),
+        .child = b.new(phantom.Padding{ .insets = .all(if (compact) 16 else 32), .child = column.widget() }).widget(),
     }).widget();
 }
 
@@ -146,7 +172,7 @@ pub fn section(b: *phantom.BuildContext, caption: []const u8, example: phantom.W
     const column = b.new(phantom.Column(.{ .children = b.newSlice(phantom.Widget, &.{
         b.new(phantom.Padding{
             .insets = .{ .bottom = 10 },
-            .child = text(b, caption, .{ .size = 16, .color = theme.colors.fg_muted }),
+            .child = text(b, caption, .{ .size = 16, .color = theme.colors.fg_muted, .wrap = true }),
         }).widget(),
         example,
     }) }));

@@ -44,6 +44,9 @@ pub const Id = enum(u32) {
     /// Three dots on the midline, for elided content. U+22EF, which no bundled
     /// face has either.
     ellipsis = 12,
+
+    /// Three horizontal rails used to open application navigation.
+    menu = 13,
 };
 
 /// What a cell backend draws in place of the mark.
@@ -89,6 +92,10 @@ pub fn cellMarkFor(id: Id) ?CellMark {
         .rule_vertical => .{ .cp = '\u{2502}', .tile = true },
         .rule_horizontal => .{ .cp = '\u{2500}', .tile = true },
         .ellipsis => .{ .cp = '\u{22EF}' },
+        // U+2630 is two columns wide under Darwin's wcwidth tables. Cell
+        // layouts need a guaranteed one-column fallback; the vector backend
+        // still draws the proper three-rail menu path.
+        .menu => .{ .cp = '=' },
     };
 }
 
@@ -122,6 +129,7 @@ pub fn iconForCodepoint(cp: u21) ?Id {
         '\u{2502}' => .rule_vertical,
         '\u{2500}' => .rule_horizontal,
         '\u{22EF}' => .ellipsis,
+        '\u{2630}' => .menu,
         else => null,
     };
 }
@@ -142,6 +150,7 @@ pub fn pathFor(id: Id) path.Path {
         .rule_vertical => rule_vertical,
         .rule_horizontal => rule_horizontal,
         .ellipsis => ellipsis,
+        .menu => menu,
     };
 }
 
@@ -433,6 +442,16 @@ const ellipsis = path.Path{ .verbs = &.{
     .{ .line = .{ .x = 12.01, .y = 12 } },
     .{ .move = .{ .x = 19, .y = 12 } },
     .{ .line = .{ .x = 19.01, .y = 12 } },
+} };
+
+/// Three rails with the same inset as the rest of the interface set.
+const menu = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 4, .y = 18 } },
+    .{ .line = .{ .x = 20, .y = 18 } },
+    .{ .move = .{ .x = 4, .y = 12 } },
+    .{ .line = .{ .x = 20, .y = 12 } },
+    .{ .move = .{ .x = 4, .y = 6 } },
+    .{ .line = .{ .x = 20, .y = 6 } },
 } };
 
 /// Full bleed and butt capped, so stacking one per row draws a continuous rail

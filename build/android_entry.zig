@@ -37,9 +37,9 @@ export fn JNI_OnLoad(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
     return 0x00010006;
 }
 
-fn nativeCreate(_: ?*anyopaque, _: ?*anyopaque, width: c_int, height: c_int, density: f32) callconv(.c) i64 {
+fn nativeCreate(_: ?*anyopaque, _: ?*anyopaque, width: c_int, height: c_int, density: f32, text_scale: f32, inset_left: c_int, inset_top: c_int, inset_right: c_int, inset_bottom: c_int) callconv(.c) i64 {
     if (width <= 0 or height <= 0) return 0;
-    const value = Session.create(gpa, phantom.Root.plain(app.root), @intCast(width), @intCast(height), density) catch |err| {
+    const value = Session.create(gpa, phantom.Root.plain(app.root), @intCast(width), @intCast(height), density, text_scale, physicalInsets(inset_left, inset_top, inset_right, inset_bottom)) catch |err| {
         log(@errorName(err));
         return 0;
     };
@@ -65,13 +65,22 @@ fn nativeSurfaceDestroyed(_: ?*anyopaque, _: ?*anyopaque, handle: i64) callconv(
     if (session(handle)) |value| value.detachNativeWindow();
 }
 
-fn nativeRender(_: ?*anyopaque, _: ?*anyopaque, handle: i64, width: c_int, height: c_int, density: f32, frame_nanos: i64) callconv(.c) c_int {
+fn nativeRender(_: ?*anyopaque, _: ?*anyopaque, handle: i64, width: c_int, height: c_int, density: f32, text_scale: f32, inset_left: c_int, inset_top: c_int, inset_right: c_int, inset_bottom: c_int, frame_nanos: i64) callconv(.c) c_int {
     const value = session(handle) orelse return 0;
-    value.render(@intCast(width), @intCast(height), density, frame_nanos) catch |err| {
+    value.render(@intCast(width), @intCast(height), density, text_scale, physicalInsets(inset_left, inset_top, inset_right, inset_bottom), frame_nanos) catch |err| {
         log(@errorName(err));
         return 0;
     };
     return 1;
+}
+
+fn physicalInsets(left: c_int, top: c_int, right: c_int, bottom: c_int) phantom.PhysicalEdgeInsets {
+    return .{
+        .left = @floatFromInt(@max(0, left)),
+        .top = @floatFromInt(@max(0, top)),
+        .right = @floatFromInt(@max(0, right)),
+        .bottom = @floatFromInt(@max(0, bottom)),
+    };
 }
 
 fn nativeTouch(_: ?*anyopaque, _: ?*anyopaque, handle: i64, action: c_int, pointer_id: c_int, x: f32, y: f32) callconv(.c) c_int {

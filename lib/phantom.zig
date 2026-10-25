@@ -92,6 +92,8 @@ pub const widgets = struct {
     pub const RichText = rich_text.RichText;
     pub const markdown = @import("phantom/widgets/markdown.zig");
     pub const Markdown = markdown.Markdown;
+    pub const navigation_scaffold = @import("phantom/widgets/navigation_scaffold.zig");
+    pub const NavigationScaffold = navigation_scaffold.NavigationScaffold;
 };
 pub const ColoredBox = widgets.ColoredBox;
 pub const Padding = widgets.Padding;
@@ -129,6 +131,7 @@ pub const GridView = widgets.GridView;
 pub const ListView = widgets.ListView;
 pub const RichText = widgets.RichText;
 pub const Markdown = widgets.Markdown;
+pub const NavigationScaffold = widgets.NavigationScaffold;
 
 pub const backend = struct {
     pub const dom = @import("phantom/backend/dom.zig");
