@@ -869,6 +869,13 @@ pub fn build(b: *std.Build) void {
 
     phantom.addImport("lattice", lattice_dep.module("lattice"));
     phantom.addImport("prism", prism_dep.module("prism"));
+    if (target.result.os.tag == .linux and !target.result.abi.isAndroid()) {
+        const dbus_dep = b.dependency("dbus", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        phantom.addImport("dbus", dbus_dep.module("dbus"));
+    }
 
     // Every task in the terminal plan runs one named test. Without a filter the
     // full suite runs each time, which hides which test the task actually proved.

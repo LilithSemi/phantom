@@ -1,7 +1,8 @@
 //! The hooks a backend fills in for the things a widget tree cannot do by
 //! itself: open a URL, and read or write the address of the page, its query
-//! string included. Native backends leave them null, and a widget that finds a
-//! null hook does nothing rather than guessing.
+//! string included. Native backends leave page-address hooks null; Linux fills
+//! the URL hook through the desktop portal. A widget that finds a null hook does
+//! nothing rather than guessing.
 
 const std = @import("std");
 const http_mod = @import("http.zig");

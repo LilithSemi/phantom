@@ -16,6 +16,10 @@
             .url = "git+https://git.lilithsemi.com/LilithSemi/prism#ac7c8bdb52f6ff665b6b891578882abf2b48308a",
             .hash = "prism-0.1.0-PSE12HfbOQCor0jDlDn3o32n7_vbg-A69F_R-rU2ovEF",
         },
+        .dbus = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/dbus.zig#ac21c343ceee75c0a5ea1793096751ca851abfa1",
+            .hash = "dbus-0.1.0-8F4MwG8vBAC1eyINQZ4xQIwrt9zl9M5D1LgTdzoFlvMl",
+        },
     },
     .paths = .{
         "build",

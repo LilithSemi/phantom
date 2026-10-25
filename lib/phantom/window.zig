@@ -1,6 +1,10 @@
 //! The window event loop. This is the compositor equivalent of `tui.Session`.
 const std = @import("std");
+const builtin = @import("builtin");
 const phantom = @import("../phantom.zig");
+
+const linux_open_url_builds = builtin.os.tag == .linux and !builtin.abi.isAndroid();
+const LinuxUrlOpener = if (linux_open_url_builds) @import("linux_open_url.zig").Opener else void;
 
 /// Whether the window path can be COMPILED here at all. Not a claim about
 /// hardware, and not a claim about whether a window can be opened.
@@ -218,7 +222,14 @@ pub const App = struct {
             // at an address that does not move: see `tui.Tui.run`, which says
             // the same of its own session for the same reason.
             var session: Session = undefined;
-            try session.initOn(process.gpa, process.io, opened, root, opts);
+            try session.initOnWithBus(
+                process.gpa,
+                process.io,
+                opened,
+                root,
+                opts,
+                process.environ_map.get("DBUS_SESSION_BUS_ADDRESS"),
+            );
             defer session.deinit();
             while (try session.step()) {}
             return;
@@ -251,6 +262,7 @@ pub const Session = struct {
     arena: std.heap.ArenaAllocator,
     sink: phantom.FaultSink,
     owner: phantom.BuildOwner,
+    url_opener: LinuxUrlOpener,
     el: *phantom.Element,
     canvas: phantom.Canvas,
 
@@ -290,7 +302,7 @@ pub const Session = struct {
         opts: Options,
     ) !void {
         const opened = open(gpa, io, environ, opts) orelse return error.NoWindowBackend;
-        return self.initOn(gpa, io, opened, root, opts);
+        return self.initOnWithBus(gpa, io, opened, root, opts, environ.get("DBUS_SESSION_BUS_ADDRESS"));
     }
 
     /// Build a session on a window that is already open, taking it over.
@@ -309,6 +321,18 @@ pub const Session = struct {
         opened: Opening,
         root: phantom.Root,
         opts: Options,
+    ) !void {
+        return self.initOnWithBus(gpa, io, opened, root, opts, null);
+    }
+
+    fn initOnWithBus(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        opened: Opening,
+        root: phantom.Root,
+        opts: Options,
+        session_bus_address: ?[]const u8,
     ) !void {
         self.gpa = gpa;
         self.io = io;
@@ -340,6 +364,12 @@ pub const Session = struct {
         self.sink = .{ .diagnostics = opts.diagnostics orelse &self.diag_writer.interface };
         self.owner = .{ .gpa = gpa, .sink = &self.sink, .io = io };
         errdefer self.owner.deinit();
+        if (linux_open_url_builds) {
+            self.url_opener = LinuxUrlOpener.init(gpa, io, session_bus_address);
+            self.owner.platform = self.url_opener.asPlatform();
+        } else {
+            self.url_opener = {};
+        }
 
         // Build a View from the surface's logical size. lattice does not
         // negotiate buffer scaling today so rt.width == desc.width and the

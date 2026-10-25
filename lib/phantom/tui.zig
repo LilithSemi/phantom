@@ -16,6 +16,9 @@ const prism_backend = @import("backend/prism.zig");
 const tui_pixels = @import("backend/tui_pixels.zig");
 const kitty_gfx = @import("tui/kitty_gfx.zig");
 
+const linux_open_url_builds = builtin.os.tag == .linux and !builtin.abi.isAndroid();
+const LinuxUrlOpener = if (linux_open_url_builds) @import("linux_open_url.zig").Opener else void;
+
 pub const Mode = enum { cells, pixels };
 
 /// Whether mode A can be COMPILED here at all, which is prism's question and is
@@ -484,6 +487,7 @@ pub const Session = struct {
     arena: std.heap.ArenaAllocator,
     sink: phantom.FaultSink,
     owner: phantom.BuildOwner,
+    url_opener: LinuxUrlOpener,
     focus_mgr: phantom.FocusManager,
     el: *phantom.Element,
     canvas: phantom.Canvas,
@@ -645,6 +649,12 @@ pub const Session = struct {
         self.sink = .{ .diagnostics = opts.diagnostics orelse &self.diag_writer.interface };
         self.owner = .{ .gpa = gpa, .sink = &self.sink, .io = io };
         errdefer self.owner.deinit();
+        if (linux_open_url_builds) {
+            self.url_opener = LinuxUrlOpener.init(gpa, io, environ.get("DBUS_SESSION_BUS_ADDRESS"));
+            self.owner.platform = self.url_opener.asPlatform();
+        } else {
+            self.url_opener = {};
+        }
         // The mono metrics are in physical pixels, the same space the cell grid
         // uses.
         self.owner.text_metrics = textMetricsFor(self.mode, self.cell_w, self.cell_h);
