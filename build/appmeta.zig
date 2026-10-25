@@ -46,6 +46,33 @@ pub const LocalizedText = struct {
 
 pub const Icon = struct { path: std.Build.LazyPath, size: u32 };
 
+pub const AndroidOptions = struct {
+    permissions: []const Permission = &.{},
+    /// Development servers commonly use HTTP. This remains off unless an app
+    /// explicitly opts into Android's cleartext transport policy.
+    uses_cleartext_traffic: bool = false,
+
+    pub const Permission = enum {
+        internet,
+
+        pub fn manifestName(self: Permission) []const u8 {
+            return switch (self) {
+                .internet => "android.permission.INTERNET",
+            };
+        }
+    };
+};
+
+test "Android capabilities are opt-in" {
+    const defaults = AndroidOptions{};
+    try std.testing.expectEqual(@as(usize, 0), defaults.permissions.len);
+    try std.testing.expect(!defaults.uses_cleartext_traffic);
+    try std.testing.expectEqualStrings(
+        "android.permission.INTERNET",
+        AndroidOptions.Permission.internet.manifestName(),
+    );
+}
+
 /// How a route appears in the address bar. `.hash` works on any static host
 /// with no configuration. `.path` needs a host that serves the application
 /// for an unknown path (shell.html in the dist), or the copies that
@@ -64,6 +91,8 @@ pub const AppOptions = struct {
     categories: []const Category = &.{},
     keywords: []const LocalizedText = &.{},
     icons: []const Icon = &.{},
+    /// Android capabilities are opt-in. The default package remains offline.
+    android: AndroidOptions = .{},
     root: std.Build.LazyPath,
     /// More modules for the app root. Build them for `target`, or for
     /// wasm32-freestanding on the web. Each module that has no `phantom` import

@@ -5,6 +5,7 @@ const appmeta = @import("build/appmeta.zig");
 pub const Category = appmeta.Category;
 pub const LocalizedText = appmeta.LocalizedText;
 pub const Icon = appmeta.Icon;
+pub const AndroidOptions = appmeta.AndroidOptions;
 pub const AppOptions = appmeta.AppOptions;
 
 /// Where a web build serves the built-in fonts, relative to the page. Must match
@@ -172,6 +173,7 @@ fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod:
         .API_LEVEL = api_level,
         .APP_NAME = androidStringEscape(b, opts.name.default),
     });
+    const android_manifest = androidManifest(b, opts.android);
 
     // Gradle writes its own caches and intermediates, so this generated project
     // must be a mutable temporary directory rather than a cached WriteFiles tree.
@@ -180,7 +182,7 @@ fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod:
     _ = project.addCopyFile(phantom_dep.path("build/android/settings.gradle.kts"), "settings.gradle.kts");
     _ = project.addCopyFile(phantom_dep.path("build/android/build.gradle.kts"), "build.gradle.kts");
     _ = project.addCopyFile(android_build, "app/build.gradle.kts");
-    _ = project.addCopyFile(phantom_dep.path("build/android/AndroidManifest.xml"), "app/src/main/AndroidManifest.xml");
+    _ = project.addCopyFile(android_manifest, "app/src/main/AndroidManifest.xml");
     _ = project.addCopyFile(activity, "app/src/main/java/MainActivity.java");
     _ = project.addCopyFile(lib.getEmittedBin(), b.fmt("app/src/main/jniLibs/{s}/lib{s}.so", .{ abi, library_name }));
 
@@ -229,6 +231,37 @@ fn androidStringEscape(b: *std.Build, value: []const u8) []const u8 {
         else => out.append(b.allocator, char) catch @panic("oom"),
     };
     return out.toOwnedSlice(b.allocator) catch @panic("oom");
+}
+
+fn androidPermissionsXml(b: *std.Build, permissions: []const appmeta.AndroidOptions.Permission) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (permissions) |permission| {
+        const line = std.fmt.allocPrint(
+            b.allocator,
+            "    <uses-permission android:name=\"{s}\" />\n",
+            .{permission.manifestName()},
+        ) catch @panic("oom");
+        out.appendSlice(b.allocator, line) catch @panic("oom");
+    }
+    return out.toOwnedSlice(b.allocator) catch @panic("oom");
+}
+
+fn androidManifest(b: *std.Build, options: appmeta.AndroidOptions) std.Build.LazyPath {
+    const with_permissions = std.mem.replaceOwned(
+        u8,
+        b.allocator,
+        @embedFile("build/android/AndroidManifest.xml"),
+        "@PERMISSIONS@",
+        androidPermissionsXml(b, options.permissions),
+    ) catch @panic("oom");
+    const text = std.mem.replaceOwned(
+        u8,
+        b.allocator,
+        with_permissions,
+        "@USES_CLEARTEXT_TRAFFIC@",
+        if (options.uses_cleartext_traffic) "true" else "false",
+    ) catch @panic("oom");
+    return b.addWriteFiles().add("AndroidManifest.xml", text);
 }
 
 fn jniPrefix(b: *std.Build, app_id: []const u8) []const u8 {
