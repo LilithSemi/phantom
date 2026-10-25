@@ -238,3 +238,23 @@ zig build run-hello     # the window backend (needs a Wayland compositor)
 zig build run-hello:web # builds the wasm + HTML demo
 zig build run-hello:tui # the terminal backend (needs a real terminal)
 ```
+
+An Android target builds and packages an APK through the same `addApp` step as
+the native and web targets. Phantom mounts and lays out the application's real
+widget tree and renders its display list with Prism's Vulkan driver. Lattice
+owns the asynchronous Android surface lifecycle, and Prism presents directly to
+the `ANativeWindow` swapchain without a CPU readback or Android bitmap. This
+path shares Prism's text, images, clipping, rounded rectangles, and built-in
+icon rendering with the desktop backend. Raw multi-touch, virtual-keyboard
+commits, IME composition, deletion, and editor actions enter through Lattice's
+neutral event model.
+
+```sh
+cd examples/app
+zig build -Dtarget=aarch64-linux-android.24
+adb install -r zig-out/bin/demo-debug.apk
+```
+
+The Nix development shell supplies Android SDK 36, the NDK, JDK 17, and Gradle.
+Outside Nix, set `ANDROID_NDK_ROOT` and put Gradle on `PATH`. The
+`-Dandroid-ndk` and `-Dandroid-gradle` options override those locations.

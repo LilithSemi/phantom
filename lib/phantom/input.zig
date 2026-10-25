@@ -199,6 +199,61 @@ pub const KeyEvent = struct {
     action: KeyAction = .press,
 };
 
+pub const TextRange = struct { start: usize = 0, end: usize = 0 };
+
+/// Platform-neutral edits from a virtual keyboard or input method. Text and
+/// ranges use UTF-8; event slices are borrowed for the callback only.
+pub const TextInputEvent = union(enum) {
+    commit: []const u8,
+    preedit: struct { text: []const u8, selection: ?TextRange = null },
+    finish_preedit: void,
+    delete_surrounding: struct { before_bytes: usize, after_bytes: usize },
+    action: enum { none, done, go, next, previous, search, send },
+};
+
+/// Turns one raw touch stream into drag-to-scroll deltas without depending on
+/// any platform API. Hosts keep sending raw touch events; this recognizer only
+/// decides when a tap has crossed touch slop and become a scroll gesture.
+pub const TouchScrollRecognizer = struct {
+    origin: geom.PhysicalOffset = .zero,
+    last: geom.PhysicalOffset = .zero,
+    dragging: bool = false,
+
+    pub const Update = union(enum) {
+        pending,
+        begin: Delta,
+        scroll: Delta,
+    };
+
+    pub const Delta = struct { dx: f32, dy: f32 };
+
+    pub fn down(self: *TouchScrollRecognizer, point: geom.PhysicalOffset) void {
+        self.origin = point;
+        self.last = point;
+        self.dragging = false;
+    }
+
+    pub fn move(self: *TouchScrollRecognizer, point: geom.PhysicalOffset, slop: f32) Update {
+        if (!self.dragging) {
+            const dx = point.x - self.origin.x;
+            const dy = point.y - self.origin.y;
+            if (dx * dx + dy * dy <= slop * slop) return .pending;
+            self.dragging = true;
+            self.last = point;
+            return .{ .begin = .{ .dx = -dx, .dy = -dy } };
+        }
+        const delta = Delta{ .dx = self.last.x - point.x, .dy = self.last.y - point.y };
+        self.last = point;
+        return .{ .scroll = delta };
+    }
+
+    pub fn finish(self: *TouchScrollRecognizer) bool {
+        const was_dragging = self.dragging;
+        self.dragging = false;
+        return was_dragging;
+    }
+};
+
 /// Routes pointer events into the tree. down records the hit handler as the
 /// pressed target and delivers on_down; up delivers on_up to the SAME pressed
 /// target (passing the up position so a GestureDetector can decide tap-vs-cancel
@@ -312,6 +367,22 @@ const HitBox = struct {
         return .{ .base = .{ .layoutFn = lf, .paintFn = pf }, .handlers = .{ .ctx = undefined }, .w = w, .h = h };
     }
 };
+
+test "touch scroll waits for slop then reports finger-opposed deltas" {
+    var recognizer = TouchScrollRecognizer{};
+    recognizer.down(.{ .x = 20, .y = 30 });
+    try std.testing.expect(recognizer.move(.{ .x = 23, .y = 34 }, 8) == .pending);
+
+    const begin = recognizer.move(.{ .x = 20, .y = 20 }, 8).begin;
+    try std.testing.expectEqual(@as(f32, 0), begin.dx);
+    try std.testing.expectEqual(@as(f32, 10), begin.dy);
+
+    const update = recognizer.move(.{ .x = 16, .y = 14 }, 8).scroll;
+    try std.testing.expectEqual(@as(f32, 4), update.dx);
+    try std.testing.expectEqual(@as(f32, 6), update.dy);
+    try std.testing.expect(recognizer.finish());
+    try std.testing.expect(!recognizer.finish());
+}
 
 test "hitTest returns the deepest handler whose bounds contain the point; Dispatcher tracks pressed" {
     const gpa = std.testing.allocator;

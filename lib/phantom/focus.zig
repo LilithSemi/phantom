@@ -638,10 +638,14 @@ const RenderObject = render_object.RenderObject;
 /// `PointerHandlers` carries one.
 pub const FocusHandlers = struct {
     ctx: *anyopaque,
+    /// True when this node accepts committed text from an input method. Platform
+    /// hosts use this to decide whether focusing it should open a virtual keyboard.
+    accepts_text_input: bool = false,
     /// Returns true when the key was used. A key this handler refuses continues
     /// through the rest of `dispatch`, which ends at the focusable ancestors and the
     /// shortcut listeners.
     on_key: ?*const fn (ctx: *anyopaque, ev: input.KeyEvent) bool = null,
+    on_text_input: ?*const fn (ctx: *anyopaque, ev: input.TextInputEvent) bool = null,
     on_focus_change: ?*const fn (ctx: *anyopaque, focused: bool) void = null,
     /// Returns false when this handler is temporarily unavailable, for example a
     /// disabled button, and must be skipped by `collect`. Null means always
@@ -835,6 +839,17 @@ pub const FocusManager = struct {
     pub fn focusedId(self: *const FocusManager) ?[]const u8 {
         const c = self.current orelse return null;
         return c.id;
+    }
+
+    pub fn acceptsTextInput(self: *const FocusManager) bool {
+        const c = self.current orelse return false;
+        return c.accepts_text_input;
+    }
+
+    pub fn dispatchTextInput(self: *FocusManager, ev: input.TextInputEvent) bool {
+        const current = self.current orelse return false;
+        const handler = current.on_text_input orelse return false;
+        return handler(current.ctx, ev);
     }
 
     /// The render object under the focused node, for a caller that needs its

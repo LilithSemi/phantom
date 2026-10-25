@@ -20,6 +20,9 @@ pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.A
     const t = opts.target.result;
     const phantom_mod = phantom_dep.module("phantom");
 
+    if (t.abi.isAndroid()) {
+        return addAndroidApp(b, phantom_dep, phantom_mod, opts);
+    }
     if (t.cpu.arch == .wasm32) {
         return addWebApp(b, phantom_dep, opts); // Task C5
     }
@@ -102,6 +105,142 @@ pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.A
     }
 
     return step;
+}
+
+/// Compile an application's Zig root into the shared library an Android host
+/// packages in its APK. The host owns Activity and Surface lifecycles; later
+/// Android runtime work can grow this entry without changing the app module or
+/// the artifact Gradle consumes.
+fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod: *std.Build.Module, opts: appmeta.AppOptions) *std.Build.Step {
+    const api_level = opts.target.result.os.version_range.linux.android;
+    const abi, const ndk_triple = switch (opts.target.result.cpu.arch) {
+        .aarch64 => .{ "arm64-v8a", "aarch64-linux-android" },
+        .x86_64 => .{ "x86_64", "x86_64-linux-android" },
+        else => return &b.addFail("phantom.addApp: Android currently supports aarch64 and x86_64 targets").step,
+    };
+    const ndk_path = b.option(std.Build.LazyPath, "android-ndk", "Path to the Android NDK") orelse
+        if (b.graph.environ_map.get("ANDROID_NDK_ROOT")) |path|
+            b.graph.cwdRelativePath(path)
+        else
+            return &b.addFail("phantom.addApp: set ANDROID_NDK_ROOT or -Dandroid-ndk=/path/to/ndk").step;
+    const app_mod = b.createModule(.{
+        .root_source_file = opts.root,
+        .target = opts.target,
+        .optimize = opts.optimize,
+    });
+    app_mod.addImport("phantom", phantom_mod);
+    addAppImports(app_mod, phantom_mod, opts.imports);
+
+    const android_options = b.addOptions();
+    android_options.addOption([]const u8, "jni_prefix", jniPrefix(b, opts.id));
+    const root_mod = b.createModule(.{
+        .root_source_file = phantom_dep.path("build/android_entry.zig"),
+        .target = opts.target,
+        .optimize = opts.optimize,
+    });
+    root_mod.addImport("phantom", phantom_mod);
+    root_mod.addImport("app_root", app_mod);
+    root_mod.addImport("android_options", android_options.createModule());
+
+    const lib = b.addLibrary(.{
+        .name = execName(b, opts.id, opts.exec_name),
+        .root_module = root_mod,
+        .linkage = .dynamic,
+    });
+    lib.root_module.link_libc = true;
+    const sysroot = ndk_path.path(b, b.fmt("toolchains/llvm/prebuilt/{s}/sysroot", .{androidNdkHost(opts.target.result)}));
+    const target_lib = sysroot.path(b, b.fmt("usr/lib/{s}", .{ndk_triple}));
+    lib.root_module.addLibraryPath(target_lib.path(b, b.fmt("{d}", .{api_level})));
+    lib.root_module.linkSystemLibrary("log", .{});
+    lib.root_module.linkSystemLibrary("android", .{});
+    const libc_config = b.addSystemCommand(&.{"sh"});
+    libc_config.addFileArg(phantom_dep.path("build/android/write-libc-config.sh"));
+    libc_config.addDirectoryArg(sysroot);
+    libc_config.addDirectoryArg(target_lib);
+    libc_config.addArg(ndk_triple);
+    libc_config.addArg(b.fmt("{d}", .{api_level}));
+    const libc = libc_config.addOutputFileArg("android-libc.conf");
+    lib.setLibCFile(libc);
+
+    const library_name = execName(b, opts.id, opts.exec_name);
+    const activity = configureAndroidFile(b, phantom_dep.path("build/android/MainActivity.java.in"), "MainActivity.java", .{
+        .PACKAGE = opts.id,
+        .LIBRARY = library_name,
+    });
+    const android_build = configureAndroidFile(b, phantom_dep.path("build/android/app.build.gradle.kts.in"), "build.gradle.kts", .{
+        .APP_ID = opts.id,
+        .API_LEVEL = api_level,
+        .APP_NAME = androidStringEscape(b, opts.name.default),
+    });
+
+    // Gradle writes its own caches and intermediates, so this generated project
+    // must be a mutable temporary directory rather than a cached WriteFiles tree.
+    const project = b.addWriteFiles();
+    project.mode = .tmp;
+    _ = project.addCopyFile(phantom_dep.path("build/android/settings.gradle.kts"), "settings.gradle.kts");
+    _ = project.addCopyFile(phantom_dep.path("build/android/build.gradle.kts"), "build.gradle.kts");
+    _ = project.addCopyFile(android_build, "app/build.gradle.kts");
+    _ = project.addCopyFile(phantom_dep.path("build/android/AndroidManifest.xml"), "app/src/main/AndroidManifest.xml");
+    _ = project.addCopyFile(activity, "app/src/main/java/MainActivity.java");
+    _ = project.addCopyFile(lib.getEmittedBin(), b.fmt("app/src/main/jniLibs/{s}/lib{s}.so", .{ abi, library_name }));
+
+    const gradle_exe = b.option([]const u8, "android-gradle", "Gradle executable used to package Android APKs") orelse "gradle";
+    const gradle = b.addSystemCommand(&.{ gradle_exe, "--no-daemon", "phantomApk" });
+    gradle.setCwd(project.getDirectory());
+    const apk_name = b.fmt("{s}-debug.apk", .{library_name});
+    const apk = gradle.addOutputFileArg2(apk_name, .{ .prefix = "-PphantomOutput=", .make_absolute = true });
+
+    const install_apk = b.addInstallFile(apk, b.fmt("bin/{s}", .{apk_name}));
+    const step = b.step(b.fmt("app-{s}", .{opts.id}), b.fmt("Package {s} (Android APK)", .{opts.id}));
+    step.dependOn(&install_apk.step);
+    return step;
+}
+
+fn androidNdkHost(target: std.Target) []const u8 {
+    _ = target;
+    return switch (@import("builtin").os.tag) {
+        .linux => "linux-x86_64",
+        .macos => "darwin-x86_64",
+        else => @panic("Android NDK builds are supported from Linux and macOS hosts"),
+    };
+}
+
+fn configureAndroidFile(
+    b: *std.Build,
+    template: std.Build.LazyPath,
+    output_name: []const u8,
+    values: anytype,
+) std.Build.LazyPath {
+    return b.addConfigHeader(.{
+        .style = .{ .autoconf_at = template },
+        .include_path = output_name,
+    }, values).getOutputFile();
+}
+
+fn androidStringEscape(b: *std.Build, value: []const u8) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (value) |char| switch (char) {
+        '\\' => out.appendSlice(b.allocator, "\\\\") catch @panic("oom"),
+        '"' => out.appendSlice(b.allocator, "\\\"") catch @panic("oom"),
+        '$' => out.appendSlice(b.allocator, "\\$") catch @panic("oom"),
+        '\n' => out.appendSlice(b.allocator, "\\n") catch @panic("oom"),
+        '\r' => out.appendSlice(b.allocator, "\\r") catch @panic("oom"),
+        '\t' => out.appendSlice(b.allocator, "\\t") catch @panic("oom"),
+        else => out.append(b.allocator, char) catch @panic("oom"),
+    };
+    return out.toOwnedSlice(b.allocator) catch @panic("oom");
+}
+
+fn jniPrefix(b: *std.Build, app_id: []const u8) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(b.allocator, "Java_") catch @panic("oom");
+    for (app_id) |char| switch (char) {
+        '.' => out.append(b.allocator, '_') catch @panic("oom"),
+        '_' => out.appendSlice(b.allocator, "_1") catch @panic("oom"),
+        else => out.append(b.allocator, char) catch @panic("oom"),
+    };
+    out.appendSlice(b.allocator, "_MainActivity_") catch @panic("oom");
+    return out.toOwnedSlice(b.allocator) catch @panic("oom");
 }
 
 fn addAppImports(app_mod: *std.Build.Module, phantom_mod: *std.Build.Module, imports: []const std.Build.Module.Import) void {
@@ -674,7 +813,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const gpu_drivers = b.option([]const u8, "gpu-drivers", "Specific GPU drivers to enable, defaults to Prism's choice.");
+    const gpu_drivers: ?[]const u8 = b.option([]const u8, "gpu-drivers", "Specific GPU drivers to enable, defaults to Prism's choice.") orelse
+        if (target.result.abi.isAndroid()) @as([]const u8, "vulkan,software") else null;
 
     const phantom = b.addModule("phantom", .{
         .root_source_file = b.path("lib/phantom.zig"),

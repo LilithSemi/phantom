@@ -10,6 +10,7 @@
 //!
 //! File-as-struct pattern: the public type is GlyphAtlas = @This().
 const std = @import("std");
+const builtin = @import("builtin");
 const prism = @import("prism");
 const hal = prism.hal;
 const text = @import("../text.zig");
@@ -22,8 +23,13 @@ const GlyphAtlas = @This();
 // Atlas dimensions. rgba8_unorm: 4 bytes per pixel, stride = width * 4.
 // Using rgba8_unorm (rather than r8_unorm) ensures the software reference
 // driver can sample the atlas correctly; coverage is stored in the R channel.
-const atlas_w: u32 = 512;
-const atlas_h: u32 = 512;
+// A 512px edge is sufficient for the current desktop path but fills during the
+// first frame on a 3x-density phone: every logical font size becomes a distinct,
+// much larger device-pixel glyph. The Android atlas costs 16 MiB in the current
+// RGBA representation and leaves enough room for a dense multi-font application.
+const atlas_edge: u32 = if (builtin.abi.isAndroid()) 2048 else 512;
+const atlas_w: u32 = atlas_edge;
+const atlas_h: u32 = atlas_edge;
 const atlas_bpp: u32 = 4; // bytes per pixel (rgba8_unorm)
 
 /// What produced a cached bitmap. The discriminator keeps an icon and a glyph
@@ -71,7 +77,7 @@ row_h: u32,
 /// Cache map from Key to Entry.
 map: std.AutoHashMapUnmanaged(Key, Entry),
 
-/// Create a 512x512 rgba8_unorm sampled atlas image (coverage in R, sampled into
+/// Create the target-sized rgba8_unorm sampled atlas image (coverage in R, sampled into
 /// alpha via a {one,one,one,r} swizzle) and zero-init its pixels. rgba8 is used
 /// because the Prism software driver has no working r8_unorm sampler path.
 pub fn init(device: prism.Device, gpa: std.mem.Allocator) !GlyphAtlas {

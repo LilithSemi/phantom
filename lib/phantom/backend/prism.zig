@@ -187,11 +187,18 @@ const Batcher = struct {
 /// offset) taken out, exactly as `appendQuad` takes it out of a rect's vertices.
 /// A rectangle wholly off the left or top edge becomes an empty scissor rather
 /// than a negative extent.
-fn scissorFor(rect: geom.PhysicalRect, off: geom.PhysicalOffset) hal.ScissorRect {
-    const x0 = @max(@as(f32, 0), rect.x - off.x);
-    const y0 = @max(@as(f32, 0), rect.y - off.y);
-    const x1 = @max(x0, rect.x - off.x + rect.width);
-    const y1 = @max(y0, rect.y - off.y + rect.height);
+fn scissorFor(rect: geom.PhysicalRect, off: geom.PhysicalOffset, viewport: geom.PhysicalSize) hal.ScissorRect {
+    if (!std.math.isFinite(rect.x) or !std.math.isFinite(rect.y) or
+        std.math.isNan(rect.width) or std.math.isNan(rect.height) or
+        !std.math.isFinite(off.x) or !std.math.isFinite(off.y) or
+        rect.width <= 0 or rect.height <= 0)
+    {
+        return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+    }
+    const x0 = std.math.clamp(rect.x - off.x, 0, viewport.width);
+    const y0 = std.math.clamp(rect.y - off.y, 0, viewport.height);
+    const x1 = std.math.clamp(rect.x - off.x + rect.width, x0, viewport.width);
+    const y1 = std.math.clamp(rect.y - off.y + rect.height, y0, viewport.height);
     return .{
         .x = @intFromFloat(x0),
         .y = @intFromFloat(y0),
@@ -500,7 +507,7 @@ pub const PrismBackend = struct {
                 // The radius is dropped: a rounded scissor needs a clip term in
                 // every fragment shader, and this pass has none. The bounding
                 // rectangle still cuts a child at the boundary.
-                try batch.setScissor(intersectScissor(batch.scissor, scissorFor(cr.rect, cur_off)));
+                try batch.setScissor(intersectScissor(batch.scissor, scissorFor(cr.rect, cur_off, viewport)));
             },
             .pop_clip => {
                 // A pop with no push is a malformed display list, a runtime fault
@@ -516,12 +523,7 @@ pub const PrismBackend = struct {
                 const full = sr.viewport.x <= 0 and sr.viewport.y <= 0 and
                     sr.viewport.x + sr.viewport.width >= viewport.width and
                     sr.viewport.y + sr.viewport.height >= viewport.height;
-                try batch.setScissor(if (full) null else .{
-                    .x = @intFromFloat(@max(@as(f32, 0), sr.viewport.x)),
-                    .y = @intFromFloat(@max(@as(f32, 0), sr.viewport.y)),
-                    .width = @intFromFloat(sr.viewport.width),
-                    .height = @intFromFloat(sr.viewport.height),
-                });
+                try batch.setScissor(if (full) null else scissorFor(sr.viewport, .zero, viewport));
                 cur_off = sr.offset;
             },
             .pop_scroll => {
@@ -591,7 +593,10 @@ pub const PrismBackend = struct {
                     if (!font.hasGlyph(g.cp)) {
                         if (icon_builtin.iconForCodepoint(g.cp)) |id| {
                             const side = run.size;
-                            const entry = try self.ensureIcon(id, .{ .width = side, .height = side });
+                            const entry = self.ensureIcon(id, .{ .width = side, .height = side }) catch |err| switch (err) {
+                                error.AtlasFull => continue,
+                                else => return err,
+                            };
                             if (entry.w == 0 or entry.h == 0) continue;
                             const mark_baseline = run.origin.y + run.ascent + g.y;
                             // The icon arm below places a bitmap at
@@ -612,7 +617,10 @@ pub const PrismBackend = struct {
                             continue;
                         }
                     }
-                    const entry = try self.atlas.ensure(self.gpa, font, run.size, g.cp);
+                    const entry = self.atlas.ensure(self.gpa, font, run.size, g.cp) catch |err| switch (err) {
+                        error.AtlasFull => continue,
+                        else => return err,
+                    };
                     // Skip zero-size glyphs (whitespace, missing).
                     if (entry.w == 0 or entry.h == 0) continue;
                     // Compute the device-pixel quad for this glyph bitmap.
@@ -650,7 +658,10 @@ pub const PrismBackend = struct {
                 // open text run rather than opening a pass of its own, which
                 // would reorder it past everything else in the list.
                 try batch.begin(.text);
-                const entry = try self.ensureIcon(ic.id, ic.size);
+                const entry = self.ensureIcon(ic.id, ic.size) catch |err| switch (err) {
+                    error.AtlasFull => continue,
+                    else => return err,
+                };
                 if (entry.w == 0 or entry.h == 0) continue;
                 // entry.left/top are the bitmap's top-left in device space, where
                 // the icon grid's own top-left is (0, -height): the rasterizer

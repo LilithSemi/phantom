@@ -160,6 +160,7 @@ pub const panic = @import("phantom/panic.zig").panic;
 pub const setPanicHook = @import("phantom/panic.zig").setHook;
 
 pub const window = @import("phantom/window.zig");
+pub const android = @import("phantom/android.zig");
 
 pub const root = @import("phantom/root.zig");
 pub const Root = root.Root;

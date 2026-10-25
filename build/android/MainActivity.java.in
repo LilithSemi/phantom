@@ -1,0 +1,226 @@
+package @PACKAGE@;
+
+import android.app.Activity;
+import android.content.Context;
+import android.content.Intent;
+import android.graphics.Rect;
+import android.net.Uri;
+import android.os.Bundle;
+import android.text.InputType;
+import android.view.Choreographer;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.inputmethod.BaseInputConnection;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputMethodManager;
+import java.nio.charset.StandardCharsets;
+
+public final class MainActivity extends Activity {
+    static { System.loadLibrary("@LIBRARY@"); }
+
+    private static native long nativeCreate(int width, int height, float density);
+    private static native void nativeDestroy(long handle);
+    private static native int nativeSurfaceCreated(long handle, android.view.Surface surface, int width, int height, float density);
+    private static native void nativeSurfaceDestroyed(long handle);
+    private static native int nativeRender(long handle, int width, int height, float density, long frameNanos);
+    private static native int nativeTouch(long handle, int action, int pointerId, float x, float y);
+    private static native void nativeCommitCodepoint(long handle, int codepoint);
+    private static native void nativeBeginPreedit(long handle);
+    private static native void nativeAppendPreeditCodepoint(long handle, int codepoint);
+    private static native void nativeEndPreedit(long handle);
+    private static native void nativeFinishPreedit(long handle);
+    private static native void nativeDeleteFromIme(long handle, int before);
+    private static native void nativeImeAction(long handle, int action);
+    private static native int nativePendingUrlLength(long handle);
+    private static native int nativePendingUrlByte(long handle, int index);
+    private static native int nativePendingUrlMode(long handle);
+    private static native void nativeClearPendingUrl(long handle);
+
+    @Override public void onCreate(Bundle state) {
+        super.onCreate(state);
+        setContentView(new PhantomView(this));
+    }
+
+    private static final class PhantomView extends SurfaceView implements SurfaceHolder.Callback, Choreographer.FrameCallback {
+        private long handle;
+        private boolean surfaceAttached;
+        private boolean frameScheduled;
+        private boolean imeEnabled;
+
+        PhantomView(Context context) {
+            super(context);
+            getHolder().addCallback(this);
+            setFocusable(true);
+            setFocusableInTouchMode(true);
+            setClickable(true);
+        }
+
+        @Override public void surfaceCreated(SurfaceHolder holder) {
+            Rect frame = holder.getSurfaceFrame();
+            int width = frame.width();
+            int height = frame.height();
+            if (width == 0 || height == 0) return;
+            float density = getResources().getDisplayMetrics().density;
+            if (handle == 0) handle = nativeCreate(width, height, density);
+            surfaceAttached = handle != 0 && nativeSurfaceCreated(handle, holder.getSurface(), width, height, density) != 0;
+            scheduleFrame();
+        }
+
+        @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+            scheduleFrame();
+        }
+
+        @Override public void surfaceDestroyed(SurfaceHolder holder) {
+            surfaceAttached = false;
+            if (frameScheduled) Choreographer.getInstance().removeFrameCallback(this);
+            frameScheduled = false;
+            if (handle != 0) nativeSurfaceDestroyed(handle);
+        }
+
+        @Override public void doFrame(long frameNanos) {
+            frameScheduled = false;
+            if (!surfaceAttached || handle == 0) return;
+            nativeRender(handle, getWidth(), getHeight(), getResources().getDisplayMetrics().density, frameNanos);
+            scheduleFrame();
+        }
+
+        private void scheduleFrame() {
+            if (!surfaceAttached || frameScheduled) return;
+            frameScheduled = true;
+            Choreographer.getInstance().postFrameCallback(this);
+        }
+
+        @Override public boolean onTouchEvent(MotionEvent event) {
+            if (handle == 0) return true;
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_MOVE) {
+                for (int i = 0; i < event.getPointerCount(); ++i) {
+                    nativeTouch(handle, 1, event.getPointerId(i), event.getX(i), event.getY(i));
+                }
+            } else if (action == MotionEvent.ACTION_CANCEL) {
+                for (int i = 0; i < event.getPointerCount(); ++i) {
+                    nativeTouch(handle, 3, event.getPointerId(i), event.getX(i), event.getY(i));
+                }
+            } else if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN
+                    || action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP) {
+                int index = event.getActionIndex();
+                int translated = (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) ? 0 : 2;
+                boolean wantsIme = nativeTouch(handle, translated, event.getPointerId(index), event.getX(index), event.getY(index)) != 0;
+                if (translated == 0) updateIme(wantsIme);
+                if (action == MotionEvent.ACTION_UP) performClick();
+            }
+            openPendingUrl();
+            scheduleFrame();
+            return true;
+        }
+
+        private void openPendingUrl() {
+            int length = nativePendingUrlLength(handle);
+            if (length < 0) return;
+            byte[] bytes = new byte[length];
+            for (int i = 0; i < length; ++i) {
+                int value = nativePendingUrlByte(handle, i);
+                if (value < 0) {
+                    nativeClearPendingUrl(handle);
+                    return;
+                }
+                bytes[i] = (byte)value;
+            }
+            int mode = nativePendingUrlMode(handle);
+            nativeClearPendingUrl(handle);
+
+            try {
+                Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(new String(bytes, StandardCharsets.UTF_8)));
+                if (mode == 0) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_DOCUMENT);
+                getContext().startActivity(intent);
+            } catch (RuntimeException ignored) {
+                // No activity accepted the URI, or the URI was malformed.
+            }
+        }
+
+        private void updateIme(boolean enabled) {
+            if (imeEnabled == enabled) return;
+            imeEnabled = enabled;
+            InputMethodManager imm = (InputMethodManager)getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (enabled) {
+                requestFocus();
+                restartInput();
+                imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
+            } else {
+                imm.hideSoftInputFromWindow(getWindowToken(), 0);
+            }
+        }
+
+        private void restartInput() {
+            InputMethodManager imm = (InputMethodManager)getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+            imm.restartInput(this);
+        }
+
+        @Override public boolean onCheckIsTextEditor() { return imeEnabled; }
+
+        @Override public InputConnection onCreateInputConnection(EditorInfo attrs) {
+            if (!imeEnabled) return null;
+            attrs.inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES;
+            attrs.imeOptions = EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_EXTRACT_UI;
+            return new BaseInputConnection(this, false) {
+                @Override public boolean commitText(CharSequence text, int newCursorPosition) {
+                    text.codePoints().forEach(cp -> nativeCommitCodepoint(handle, cp));
+                    scheduleFrame();
+                    return super.commitText(text, newCursorPosition);
+                }
+
+                @Override public boolean setComposingText(CharSequence text, int newCursorPosition) {
+                    nativeBeginPreedit(handle);
+                    text.codePoints().forEach(cp -> nativeAppendPreeditCodepoint(handle, cp));
+                    nativeEndPreedit(handle);
+                    scheduleFrame();
+                    return super.setComposingText(text, newCursorPosition);
+                }
+
+                @Override public boolean finishComposingText() {
+                    nativeFinishPreedit(handle);
+                    scheduleFrame();
+                    return super.finishComposingText();
+                }
+
+                @Override public boolean deleteSurroundingText(int beforeLength, int afterLength) {
+                    if (beforeLength > 0) nativeDeleteFromIme(handle, 1);
+                    if (afterLength > 0) nativeDeleteFromIme(handle, 0);
+                    scheduleFrame();
+                    return super.deleteSurroundingText(beforeLength, afterLength);
+                }
+
+                @Override public boolean sendKeyEvent(KeyEvent event) {
+                    if (event.getAction() == KeyEvent.ACTION_DOWN && event.getKeyCode() == KeyEvent.KEYCODE_DEL) {
+                        nativeDeleteFromIme(handle, 1);
+                        scheduleFrame();
+                        return true;
+                    }
+                    return super.sendKeyEvent(event);
+                }
+
+                @Override public boolean performEditorAction(int actionCode) {
+                    nativeImeAction(handle, actionCode);
+                    scheduleFrame();
+                    return true;
+                }
+            };
+        }
+
+        @Override public boolean performClick() {
+            super.performClick();
+            return true;
+        }
+
+        @Override protected void onDetachedFromWindow() {
+            surfaceAttached = false;
+            if (frameScheduled) Choreographer.getInstance().removeFrameCallback(this);
+            frameScheduled = false;
+            if (handle != 0) { nativeDestroy(handle); handle = 0; }
+            super.onDetachedFromWindow();
+        }
+    }
+}

@@ -603,6 +603,8 @@ pub const TextField = struct {
         buf: std.ArrayList(u8) = .empty,
         /// Caret position in bytes, always on a character boundary.
         caret: usize = 0,
+        /// UTF-8 byte range currently owned by an input method.
+        composing: ?input.TextRange = null,
         focused: bool = false,
         /// The blink phase. The caret only draws when the field is focused AND
         /// this is on.
@@ -721,7 +723,9 @@ pub const TextField = struct {
             };
             s.focus_config = .{
                 .child = s.view.widget(),
+                .accepts_text_input = true,
                 .on_key = State.onKey,
+                .on_text_input = State.onTextInput,
                 .on_focus_change = State.onFocusChange,
                 .ctx = s,
                 .id = s.id,
@@ -831,6 +835,7 @@ pub const TextField = struct {
                 if (f(s.user_ctx, ev)) return true;
             }
             if (ev.action == .release) return false;
+            s.composing = null;
             // Keysym is not exhaustive, because a printable key carries a unicode
             // keysym, so the default prong is the printable path.
             switch (ev.keysym) {
@@ -897,6 +902,53 @@ pub const TextField = struct {
                     return true;
                 },
             }
+        }
+
+        fn onTextInput(ctx: *anyopaque, ev: input.TextInputEvent) bool {
+            const s: *State = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .commit => |text| {
+                    s.removeComposition();
+                    if (!s.insertTyped(text)) return true;
+                    s.afterEdit();
+                },
+                .preedit => |preedit| {
+                    s.removeComposition();
+                    const start = s.caret;
+                    if (!s.insertTyped(preedit.text)) return true;
+                    const end = s.caret;
+                    s.composing = .{ .start = start, .end = end };
+                    if (preedit.selection) |selection| {
+                        s.caret = start + @min(selection.end, end - start);
+                    }
+                    s.afterEdit();
+                },
+                .finish_preedit => s.composing = null,
+                .delete_surrounding => |delete| {
+                    s.removeComposition();
+                    const start = s.caret -| @min(delete.before_bytes, s.caret);
+                    const after = @min(delete.after_bytes, s.buf.items.len - s.caret);
+                    const end = s.caret + after;
+                    if (start != end) {
+                        s.buf.replaceRangeAssumeCapacity(start, end - start, &.{});
+                        s.caret = start;
+                        s.afterEdit();
+                    } else s.afterMove();
+                },
+                .action => |action| if (action != .none) {
+                    _ = onKey(s, .{ .keysym = .enter });
+                },
+            }
+            return true;
+        }
+
+        fn removeComposition(s: *State) void {
+            const composing = s.composing orelse return;
+            const start = @min(composing.start, s.buf.items.len);
+            const end = @min(@max(start, composing.end), s.buf.items.len);
+            s.buf.replaceRangeAssumeCapacity(start, end - start, &.{});
+            s.caret = start;
+            s.composing = null;
         }
 
         fn onLines(ctx: *anyopaque, lines: u16) void {
@@ -1011,6 +1063,36 @@ test "a named TextField takes the focus by id, which is what a click on it does"
     f.typeText("hi");
     const s = try f.state();
     try std.testing.expectEqualStrings("hi", s.value());
+}
+
+test "IME preedit is replaced by the next preedit and commit" {
+    const gpa = std.testing.allocator;
+    var field = TextField{};
+    var f = try Fixture.init(gpa, &field);
+    defer f.deinit();
+    try f.focus();
+
+    try std.testing.expect(f.manager.acceptsTextInput());
+    try std.testing.expect(f.manager.dispatchTextInput(.{ .preedit = .{ .text = "n" } }));
+    try std.testing.expectEqualStrings("n", (try f.state()).value());
+    try std.testing.expect(f.manager.dispatchTextInput(.{ .preedit = .{ .text = "ni" } }));
+    try std.testing.expectEqualStrings("ni", (try f.state()).value());
+    try std.testing.expect(f.manager.dispatchTextInput(.{ .commit = "\u{4f60}" }));
+    try std.testing.expectEqualStrings("\u{4f60}", (try f.state()).value());
+}
+
+test "IME delete-surrounding uses UTF-8 byte ranges" {
+    const gpa = std.testing.allocator;
+    var field = TextField{ .text = "a\u{20ac}" };
+    var f = try Fixture.init(gpa, &field);
+    defer f.deinit();
+    try f.focus();
+
+    try std.testing.expect(f.manager.dispatchTextInput(.{ .delete_surrounding = .{
+        .before_bytes = 3,
+        .after_bytes = 0,
+    } }));
+    try std.testing.expectEqualStrings("a", (try f.state()).value());
 }
 
 test "an unnamed TextField answers to no id, so a stray name cannot focus it" {

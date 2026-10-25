@@ -26,6 +26,7 @@ const RenderFocus = struct {
     id: phantom.focus.OwnedId = .{},
     // User callbacks + ctx captured from the widget config.
     on_key: ?*const fn (*anyopaque, input.KeyEvent) bool,
+    on_text_input: ?*const fn (*anyopaque, input.TextInputEvent) bool,
     on_focus_change: ?*const fn (*anyopaque, bool) void,
     user_ctx: *anyopaque,
 
@@ -53,6 +54,11 @@ const RenderFocus = struct {
         if (self.on_key) |f| return f(self.user_ctx, ev);
         return false;
     }
+    fn textInputThunk(ctx: *anyopaque, ev: input.TextInputEvent) bool {
+        const self: *RenderFocus = @ptrCast(@alignCast(ctx));
+        if (self.on_text_input) |f| return f(self.user_ctx, ev);
+        return false;
+    }
     fn focusChangeThunk(ctx: *anyopaque, focused: bool) void {
         const self: *RenderFocus = @ptrCast(@alignCast(ctx));
         if (self.on_focus_change) |f| f(self.user_ctx, focused);
@@ -61,9 +67,11 @@ const RenderFocus = struct {
 
 pub const Focus = struct {
     child: Widget,
+    accepts_text_input: bool = false,
     /// Return true when the key was used. An unused key falls through to the focus
     /// traversal rules, which is how Tab keeps working inside a focusable widget.
     on_key: ?*const fn (ctx: *anyopaque, ev: input.KeyEvent) bool = null,
+    on_text_input: ?*const fn (ctx: *anyopaque, ev: input.TextInputEvent) bool = null,
     on_focus_change: ?*const fn (ctx: *anyopaque, focused: bool) void = null,
     ctx: *anyopaque = undefined,
     /// The name `FocusManager.focusById` moves the focus here by. Null leaves the
@@ -79,12 +87,15 @@ pub const Focus = struct {
 
     fn install(ro: *RenderFocus, self: *const Focus) !void {
         ro.on_key = self.on_key;
+        ro.on_text_input = self.on_text_input;
         ro.on_focus_change = self.on_focus_change;
         ro.user_ctx = self.ctx;
         try ro.id.set(ro.gpa, self.id);
         ro.handlers = .{
             .ctx = ro,
+            .accepts_text_input = self.accepts_text_input,
             .on_key = if (self.on_key != null) RenderFocus.keyThunk else null,
+            .on_text_input = if (self.on_text_input != null) RenderFocus.textInputThunk else null,
             .on_focus_change = if (self.on_focus_change != null) RenderFocus.focusChangeThunk else null,
             .id = ro.id.text,
             .node = &ro.base,
@@ -96,7 +107,7 @@ pub const Focus = struct {
         const self: *const Focus = @ptrCast(@alignCast(ptr));
         const gpa = bctx.owner.gpa;
         const ro = try gpa.create(RenderFocus);
-        ro.* = .{ .base = .{ .layoutFn = RenderFocus.layoutFn, .paintFn = RenderFocus.paintFn, .destroyFn = RenderFocus.destroyFn, .adoptChildFn = RenderFocus.adopt }, .gpa = gpa, .handlers = .{ .ctx = undefined }, .on_key = null, .on_focus_change = null, .user_ctx = undefined };
+        ro.* = .{ .base = .{ .layoutFn = RenderFocus.layoutFn, .paintFn = RenderFocus.paintFn, .destroyFn = RenderFocus.destroyFn, .adoptChildFn = RenderFocus.adopt }, .gpa = gpa, .handlers = .{ .ctx = undefined }, .on_key = null, .on_text_input = null, .on_focus_change = null, .user_ctx = undefined };
         install(ro, self) catch |e| {
             gpa.destroy(ro);
             return e;

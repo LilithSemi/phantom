@@ -45,6 +45,7 @@
             inherit system;
             pkgs = import nixpkgs {
               inherit system;
+              config.allowUnfree = true;
             };
           }
         );
@@ -57,14 +58,54 @@
       devShells = forAllSystems (
         { pkgs, ... }:
         {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              zig_0_17
-              bun
-              nodejs
-              typescript
-            ];
-          };
+          default =
+            let
+              androidEnv = pkgs.callPackage "${pkgs.path}/pkgs/development/mobile/androidenv" {
+                inherit pkgs;
+                licenseAccepted = true;
+              };
+              androidSdk =
+                (androidEnv.composeAndroidPackages {
+                  platformVersions = [ "36" ];
+                  buildToolsVersions = [ "36.0.0" ];
+                  abiVersions = [
+                    "arm64-v8a"
+                    "x86_64"
+                  ];
+                  includeNDK = true;
+                  includeEmulator = false;
+                  includeSystemImages = false;
+                  includeCmake = false;
+                }).androidsdk;
+              jdk = pkgs.jdk17;
+
+              useAndroidSdk = pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isx86_64;
+            in
+            pkgs.mkShell {
+              packages =
+                with pkgs;
+                [
+                  zig_0_17
+                  bun
+                  nodejs
+                  typescript
+                ]
+                ++ lib.optionals useAndroidSdk [
+                  androidSdk
+                  gradle_8
+                  jdk
+                ];
+
+              env = lib.optionalAttrs useAndroidSdk {
+                JAVA_HOME = jdk.home;
+                ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
+                ANDROID_NDK_ROOT = "${androidSdk}/libexec/android-sdk/ndk-bundle";
+              };
+
+              shellHook = lib.optionalString useAndroidSdk ''
+                export GRADLE_OPTS="-Dorg.gradle.project.android.aapt2FromMavenOverride=$(echo "$ANDROID_HOME/build-tools/"*/aapt2) ''${GRADLE_OPTS:-}"
+              '';
+            };
         }
       );
 
@@ -81,7 +122,7 @@
 
             zigDeps = pkgs.zig_0_17.fetchDeps {
               inherit (finalAttrs) src pname version;
-              hash = "sha256-gEzFGF2pt8c5PTPuYT77CgNO5yl4HYqKSyp3/KcgDNA=";
+              hash = "sha256-fo2G90Bo1WVCphOtiv6h3vVIhvnGSxDOMMkdGBbbCn4=";
             };
 
             nativeBuildInputs = with pkgs; [

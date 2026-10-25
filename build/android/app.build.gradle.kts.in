@@ -1,0 +1,31 @@
+plugins {
+    id("com.android.application")
+}
+
+android {
+    namespace = "@APP_ID@"
+    compileSdk = 36
+    buildToolsVersion = "36.0.0"
+    defaultConfig {
+        applicationId = "@APP_ID@"
+        minSdk = @API_LEVEL@
+        targetSdk = 36
+        versionCode = 1
+        versionName = "0.1.0"
+        resValue("string", "app_name", "@APP_NAME@")
+    }
+}
+
+val phantomOutput = providers.gradleProperty("phantomOutput")
+tasks.register("phantomApk") {
+    dependsOn("assembleDebug")
+    doLast {
+        val output = file(phantomOutput.get())
+        output.parentFile.mkdirs()
+        copy {
+            from(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk"))
+            into(output.parentFile)
+            rename { output.name }
+        }
+    }
+}
