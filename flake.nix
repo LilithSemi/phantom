@@ -89,6 +89,8 @@
                   bun
                   nodejs
                   typescript
+                  pkg-config
+                  vulkan-loader
                 ]
                 ++ lib.optionals useAndroidSdk [
                   androidSdk
@@ -122,7 +124,7 @@
 
             zigDeps = pkgs.zig_0_17.fetchDeps {
               inherit (finalAttrs) src pname version;
-              hash = "sha256-fo2G90Bo1WVCphOtiv6h3vVIhvnGSxDOMMkdGBbbCn4=";
+              hash = "sha256-pSdVNXXAqrmdOWoHUqVumYNa9SoSKgcXGTVrzqRFx0U=";
             };
 
             nativeBuildInputs = with pkgs; [

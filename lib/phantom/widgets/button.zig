@@ -173,6 +173,7 @@ pub const Button = struct {
     pub const Variant = enum { primary, secondary };
 
     variant: Variant = .primary,
+    padding: phantom.LogicalEdgeInsets = phantom.LogicalEdgeInsets.symmetric(24, 12),
     enabled: bool = true,
     on_tap: ?*const fn (*anyopaque) void = null,
     ctx: *anyopaque = undefined,
@@ -259,7 +260,7 @@ pub const Button = struct {
         };
         errdefer el.deinit(gpa);
         const pad = bctx.new(phantom.Padding{
-            .insets = phantom.LogicalEdgeInsets.symmetric(24, 12),
+            .insets = self.padding,
             .child = self.child,
         });
         el.child = try el.updateChild(null, pad.widget(), bctx);
@@ -273,7 +274,7 @@ pub const Button = struct {
         try ro.id.set(ro.gpa, self.id);
         self.colorsFor(bctx, el.parent, ro);
         const pad = bctx.new(phantom.Padding{
-            .insets = phantom.LogicalEdgeInsets.symmetric(24, 12),
+            .insets = self.padding,
             .child = self.child,
         });
         el.child = try el.updateChild(el.child, pad.widget(), bctx);

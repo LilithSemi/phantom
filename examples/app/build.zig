@@ -5,9 +5,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const gpu_drivers: ?[]const u8 = b.option([]const u8, "gpu-drivers", "Specific GPU drivers to enable, defaults to Phantom's choice.") orelse null;
+
     const phantom_dep = b.dependency("phantom", .{
         .target = target,
         .optimize = optimize,
+        .@"gpu-drivers" = gpu_drivers,
     });
 
     const app = phantom.addApp(b, phantom_dep, .{

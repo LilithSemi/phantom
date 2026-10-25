@@ -258,3 +258,17 @@ adb install -r zig-out/bin/demo-debug.apk
 The Nix development shell supplies Android SDK 36, the NDK, JDK 17, and Gradle.
 Outside Nix, set `ANDROID_NDK_ROOT` and put Gradle on `PATH`. The
 `-Dandroid-ndk` and `-Dandroid-gradle` options override those locations.
+
+### Native window chrome
+
+Native window sessions add a draggable title bar with minimize, maximize/restore,
+and close buttons when Lattice negotiates client-side decorations. Fullscreen
+windows and windows with server-side decorations hide the bar. `WindowChrome`,
+`WindowTitleBar`, and `WindowController` are also exported for custom hosts.
+
+Mobile detection runs at startup, including on Linux: it checks mobile desktop
+sessions such as Phosh and Plasma Mobile, chassis metadata, and device-tree
+hints. Native Android and iOS targets are also classified as mobile. Devices
+without identifying metadata can use `window.Options.mobile = true` to suppress
+the chrome; `false` explicitly selects desktop behavior. Window width alone
+does not classify a device.

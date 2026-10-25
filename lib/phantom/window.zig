@@ -29,6 +29,7 @@ const lattice = if (compositor_builds) @import("lattice") else void;
 pub const Opening = if (compositor_builds) struct {
     ctx: lattice.Context,
     surface: lattice.Surface,
+    mobile: bool = false,
 
     /// Give back the window and the connection, for a caller that asked whether
     /// a window was possible and is not going to draw in one.
@@ -97,11 +98,12 @@ pub fn open(
             .width = opts.width,
             .height = opts.height,
             .color = lattice.ColorConfig.sdr(.xrgb8888),
+            .decoration_mode = .client_side,
         }) catch {
             ctx.deinit();
             return null;
         };
-        return .{ .ctx = ctx, .surface = surface };
+        return .{ .ctx = ctx, .surface = surface, .mobile = opts.mobile orelse detectMobile(gpa, io, environ) };
     }
     return null;
 }
@@ -158,6 +160,8 @@ fn dispatchKey(focus_mgr: *phantom.FocusManager, k: lattice.event.KeyEvent) void
 /// field wherever the two backends have the same decision to make, so a caller
 /// that has driven one already knows how to drive the other.
 pub const Options = struct {
+    /// Override runtime mobile-device detection for unusual hosts.
+    mobile: ?bool = null,
     title: []const u8 = "phantom",
     width: u32 = 800,
     height: u32 = 600,
@@ -266,6 +270,8 @@ pub const Session = struct {
     drew_frame: bool,
     scale: f32,
     running: bool,
+    mobile: bool,
+    chrome: phantom.WindowController,
 
     /// Open the window and mount the tree. On any failure this unwinds
     /// everything it already did, so a caller that gets an error must NOT call
@@ -307,6 +313,8 @@ pub const Session = struct {
         self.gpa = gpa;
         self.io = io;
         self.opts = opts;
+        self.mobile = opts.mobile orelse opened.mobile;
+        self.chrome = .{ .ctx = self, .command = chromeCommand, .title = opts.title };
 
         self.ctx = opened.ctx;
         self.surface = opened.surface;
@@ -359,7 +367,7 @@ pub const Session = struct {
         self.owner.focus = &self.focus_mgr;
 
         var bctx = phantom.BuildContext{ .arena = self.arena.allocator(), .owner = &self.owner };
-        const root_widget = root.call(&bctx);
+        const root_widget = bctx.new(phantom.WindowChrome{ .controller = &self.chrome, .body = root }).widget();
         var mq = phantom.MediaQuery{ .data = &view.metrics, .child = root_widget };
         self.el = if (self.sink.ok())
             try mq.widget().mount(&bctx, null)
@@ -492,6 +500,16 @@ pub const Session = struct {
     /// Separate from `dispatchEvent` only because lattice hands a callback an
     /// opaque pointer. Everything this decides lives in `dispatchEvent`, which
     /// takes a real `*Session` and can therefore be tested without a compositor.
+    fn chromeCommand(ptr: *anyopaque, action: phantom.WindowController.Action) void {
+        const self: *Session = @ptrCast(@alignCast(ptr));
+        switch (action) {
+            .close => self.running = false,
+            .move => self.ctx.beginMove(self.surface.id) catch {},
+            .minimize => self.ctx.minimize(self.surface.id) catch {},
+            .maximize => self.ctx.setMaximized(self.surface.id, !self.chrome.maximized) catch {},
+        }
+    }
+
     fn handleEvent(ctx_data: *anyopaque, ev: lattice.Event) void {
         const self: *Session = @ptrCast(@alignCast(ctx_data));
         self.dispatchEvent(ev);
@@ -503,6 +521,12 @@ pub const Session = struct {
     /// wherever the last motion left the pointer.
     pub fn dispatchEvent(self: *Session, ev: lattice.Event) void {
         switch (ev) {
+            .window_configured => |cfg| {
+                if (cfg.surface != self.surface.id) return;
+                self.chrome.visible = !self.mobile and !cfg.state.fullscreen and cfg.decoration_mode == .client_side and self.ctx.capabilities().window_chrome;
+                self.chrome.maximized = cfg.state.maximized;
+                self.chrome.changed();
+            },
             .close_requested => self.running = false,
             .input => |ie| switch (ie) {
                 .pointer_motion => |m| {
@@ -730,4 +754,48 @@ test "a build sees the size of the frame it is building, not the one before" {
     seen_width = 0;
     _ = try f.session.step();
     try std.testing.expectEqual(@as(f32, 1024), seen_width);
+}
+
+fn detectMobile(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) bool {
+    if (@import("builtin").abi == .android or @import("builtin").os.tag == .ios) return true;
+    for ([_][]const u8{ "XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP", "CHASSIS" }) |key| {
+        if (environ.get(key)) |value| {
+            if (mobileHint(value)) return true;
+        }
+    }
+    for ([_][]const u8{ "/etc/machine-info", "/sys/class/dmi/id/chassis_type", "/sys/firmware/devicetree/base/chassis-type", "/sys/firmware/devicetree/base/model" }) |path| {
+        const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4096)) catch continue;
+        defer gpa.free(data);
+        if (mobileHint(data)) return true;
+        const chassis = std.mem.trim(u8, data, " \t\r\n");
+        for ([_][]const u8{ "11", "30", "31", "32" }) |kind| {
+            if (std.mem.eql(u8, chassis, kind)) return true;
+        }
+    }
+    return false;
+}
+
+fn mobileHint(value: []const u8) bool {
+    for ([_][]const u8{ "phosh", "plasma-mobile", "plasma_mobile", "plasmamobile", "phone", "handset", "tablet", "librem 5" }) |hint| {
+        if (hint.len > value.len) continue;
+        for (0..value.len - hint.len + 1) |i| {
+            if (std.ascii.eqlIgnoreCase(value[i..][0..hint.len], hint)) return true;
+        }
+    }
+    return false;
+}
+
+test "mobile session hints include Linux phone shells" {
+    try std.testing.expect(mobileHint("Phosh:GNOME"));
+    try std.testing.expect(mobileHint("plasma-mobile"));
+    try std.testing.expect(mobileHint("CHASSIS=handset"));
+    try std.testing.expect(!mobileHint("GNOME"));
+    try std.testing.expect(!mobileHint("KDE"));
+}
+
+test "runtime mobile shell detection works for a native Linux target" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CURRENT_DESKTOP", "Phosh:GNOME");
+    try std.testing.expect(detectMobile(std.testing.allocator, std.testing.io, &env));
 }
