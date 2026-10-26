@@ -398,6 +398,8 @@ pub fn render(grid: *CellGrid, list: DisplayList, ctx: Ctx) !void {
                 translated.rect = translateRect(p.rect, offset);
                 paintImageFallback(grid, translated, ctx);
             },
+            // GPU-owned client buffers cannot be sampled by a character grid.
+            .texture => {},
             .icon => |p| {
                 var translated = p;
                 translated.origin = translateOffset(p.origin, offset);

@@ -176,6 +176,12 @@ pub const Options = struct {
     /// environment, which is what an ordinary application wants.
     driver: ?[]const u8 = null,
 
+    /// Start a Wayland server which shares this window's render device.
+    compositor: bool = false,
+    /// Optional process to start on the nested display. This is normally the
+    /// native application's trailing command line.
+    client_argv: []const []const u8 = &.{},
+
     /// Where recovered faults and other diagnostics are written. Null opens a
     /// writer over the process's own stderr. A window session has no display to
     /// corrupt, unlike the terminal one, so stderr is simply where a human
@@ -287,6 +293,7 @@ pub const Session = struct {
     running: bool,
     mobile: bool,
     chrome: phantom.WindowController,
+    host: ?phantom.compositor.Host,
 
     /// Open the window and mount the tree. On any failure this unwinds
     /// everything it already did, so a caller that gets an error must NOT call
@@ -361,12 +368,13 @@ pub const Session = struct {
         // so the top-left frontend coordinate space presents upright. Offscreen
         // goldens leave this false.
         self.backend.flip_y = true;
+        self.host = null;
 
         self.diag_writer = std.Io.File.stderr().writerStreaming(io, &self.diag_buf);
         self.arena = std.heap.ArenaAllocator.init(gpa);
         errdefer self.arena.deinit();
         self.sink = .{ .diagnostics = opts.diagnostics orelse &self.diag_writer.interface };
-        self.owner = .{ .gpa = gpa, .sink = &self.sink, .io = io };
+        self.owner = .{ .gpa = gpa, .sink = &self.sink, .io = io, .environ = environ };
         errdefer self.owner.deinit();
         if (linux_open_url_builds) {
             self.platform_host = if (environ) |env|
@@ -377,6 +385,24 @@ pub const Session = struct {
             self.owner.platform = self.platform_host.asPlatform();
         } else {
             self.platform_host = {};
+        }
+
+        if (opts.compositor) {
+            if (comptime phantom.compositor.supported) {
+                const env = environ orelse return error.NoEnvironment;
+                self.host = try phantom.compositor.Host.init(gpa, io, dev, env, opts.client_argv);
+                errdefer if (self.host) |*host| host.deinit();
+                self.owner.compositor_host = &self.host.?;
+                var message: [128]u8 = undefined;
+                const line = std.fmt.bufPrint(
+                    &message,
+                    "phantom: nested Wayland display {s}\n",
+                    .{self.host.?.socketName()},
+                ) catch "phantom: nested Wayland compositor ready\n";
+                const diagnostics = opts.diagnostics orelse &self.diag_writer.interface;
+                diagnostics.writeAll(line) catch {};
+                diagnostics.flush() catch {};
+            } else return error.CompositorUnsupported;
         }
 
         // Build a View from the surface's logical size. lattice does not
@@ -439,6 +465,7 @@ pub const Session = struct {
         if (linux_open_url_builds) self.platform_host.deinit();
         self.arena.deinit();
         self.ctx.destroySurface(self.surface.id);
+        if (self.host) |*host| host.deinit();
         self.backend.deinit();
         self.ctx.deinit();
         self.* = undefined;
@@ -455,9 +482,20 @@ pub const Session = struct {
     /// because a terminal has nothing to hold a frame back.
     pub fn step(self: *Session) !bool {
         if (!self.running) return false;
+        if (self.host) |*host| try host.pump();
+
+        // Drain already-ready parent-compositor events before testing frame
+        // availability. Previously frame-done was not observed until after the
+        // decision, so a nested surface commit could miss the available outer
+        // frame and remain invisible until a later unrelated client/input event.
+        try self.ctx.poll(0, handleEvent, self);
         self.drew_frame = self.ctx.renderAvailable(self.surface.id);
         if (self.drew_frame) try self.renderFrame();
         try self.ctx.poll(self.opts.poll_ms, handleEvent, self);
+        // A hosted client may have written requests while the outer Wayland
+        // connection was waiting. Service and flush those requests on this
+        // turn instead of adding another full shell iteration of latency.
+        if (self.host) |*host| try host.pump();
         return self.running;
     }
 
@@ -529,6 +567,7 @@ pub const Session = struct {
             phantom.ColorScheme.tokyoNight().bg,
         );
         try self.ctx.commit(self.surface.id);
+        if (self.host) |*host| host.endFrame();
         // Transient configs produced during this build pass are dead now that
         // mount/update copied everything they keep into the gpa tree.
         _ = self.arena.reset(.retain_capacity);
@@ -574,18 +613,35 @@ pub const Session = struct {
                         .y = @as(f32, @floatCast(m.y)) * self.scale,
                     };
                     self.dispatcher.move(self.el, self.last_point);
+                    if (self.host) |*host| _ = host.pointerMotion(self.last_point);
                 },
-                .pointer_button => |btn| switch (btn.state) {
-                    .pressed => self.dispatcher.down(self.el, self.last_point),
-                    .released => self.dispatcher.up(self.el, self.last_point),
+                .pointer_button => |btn| {
+                    const pressed = btn.state == .pressed;
+                    const hosted = if (self.host) |*host|
+                        host.pointerButton(self.last_point, btn.button, pressed)
+                    else
+                        false;
+                    if (!hosted) {
+                        if (self.host) |*host| if (pressed) host.clearFocus();
+                        if (pressed) self.dispatcher.down(self.el, self.last_point) else self.dispatcher.up(self.el, self.last_point);
+                    }
                 },
-                .pointer_axis => |a| self.dispatcher.scroll(
-                    self.el,
-                    self.last_point,
-                    @as(f32, @floatCast(a.horizontal)) * self.scale,
-                    @as(f32, @floatCast(a.vertical)) * self.scale,
-                ),
-                .key => |k| dispatchKey(&self.focus_mgr, k),
+                .pointer_axis => |a| {
+                    const hosted = if (self.host) |*host|
+                        host.pointerAxis(self.last_point, a.horizontal, a.vertical)
+                    else
+                        false;
+                    if (!hosted) self.dispatcher.scroll(
+                        self.el,
+                        self.last_point,
+                        @as(f32, @floatCast(a.horizontal)) * self.scale,
+                        @as(f32, @floatCast(a.vertical)) * self.scale,
+                    );
+                },
+                .key => |k| {
+                    const hosted = if (self.host) |*host| host.key(k.keycode, k.state == .pressed) else false;
+                    if (!hosted) dispatchKey(&self.focus_mgr, k);
+                },
                 else => {},
             },
             else => {},

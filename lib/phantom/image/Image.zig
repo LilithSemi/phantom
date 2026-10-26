@@ -1,14 +1,24 @@
 const std = @import("std");
 const png = @import("png.zig");
 const jpeg = @import("jpeg.zig");
+const svg = @import("svg.zig");
 pub const Image = @This();
 
-pub const Format = enum { png, jpeg, unknown };
+var next_cache_id: std.atomic.Value(usize) = .init(1);
+
+fn newCacheId() usize {
+    return next_cache_id.fetchAdd(1, .monotonic);
+}
+
+pub const Format = enum { png, jpeg, svg, unknown };
 
 /// Sniff the image format from the leading magic bytes.
 pub fn detectFormat(bytes: []const u8) Format {
     if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], &.{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A })) return .png;
     if (bytes.len >= 3 and bytes[0] == 0xFF and bytes[1] == 0xD8 and bytes[2] == 0xFF) return .jpeg;
+    const head = std.mem.trim(u8, bytes, " \t\r\n");
+    if (std.mem.startsWith(u8, head, "<svg") or
+        (std.mem.startsWith(u8, head, "<?xml") and std.mem.indexOf(u8, head[0..@min(head.len, 512)], "<svg") != null)) return .svg;
     return .unknown;
 }
 
@@ -17,6 +27,7 @@ pub fn mime(f: Format) []const u8 {
     return switch (f) {
         .png => "image/png",
         .jpeg => "image/jpeg",
+        .svg => "image/svg+xml",
         .unknown => "application/octet-stream",
     };
 }
@@ -32,18 +43,21 @@ rgba: ?[]const u8 = null,
 /// True when rgba was allocated by ensureDecoded and must be freed in deinit.
 /// False for fromRgba images (borrowed slice; caller owns it).
 rgba_owned: bool = false,
+/// Process-unique identity for native texture caches. Pointer addresses are not
+/// identities: the allocator may reuse one after a widget changes type.
+cache_id: usize,
 
 pub fn fromBytes(bytes: []const u8, width: u32, height: u32) Image {
-    return .{ .bytes = bytes, .format = detectFormat(bytes), .width = width, .height = height, .rgba = null, .rgba_owned = false };
+    return .{ .bytes = bytes, .format = detectFormat(bytes), .width = width, .height = height, .rgba = null, .rgba_owned = false, .cache_id = newCacheId() };
 }
 pub fn fromRgba(pixels: []const u8, width: u32, height: u32) Image {
-    return .{ .bytes = "", .format = .unknown, .width = width, .height = height, .rgba = pixels, .rgba_owned = false };
+    return .{ .bytes = "", .format = .unknown, .width = width, .height = height, .rgba = pixels, .rgba_owned = false, .cache_id = newCacheId() };
 }
 
 /// Decode encoded bytes into rgba (memoized). Sets width/height to the intrinsic
 /// decoded dimensions so the Prism texture (sized from width x height) matches rgba.
 /// No-op if rgba is already set or if bytes is empty (fromRgba path).
-pub fn ensureDecoded(self: *Image, gpa: std.mem.Allocator) (png.DecodeError || jpeg.DecodeError)!void {
+pub fn ensureDecoded(self: *Image, gpa: std.mem.Allocator) (png.DecodeError || jpeg.DecodeError || svg.DecodeError)!void {
     if (self.rgba != null) return; // already decoded or fromRgba
     if (self.bytes.len == 0) return; // fromRgba; nothing to decode
     switch (self.format) {
@@ -56,6 +70,13 @@ pub fn ensureDecoded(self: *Image, gpa: std.mem.Allocator) (png.DecodeError || j
         },
         .jpeg => {
             const d = try jpeg.decode(gpa, self.bytes);
+            self.rgba = d.rgba;
+            self.width = d.width;
+            self.height = d.height;
+            self.rgba_owned = true;
+        },
+        .svg => {
+            const d = try svg.decode(gpa, self.bytes);
             self.rgba = d.rgba;
             self.width = d.width;
             self.height = d.height;
@@ -75,9 +96,10 @@ pub fn deinit(self: *Image, gpa: std.mem.Allocator) void {
     }
 }
 
-test "detectFormat sniffs png/jpeg/unknown by magic bytes" {
+test "detectFormat sniffs png/jpeg/svg/unknown by magic bytes" {
     try std.testing.expectEqual(Format.png, detectFormat(&.{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0 }));
     try std.testing.expectEqual(Format.jpeg, detectFormat(&.{ 0xFF, 0xD8, 0xFF, 0xE0, 0 }));
+    try std.testing.expectEqual(Format.svg, detectFormat("  <svg viewBox=\"0 0 10 10\"></svg>"));
     try std.testing.expectEqual(Format.unknown, detectFormat(&.{ 1, 2, 3, 4 }));
     try std.testing.expectEqual(Format.unknown, detectFormat(&.{}));
 }
@@ -101,4 +123,11 @@ test "ensureDecoded is a no-op for a fromRgba image and does not free the borrow
     defer img.deinit(gpa);
     try img.ensureDecoded(gpa);
     try std.testing.expect(!img.rgba_owned);
+}
+
+test "new image handles receive unique cache identities" {
+    const bytes = [_]u8{ 1, 2, 3 };
+    const first = fromBytes(&bytes, 1, 1);
+    const second = fromBytes(&bytes, 1, 1);
+    try std.testing.expect(first.cache_id != second.cache_id);
 }

@@ -6,6 +6,14 @@
 
 const std = @import("std");
 const http_mod = @import("http.zig");
+pub const system = @import("platform/system.zig");
+pub const Connectivity = system.Connectivity;
+pub const WifiNetwork = system.WifiNetwork;
+pub const Power = system.Power;
+pub const Audio = system.Audio;
+pub const Brightness = system.Brightness;
+pub const SessionCapabilities = system.SessionCapabilities;
+pub const Identity = system.Identity;
 
 pub const UrlStrategy = enum {
     /// `/#/gallery`. Works on any static host with no configuration.
@@ -175,6 +183,30 @@ pub const Platform = struct {
     notification_permission: ?*const fn (*anyopaque) NotificationPermission = null,
     request_notification_permission: ?*const fn (*anyopaque, NotificationPermissionSink) bool = null,
     show_notification: ?*const fn (*anyopaque, Notification) bool = null,
+    /// Host-wide hardware/session state. A missing hook means the backend does
+    /// not expose that capability; a returned value such as `Power.present =
+    /// false` is a successful answer and must not be confused with missing
+    /// support.
+    read_connectivity: ?*const fn (*anyopaque) ?Connectivity = null,
+    set_networking_enabled: ?*const fn (*anyopaque, bool) bool = null,
+    set_wifi_enabled: ?*const fn (*anyopaque, bool) bool = null,
+    set_cellular_enabled: ?*const fn (*anyopaque, bool) bool = null,
+    read_wifi_networks: ?*const fn (*anyopaque) ?[]const WifiNetwork = null,
+    request_wifi_scan: ?*const fn (*anyopaque) bool = null,
+    connect_wifi: ?*const fn (*anyopaque, id: []const u8, password: []const u8) bool = null,
+    disconnect_wifi: ?*const fn (*anyopaque, id: []const u8) bool = null,
+    read_power: ?*const fn (*anyopaque) ?Power = null,
+    read_audio: ?*const fn (*anyopaque) ?Audio = null,
+    set_audio: ?*const fn (*anyopaque, Audio) bool = null,
+    read_brightness: ?*const fn (*anyopaque) ?Brightness = null,
+    set_brightness: ?*const fn (*anyopaque, Brightness) bool = null,
+    session_capabilities: ?*const fn (*anyopaque) SessionCapabilities = null,
+    lock_session: ?*const fn (*anyopaque) bool = null,
+    logout_session: ?*const fn (*anyopaque) bool = null,
+    suspend_session: ?*const fn (*anyopaque) bool = null,
+    restart_system: ?*const fn (*anyopaque) bool = null,
+    power_off_system: ?*const fn (*anyopaque) bool = null,
+    read_identity: ?*const fn (*anyopaque) ?Identity = null,
 
     /// True when the URL was opened. False means NOTHING HAPPENED, and a caller
     /// should say so: no hook on this backend, or a browser that refused the
@@ -284,6 +316,113 @@ pub const Platform = struct {
         const c = self.ctx orelse return false;
         return f(c, notification);
     }
+
+    pub fn readConnectivity(self: Platform) ?Connectivity {
+        const f = self.read_connectivity orelse return null;
+        return f(self.ctx orelse return null);
+    }
+
+    pub fn setNetworkingEnabled(self: Platform, enabled: bool) bool {
+        const f = self.set_networking_enabled orelse return false;
+        return f(self.ctx orelse return false, enabled);
+    }
+
+    pub fn setWifiEnabled(self: Platform, enabled: bool) bool {
+        const f = self.set_wifi_enabled orelse return false;
+        return f(self.ctx orelse return false, enabled);
+    }
+
+    pub fn readWifiNetworks(self: Platform) ?[]const WifiNetwork {
+        const f = self.read_wifi_networks orelse return null;
+        const c = self.ctx orelse return null;
+        return f(c);
+    }
+
+    pub fn requestWifiScan(self: Platform) bool {
+        const f = self.request_wifi_scan orelse return false;
+        const c = self.ctx orelse return false;
+        return f(c);
+    }
+
+    pub fn connectWifi(self: Platform, id: []const u8, password: []const u8) bool {
+        const f = self.connect_wifi orelse return false;
+        const c = self.ctx orelse return false;
+        return f(c, id, password);
+    }
+
+    pub fn disconnectWifi(self: Platform, id: []const u8) bool {
+        const f = self.disconnect_wifi orelse return false;
+        const c = self.ctx orelse return false;
+        return f(c, id);
+    }
+
+    pub fn setCellularEnabled(self: Platform, enabled: bool) bool {
+        const f = self.set_cellular_enabled orelse return false;
+        return f(self.ctx orelse return false, enabled);
+    }
+
+    pub fn readPower(self: Platform) ?Power {
+        const f = self.read_power orelse return null;
+        return f(self.ctx orelse return null);
+    }
+
+    pub fn readAudio(self: Platform) ?Audio {
+        const f = self.read_audio orelse return null;
+        return f(self.ctx orelse return null);
+    }
+
+    pub fn setAudio(self: Platform, state: Audio) bool {
+        const f = self.set_audio orelse return false;
+        return f(self.ctx orelse return false, .{
+            .output_volume = @max(0, @min(1, state.output_volume)),
+            .muted = state.muted,
+        });
+    }
+
+    pub fn readBrightness(self: Platform) ?Brightness {
+        const f = self.read_brightness orelse return null;
+        return f(self.ctx orelse return null);
+    }
+
+    pub fn setBrightness(self: Platform, state: Brightness) bool {
+        const f = self.set_brightness orelse return false;
+        return f(self.ctx orelse return false, .{ .level = @max(0, @min(1, state.level)) });
+    }
+
+    pub fn sessionCapabilities(self: Platform) SessionCapabilities {
+        const f = self.session_capabilities orelse return .{};
+        return f(self.ctx orelse return .{});
+    }
+
+    pub fn lockSession(self: Platform) bool {
+        const f = self.lock_session orelse return false;
+        return f(self.ctx orelse return false);
+    }
+
+    pub fn logoutSession(self: Platform) bool {
+        const f = self.logout_session orelse return false;
+        return f(self.ctx orelse return false);
+    }
+
+    pub fn suspendSession(self: Platform) bool {
+        const f = self.suspend_session orelse return false;
+        return f(self.ctx orelse return false);
+    }
+
+    pub fn restartSystem(self: Platform) bool {
+        const f = self.restart_system orelse return false;
+        return f(self.ctx orelse return false);
+    }
+
+    pub fn powerOffSystem(self: Platform) bool {
+        const f = self.power_off_system orelse return false;
+        return f(self.ctx orelse return false);
+    }
+
+    pub fn readIdentity(self: Platform) ?Identity {
+        const f = self.read_identity orelse return null;
+        return f(self.ctx orelse return null);
+    }
 };
 
 pub fn validSettingKey(key: []const u8) bool {
@@ -315,6 +454,44 @@ test "an empty platform reports interactive services as unsupported" {
     try std.testing.expectEqual(NotificationPermission.unsupported, p.notificationPermission());
     try std.testing.expect(!p.requestNotificationPermission(.{ .ctx = &context, .on_result = Sink.permission }));
     try std.testing.expect(!p.showNotification(.{ .id = "id", .title = "title", .body = "body" }));
+    try std.testing.expectEqual(@as(?Connectivity, null), p.readConnectivity());
+    try std.testing.expect(!p.setNetworkingEnabled(true));
+    try std.testing.expect(!p.setWifiEnabled(true));
+    try std.testing.expect(!p.setCellularEnabled(true));
+    try std.testing.expectEqual(@as(?Power, null), p.readPower());
+    try std.testing.expectEqual(@as(?Audio, null), p.readAudio());
+    try std.testing.expectEqual(@as(?Brightness, null), p.readBrightness());
+    try std.testing.expect(!p.sessionCapabilities().power_off);
+    try std.testing.expect(!p.lockSession());
+    try std.testing.expect(!p.logoutSession());
+    try std.testing.expect(!p.suspendSession());
+    try std.testing.expect(!p.restartSystem());
+    try std.testing.expect(!p.powerOffSystem());
+    try std.testing.expectEqual(@as(?Identity, null), p.readIdentity());
+}
+
+test "normalized hardware writes are clamped before reaching a host" {
+    const Spy = struct {
+        audio: Audio = .{ .output_volume = 0, .muted = false },
+        brightness: Brightness = .{ .level = 0 },
+        fn setAudio(ctx: *anyopaque, value: Audio) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.audio = value;
+            return true;
+        }
+        fn setBrightness(ctx: *anyopaque, value: Brightness) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.brightness = value;
+            return true;
+        }
+    };
+    var spy = Spy{};
+    const p = Platform{ .ctx = &spy, .set_audio = Spy.setAudio, .set_brightness = Spy.setBrightness };
+    try std.testing.expect(p.setAudio(.{ .output_volume = 4, .muted = true }));
+    try std.testing.expect(p.setBrightness(.{ .level = -2 }));
+    try std.testing.expectEqual(@as(f32, 1), spy.audio.output_volume);
+    try std.testing.expect(spy.audio.muted);
+    try std.testing.expectEqual(@as(f32, 0), spy.brightness.level);
 }
 
 test "portable setting keys reject paths and malformed UTF-8" {

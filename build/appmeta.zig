@@ -146,6 +146,9 @@ pub const AppOptions = struct {
     icons: []const Icon = &.{},
     /// Android capabilities are opt-in. The default package remains offline.
     android: AndroidOptions = .{},
+    /// Host Wayland clients inside the native window. Other targets ignore
+    /// this flag, so one app description can still build for web and Android.
+    compositor: bool = false,
     root: std.Build.LazyPath,
     /// More modules for the app root. Build them for `target`, or for
     /// wasm32-freestanding on the web. Each module that has no `phantom` import

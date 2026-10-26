@@ -79,6 +79,17 @@ pub const ImagePrimitive = struct {
     opacity: f32 = 1,
 };
 
+/// A sampled GPU texture owned outside the renderer. The display list borrows
+/// it for one frame; unlike ImagePrimitive, the backend neither uploads nor
+/// caches it. Nested Wayland client buffers use this path.
+pub const TexturePrimitive = struct {
+    pub const UvRect = struct { x: f32 = 0, y: f32 = 0, width: f32 = 1, height: f32 = 1 };
+    texture: *anyopaque,
+    rect: geom.PhysicalRect,
+    uv: UvRect = .{},
+    opacity: f32 = 1,
+};
+
 /// A built-in icon to draw. The frontend emits the identity, the size and the
 /// tint; the backend expands the centreline, rasterises it at `size` and caches
 /// the coverage. That is the same split text uses, where the frontend emits
@@ -117,6 +128,7 @@ pub const Primitive = union(enum) {
     push_clip: ClipRegion,
     pop_clip: void,
     image: ImagePrimitive,
+    texture: TexturePrimitive,
     icon: IconPrimitive,
 };
 
@@ -151,6 +163,7 @@ pub fn primitiveEql(a: Primitive, b: Primitive) bool {
         .push_clip => |x| std.meta.eql(x, b.push_clip),
         .pop_clip => true,
         .image => |x| std.meta.eql(x, b.image),
+        .texture => |x| std.meta.eql(x, b.texture),
         .icon => |x| i: {
             const y = b.icon;
             break :i x.id == y.id and

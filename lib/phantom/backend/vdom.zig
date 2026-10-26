@@ -353,6 +353,8 @@ pub fn build(arena: std.mem.Allocator, list: display_list.DisplayList, viewport:
     for (list.primitives.items) |p| switch (p) {
         .rrect => |r| try b.rrect(r),
         .image => |img| try b.image(img),
+        // A hosted client texture has no representation in a browser build.
+        .texture => {},
         .icon => |ic| try b.icon(ic),
         .text => |run| try b.textRun(run),
         .push_scroll => |sr| try b.pushScroll(sr),

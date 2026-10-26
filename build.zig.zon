@@ -9,8 +9,8 @@
             .hash = "webidl_zig-0.1.0-FrIyV4ARBwDm9n_tOpop47X8vgsc-rZlldhnsVKfgy2A",
         },
         .lattice = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/lattice#e7707673d549085709d98af75db6ded0c7ad34b2",
-            .hash = "lattice-0.1.0-TdtxHJV2CgBAvXAlWHNcloAUExbmWjtjRIfE_SS0PsGy",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/lattice#405078a976fdbc1cd88843951d9dcdca22631f97",
+            .hash = "lattice-0.1.0-TdtxHCD1CgCrh5jedWb7IexzuOyhJsD5uDnUYcsnaY1f",
         },
         .prism = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/prism#ac7c8bdb52f6ff665b6b891578882abf2b48308a",

@@ -412,7 +412,7 @@ pub const PrismBackend = struct {
             return null;
         };
         const rgba = img.rgba orelse return null;
-        const key = @intFromPtr(img);
+        const key = img.cache_id;
         if (self.image_textures.get(key)) |t| return t;
         const tex = try self.device.createResource(.{ .image = .{ .width = img.width, .height = img.height, .format = .rgba8_unorm, .usage = .{ .sampled = true } } });
         errdefer self.device.destroyResource(tex);
@@ -565,6 +565,31 @@ pub const PrismBackend = struct {
                     .{ .x = tl[0], .y = tl[1], .u = 0, .v = 0, .r = 1, .g = 1, .b = 1, .a = op },
                     .{ .x = br[0], .y = br[1], .u = 1, .v = 1, .r = 1, .g = 1, .b = 1, .a = op },
                     .{ .x = bl[0], .y = bl[1], .u = 0, .v = 1, .r = 1, .g = 1, .b = 1, .a = op },
+                });
+            },
+            .texture => |texture_prim| {
+                const tex: *hal.Resource = @ptrCast(@alignCast(texture_prim.texture));
+                const r = texture_prim.rect;
+                const x0 = r.x - cur_off.x;
+                const y0 = r.y - cur_off.y;
+                const x1 = x0 + r.width;
+                const y1 = y0 + r.height;
+                const tl = toClip(x0, y0, viewport, self.flip_y);
+                const tr = toClip(x1, y0, viewport, self.flip_y);
+                const br = toClip(x1, y1, viewport, self.flip_y);
+                const bl = toClip(x0, y1, viewport, self.flip_y);
+                const op = texture_prim.opacity;
+                const tex_u0 = texture_prim.uv.x;
+                const tex_v0 = texture_prim.uv.y;
+                const tex_u1 = tex_u0 + texture_prim.uv.width;
+                const tex_v1 = tex_v0 + texture_prim.uv.height;
+                try batch.appendImage(tex, .{
+                    .{ .x = tl[0], .y = tl[1], .u = tex_u0, .v = tex_v0, .r = 1, .g = 1, .b = 1, .a = op },
+                    .{ .x = tr[0], .y = tr[1], .u = tex_u1, .v = tex_v0, .r = 1, .g = 1, .b = 1, .a = op },
+                    .{ .x = br[0], .y = br[1], .u = tex_u1, .v = tex_v1, .r = 1, .g = 1, .b = 1, .a = op },
+                    .{ .x = tl[0], .y = tl[1], .u = tex_u0, .v = tex_v0, .r = 1, .g = 1, .b = 1, .a = op },
+                    .{ .x = br[0], .y = br[1], .u = tex_u1, .v = tex_v1, .r = 1, .g = 1, .b = 1, .a = op },
+                    .{ .x = bl[0], .y = bl[1], .u = tex_u0, .v = tex_v1, .r = 1, .g = 1, .b = 1, .a = op },
                 });
             },
             .text => |run| {

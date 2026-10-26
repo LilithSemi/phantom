@@ -47,6 +47,29 @@ pub const Id = enum(u32) {
 
     /// Three horizontal rails used to open application navigation.
     menu = 13,
+
+    /// A three-by-three application grid. Shells use this to open an app
+    /// launcher without having to carry a private vector asset.
+    apps_grid = 14,
+
+    /// Four window panes used for a workspace or window overview.
+    overview = 15,
+
+    /// A notification bell for status areas and notification centres.
+    notification = 16,
+
+    wifi_none = 17,
+    wifi_weak = 18,
+    wifi_fair = 19,
+    wifi_good = 20,
+    wifi_strong = 21,
+    ethernet = 22,
+    battery_empty = 23,
+    battery_low = 24,
+    battery_half = 25,
+    battery_high = 26,
+    battery_full = 27,
+    battery_charging = 28,
 };
 
 /// What a cell backend draws in place of the mark.
@@ -96,6 +119,23 @@ pub fn cellMarkFor(id: Id) ?CellMark {
         // layouts need a guaranteed one-column fallback; the vector backend
         // still draws the proper three-rail menu path.
         .menu => .{ .cp = '=' },
+        // Cell mode cannot reproduce the miniature panes, but these remain
+        // compact, one-column controls with distinct meanings.
+        .apps_grid => .{ .cp = '#' },
+        .overview => .{ .cp = '%' },
+        .notification => .{ .cp = '!' },
+        .wifi_none => .{ .cp = 'x' },
+        .wifi_weak => .{ .cp = '.' },
+        .wifi_fair => .{ .cp = ':' },
+        .wifi_good => .{ .cp = ';' },
+        .wifi_strong => .{ .cp = '~' },
+        .ethernet => .{ .cp = '=' },
+        .battery_empty => .{ .cp = '0' },
+        .battery_low => .{ .cp = '1' },
+        .battery_half => .{ .cp = '2' },
+        .battery_high => .{ .cp = '3' },
+        .battery_full => .{ .cp = '4' },
+        .battery_charging => .{ .cp = '+' },
     };
 }
 
@@ -151,6 +191,21 @@ pub fn pathFor(id: Id) path.Path {
         .rule_horizontal => rule_horizontal,
         .ellipsis => ellipsis,
         .menu => menu,
+        .apps_grid => apps_grid,
+        .overview => overview,
+        .notification => notification,
+        .wifi_none => wifi_none,
+        .wifi_weak => wifi_weak,
+        .wifi_fair => wifi_fair,
+        .wifi_good => wifi_good,
+        .wifi_strong => wifi_strong,
+        .ethernet => ethernet,
+        .battery_empty => battery_empty,
+        .battery_low => battery_low,
+        .battery_half => battery_half,
+        .battery_high => battery_high,
+        .battery_full => battery_full,
+        .battery_charging => battery_charging,
     };
 }
 
@@ -453,6 +508,107 @@ const menu = path.Path{ .verbs = &.{
     .{ .move = .{ .x = 4, .y = 6 } },
     .{ .line = .{ .x = 20, .y = 6 } },
 } };
+
+/// Nine short round-capped strokes read as dots at icon size. Small strokes
+/// are used instead of zero-length ones because the stroker deliberately
+/// culls degenerate segments.
+const apps_grid = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 5, .y = 18 } },  .{ .line = .{ .x = 5.01, .y = 18 } },
+    .{ .move = .{ .x = 12, .y = 18 } }, .{ .line = .{ .x = 12.01, .y = 18 } },
+    .{ .move = .{ .x = 19, .y = 18 } }, .{ .line = .{ .x = 19.01, .y = 18 } },
+    .{ .move = .{ .x = 5, .y = 12 } },  .{ .line = .{ .x = 5.01, .y = 12 } },
+    .{ .move = .{ .x = 12, .y = 12 } }, .{ .line = .{ .x = 12.01, .y = 12 } },
+    .{ .move = .{ .x = 19, .y = 12 } }, .{ .line = .{ .x = 19.01, .y = 12 } },
+    .{ .move = .{ .x = 5, .y = 6 } },   .{ .line = .{ .x = 5.01, .y = 6 } },
+    .{ .move = .{ .x = 12, .y = 6 } },  .{ .line = .{ .x = 12.01, .y = 6 } },
+    .{ .move = .{ .x = 19, .y = 6 } },  .{ .line = .{ .x = 19.01, .y = 6 } },
+} };
+
+/// Four inset panes. Each subpath is closed so the mark remains legible at
+/// both dock and compact top-bar sizes.
+const overview = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 4, .y = 13 } },  .{ .line = .{ .x = 10, .y = 13 } },
+    .{ .line = .{ .x = 10, .y = 20 } }, .{ .line = .{ .x = 4, .y = 20 } },
+    .close,                             .{ .move = .{ .x = 14, .y = 13 } },
+    .{ .line = .{ .x = 20, .y = 13 } }, .{ .line = .{ .x = 20, .y = 20 } },
+    .{ .line = .{ .x = 14, .y = 20 } }, .close,
+    .{ .move = .{ .x = 4, .y = 4 } },   .{ .line = .{ .x = 10, .y = 4 } },
+    .{ .line = .{ .x = 10, .y = 10 } }, .{ .line = .{ .x = 4, .y = 10 } },
+    .close,                             .{ .move = .{ .x = 14, .y = 4 } },
+    .{ .line = .{ .x = 20, .y = 4 } },  .{ .line = .{ .x = 20, .y = 10 } },
+    .{ .line = .{ .x = 14, .y = 10 } }, .close,
+} };
+
+/// Bell silhouette with a separate clapper. The body is one closed stroked
+/// contour so it remains recognisable at compact top-bar sizes.
+const notification = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 5, .y = 17 } },
+    .{ .quad = .{ .ctrl = .{ .x = 7, .y = 15 }, .end = .{ .x = 7, .y = 10 } } },
+    .{ .quad = .{ .ctrl = .{ .x = 7, .y = 5 }, .end = .{ .x = 12, .y = 5 } } },
+    .{ .quad = .{ .ctrl = .{ .x = 17, .y = 5 }, .end = .{ .x = 17, .y = 10 } } },
+    .{ .quad = .{ .ctrl = .{ .x = 17, .y = 15 }, .end = .{ .x = 19, .y = 17 } } },
+    .close,
+    .{ .move = .{ .x = 10, .y = 20 } },
+    .{ .quad = .{ .ctrl = .{ .x = 12, .y = 22 }, .end = .{ .x = 14, .y = 20 } } },
+} };
+
+const wifi_dot = [_]path.Verb{
+    .{ .move = .{ .x = 12, .y = 5 } }, .{ .line = .{ .x = 12.01, .y = 5 } },
+};
+const wifi_low_arc = [_]path.Verb{
+    .{ .move = .{ .x = 8.5, .y = 8 } },
+    .{ .quad = .{ .ctrl = .{ .x = 12, .y = 11 }, .end = .{ .x = 15.5, .y = 8 } } },
+};
+const wifi_mid_arc = [_]path.Verb{
+    .{ .move = .{ .x = 5.5, .y = 12 } },
+    .{ .quad = .{ .ctrl = .{ .x = 12, .y = 17 }, .end = .{ .x = 18.5, .y = 12 } } },
+};
+const wifi_high_arc = [_]path.Verb{
+    .{ .move = .{ .x = 2.5, .y = 16 } },
+    .{ .quad = .{ .ctrl = .{ .x = 12, .y = 21.5 }, .end = .{ .x = 21.5, .y = 16 } } },
+};
+
+const wifi_none = path.Path{ .verbs = &.{
+    wifi_high_arc[0],                  wifi_high_arc[1],                  wifi_mid_arc[0], wifi_mid_arc[1],
+    wifi_low_arc[0],                   wifi_low_arc[1],                   wifi_dot[0],     wifi_dot[1],
+    .{ .move = .{ .x = 5, .y = 19 } }, .{ .line = .{ .x = 19, .y = 5 } },
+} };
+const wifi_weak = path.Path{ .verbs = &.{ wifi_dot[0], wifi_dot[1] } };
+const wifi_fair = path.Path{ .verbs = &.{ wifi_low_arc[0], wifi_low_arc[1], wifi_dot[0], wifi_dot[1] } };
+const wifi_good = path.Path{ .verbs = &.{ wifi_mid_arc[0], wifi_mid_arc[1], wifi_low_arc[0], wifi_low_arc[1], wifi_dot[0], wifi_dot[1] } };
+const wifi_strong = path.Path{ .verbs = &.{ wifi_high_arc[0], wifi_high_arc[1], wifi_mid_arc[0], wifi_mid_arc[1], wifi_low_arc[0], wifi_low_arc[1], wifi_dot[0], wifi_dot[1] } };
+
+/// A compact wired-network jack: cable, plug body and four contacts.
+const ethernet = path.Path{ .verbs = &.{
+    .{ .move = .{ .x = 12, .y = 3 } },  .{ .line = .{ .x = 12, .y = 7 } },
+    .{ .move = .{ .x = 5, .y = 7 } },   .{ .line = .{ .x = 19, .y = 7 } },
+    .{ .line = .{ .x = 19, .y = 18 } }, .{ .line = .{ .x = 5, .y = 18 } },
+    .close,                             .{ .move = .{ .x = 8, .y = 18 } },
+    .{ .line = .{ .x = 8, .y = 21 } },  .{ .move = .{ .x = 11, .y = 18 } },
+    .{ .line = .{ .x = 11, .y = 21 } }, .{ .move = .{ .x = 14, .y = 18 } },
+    .{ .line = .{ .x = 14, .y = 21 } }, .{ .move = .{ .x = 17, .y = 18 } },
+    .{ .line = .{ .x = 17, .y = 21 } },
+} };
+
+const battery_outline = [_]path.Verb{
+    .{ .move = .{ .x = 3, .y = 6 } },   .{ .line = .{ .x = 18, .y = 6 } },
+    .{ .line = .{ .x = 18, .y = 18 } }, .{ .line = .{ .x = 3, .y = 18 } },
+    .close,                             .{ .move = .{ .x = 20, .y = 9 } },
+    .{ .line = .{ .x = 20, .y = 15 } },
+};
+const battery_bar_1 = [_]path.Verb{ .{ .move = .{ .x = 6, .y = 9 } }, .{ .line = .{ .x = 6, .y = 15 } } };
+const battery_bar_2 = [_]path.Verb{ .{ .move = .{ .x = 9, .y = 9 } }, .{ .line = .{ .x = 9, .y = 15 } } };
+const battery_bar_3 = [_]path.Verb{ .{ .move = .{ .x = 12, .y = 9 } }, .{ .line = .{ .x = 12, .y = 15 } } };
+const battery_bar_4 = [_]path.Verb{ .{ .move = .{ .x = 15, .y = 9 } }, .{ .line = .{ .x = 15, .y = 15 } } };
+const battery_empty = path.Path{ .verbs = &battery_outline };
+const battery_low = path.Path{ .verbs = &(battery_outline ++ battery_bar_1) };
+const battery_half = path.Path{ .verbs = &(battery_outline ++ battery_bar_1 ++ battery_bar_2) };
+const battery_high = path.Path{ .verbs = &(battery_outline ++ battery_bar_1 ++ battery_bar_2 ++ battery_bar_3) };
+const battery_full = path.Path{ .verbs = &(battery_outline ++ battery_bar_1 ++ battery_bar_2 ++ battery_bar_3 ++ battery_bar_4) };
+const battery_charging = path.Path{ .verbs = &(battery_outline ++ [_]path.Verb{
+    .{ .move = .{ .x = 12.5, .y = 17 } }, .{ .line = .{ .x = 8, .y = 11 } },
+    .{ .line = .{ .x = 12, .y = 11 } },   .{ .line = .{ .x = 8.5, .y = 7 } },
+}) };
 
 /// Full bleed and butt capped, so stacking one per row draws a continuous rail
 /// with no seam at the row boundaries. This is U+2502's job in a terminal, and

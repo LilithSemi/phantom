@@ -112,17 +112,23 @@ pub const Image = struct {
     }
 
     fn update(ptr: *const anyopaque, el: *Element, bctx: *phantom.BuildContext) anyerror!void {
-        _ = bctx;
         const self: *const Image = @ptrCast(@alignCast(ptr));
         const ro: *RenderImage = @fieldParentPtr("base", el.render_object.?);
         // Refresh the widget's requested display size from the new config.
         ro.logical_w = self.width;
         ro.logical_h = self.height;
-        // Reset the handle with the new bytes/dimensions in place.
-        // This clears any previously decoded rgba (rgba_owned is reset to false here
-        // since fromBytes sets rgba=null and rgba_owned=false; the old owned buffer
-        // is intentionally NOT freed here because Prism may still hold a cached texture
-        // key pointing at the handle. Dynamic image invalidation is a follow-up.
+
+        // A parent rebuild also updates every same-type child. Keep the decoded pixels
+        // when this is still the same encoded image: resetting the handle here used to
+        // orphan one full RGBA allocation on every such rebuild (a clock above a
+        // wallpaper, for example, leaked the wallpaper once per tick).
+        const same_bytes = ro.img_handle.bytes.ptr == self.bytes.ptr and
+            ro.img_handle.bytes.len == self.bytes.len;
+        if (same_bytes) return;
+
+        // The source really changed, so release the CPU-side decode before replacing
+        // the stable handle. fromBytes assigns a fresh texture-cache identity.
+        ro.img_handle.deinit(bctx.owner.gpa);
         ro.img_handle.* = image_mod.Image.fromBytes(
             self.bytes,
             @intFromFloat(self.width),
@@ -165,4 +171,33 @@ test "Image mounts, lays out at 32x32, and emits one image primitive" {
     // The owned handle detected PNG format.
     const handle: *image_mod.Image = @ptrCast(@alignCast(prim.image));
     try std.testing.expectEqual(image_mod.Image.Format.png, handle.format);
+}
+
+test "Image update preserves a decoded image when only its display size changes" {
+    const gpa = std.testing.allocator;
+    var sink = phantom.FaultSink{};
+    var owner = phantom.BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var bctx = phantom.BuildContext{ .arena = arena.allocator(), .owner = &owner };
+
+    const bytes = @embedFile("../image/testdata/logo.png");
+    var first = Image{ .bytes = bytes, .width = 32, .height = 32 };
+    const el = try first.widget().mount(&bctx, null);
+    defer el.deinit(gpa);
+
+    const ro: *RenderImage = @fieldParentPtr("base", el.render_object.?);
+    try ro.img_handle.ensureDecoded(gpa);
+    const decoded = ro.img_handle.rgba.?.ptr;
+
+    // This is the update pattern produced by an unrelated stateful parent rebuild.
+    // The allocation must remain owned by the persistent render object and be freed
+    // exactly once when the element is unmounted.
+    var resized = Image{ .bytes = bytes, .width = 64, .height = 48 };
+    try resized.widget().update(el, &bctx);
+    try std.testing.expectEqual(decoded, ro.img_handle.rgba.?.ptr);
+    try std.testing.expect(ro.img_handle.rgba_owned);
+    try std.testing.expectEqual(@as(f32, 64), ro.logical_w);
+    try std.testing.expectEqual(@as(f32, 48), ro.logical_h);
 }

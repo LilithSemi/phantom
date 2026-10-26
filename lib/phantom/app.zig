@@ -92,6 +92,14 @@ test "an unknown override value is ignored and the preference runs" {
 }
 
 pub const App = struct {
+    pub const RunOptions = struct {
+        app_id: []const u8 = "phantom",
+        compositor: bool = false,
+        /// One hosted process. The first item is the executable and the rest
+        /// are its arguments, matching the process argv convention.
+        client_argv: []const []const u8 = &.{},
+    };
+
     /// Pick the backend and dispatch to it. A compositor gives the window path, a
     /// terminal on stdout gives the terminal path, and neither is a runtime fault:
     /// it fails loudly instead of drawing nothing and leaving the person to guess why.
@@ -101,6 +109,10 @@ pub const App = struct {
 
     /// Run with the stable application id used by platform services.
     pub fn runWithId(init: std.process.Init, root: phantom.Root, app_id: []const u8) !void {
+        return runConfigured(init, root, .{ .app_id = app_id });
+    }
+
+    pub fn runConfigured(init: std.process.Init, root: phantom.Root, run_opts: RunOptions) !void {
         // The terminal backend draws every frame to stdout (see Term.out in
         // lib/phantom/tui/term.zig), so stdout is the fd that decides whether the
         // terminal path can work. A terminal on stderr with stdout piped elsewhere
@@ -115,7 +127,11 @@ pub const App = struct {
         // the only honest way to know a window is possible, so the answer comes
         // with the thing itself, and dropping it here would mean connecting a
         // second time for something already in hand.
-        const opts = phantom.window.Options{ .app_id = app_id };
+        const opts = phantom.window.Options{
+            .app_id = run_opts.app_id,
+            .compositor = run_opts.compositor,
+            .client_argv = run_opts.client_argv,
+        };
         var opened = phantom.window.open(init.gpa, init.io, init.environ_map, opts);
         // Whatever this function does next, an unused window is given back. Every
         // path that takes it over clears this first, so it is closed once or not
@@ -131,7 +147,7 @@ pub const App = struct {
                 opened = null;
                 return phantom.window.App.runOn(init, win, root, opts);
             },
-            .tui => return phantom.Tui.run(init, root, .{ .app_id = app_id }),
+            .tui => return phantom.Tui.run(init, root, .{ .app_id = run_opts.app_id }),
             .none => {
                 // A clear message, because "it did nothing" is the worst outcome here.
                 var buf: [256]u8 = undefined;

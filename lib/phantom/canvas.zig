@@ -59,6 +59,10 @@ pub const Canvas = struct {
         try self.list.append(self.gpa, .{ .image = prim });
     }
 
+    pub fn drawTexture(self: *Canvas, prim: dl.TexturePrimitive) !void {
+        try self.list.append(self.gpa, .{ .texture = prim });
+    }
+
     pub fn drawIcon(self: *Canvas, prim: dl.IconPrimitive) !void {
         try self.list.append(self.gpa, .{ .icon = prim });
     }

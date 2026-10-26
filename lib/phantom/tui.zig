@@ -649,7 +649,7 @@ pub const Session = struct {
         errdefer self.arena.deinit();
         self.diag_writer = std.Io.File.stderr().writerStreaming(io, &self.diag_buf);
         self.sink = .{ .diagnostics = opts.diagnostics orelse &self.diag_writer.interface };
-        self.owner = .{ .gpa = gpa, .sink = &self.sink, .io = io };
+        self.owner = .{ .gpa = gpa, .sink = &self.sink, .io = io, .environ = environ };
         errdefer self.owner.deinit();
         if (linux_open_url_builds) {
             self.platform_host = LinuxPlatformHost.initForApp(gpa, io, environ.get("DBUS_SESSION_BUS_ADDRESS"), environ, opts.app_id) catch

@@ -641,6 +641,9 @@ pub const FocusHandlers = struct {
     /// True when this node accepts committed text from an input method. Platform
     /// hosts use this to decide whether focusing it should open a virtual keyboard.
     accepts_text_input: bool = false,
+    /// A one-shot request consumed by the next collection pass. Widgets retain
+    /// this bit across ordinary rebuilds so autofocus cannot steal focus back.
+    autofocus_pending: bool = false,
     /// Returns true when the key was used. A key this handler refuses continues
     /// through the rest of `dispatch`, which ends at the focusable ancestors and the
     /// shortcut listeners.
@@ -734,6 +737,12 @@ pub const FocusManager = struct {
                 if (h == c) still_there = true;
             }
             if (!still_there) self.setCurrent(null);
+        }
+        for (self.order.items) |h| {
+            if (!h.autofocus_pending) continue;
+            h.autofocus_pending = false;
+            self.setCurrent(h);
+            break;
         }
     }
 

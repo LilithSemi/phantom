@@ -553,6 +553,9 @@ pub const TextField = struct {
     /// its text from then on, so a later rebuild does not overwrite what the user
     /// typed.
     text: []const u8 = "",
+    /// Display entered bytes as bullets while retaining the original value in
+    /// the controller. Intended for passwords and other short secrets.
+    obscure: bool = false,
     /// Logical font size. Null takes the theme's.
     size: ?f32 = null,
     /// Null takes the theme's text colour.
@@ -575,6 +578,9 @@ pub const TextField = struct {
     /// object and the focus is held by name. Null leaves the field reachable
     /// through Tab only.
     id: ?[]const u8 = null,
+    /// Focus this field once when it appears. Later rebuilds preserve whichever
+    /// focus the user selected.
+    autofocus: bool = false,
     /// Sees every key before the field does, with `ctx`. Return true to use the
     /// key, and the field then ignores it. This is where completion, history and
     /// keys with a meaning of their own go, Tab included.
@@ -621,10 +627,12 @@ pub const TextField = struct {
         /// Borrowed from the config. The `Focus` widget below copies it, so the
         /// slice only has to survive until the next build.
         id: ?[]const u8 = null,
+        autofocus: bool = false,
         on_key: ?*const fn (ctx: *anyopaque, ev: input.KeyEvent) bool = null,
         controller: ?*TextFieldController = null,
         max_lines: u16 = 1,
         min_lines: u16 = 1,
+        obscure: bool = false,
         /// Borrowed from the config. `CaretText` copies it.
         placeholder: ?[]const u8 = null,
         on_lines_change: ?*const fn (ctx: *anyopaque, lines: u16) void = null,
@@ -689,9 +697,11 @@ pub const TextField = struct {
             s.caret_width = config.caret_width;
             s.blink_period = config.blink_period;
             s.id = config.id;
+            s.autofocus = config.autofocus;
             s.on_key = config.on_key;
             s.max_lines = config.max_lines;
             s.min_lines = config.min_lines;
+            s.obscure = config.obscure;
             s.placeholder = config.placeholder;
             s.on_lines_change = config.on_lines_change;
         }
@@ -704,8 +714,13 @@ pub const TextField = struct {
         pub fn build(s: *State, b: *BuildContext) anyerror!Widget {
             const td = phantom.Theme.of(b);
             const max_lines = @max(1, s.max_lines);
+            const displayed = if (s.obscure) blk: {
+                const masked = try b.arena.alloc(u8, s.buf.items.len);
+                @memset(masked, '*');
+                break :blk masked;
+            } else s.buf.items;
             s.view = .{
-                .text = s.buf.items,
+                .text = displayed,
                 .caret = s.caret,
                 .caret_visible = s.focused and s.caret_on,
                 .font = s.font orelse td.body_font,
@@ -724,6 +739,7 @@ pub const TextField = struct {
             s.focus_config = .{
                 .child = s.view.widget(),
                 .accepts_text_input = true,
+                .autofocus = s.autofocus,
                 .on_key = State.onKey,
                 .on_text_input = State.onTextInput,
                 .on_focus_change = State.onFocusChange,
@@ -774,6 +790,11 @@ pub const TextField = struct {
         /// changed since the last frame. Null when it cannot take the new text.
         fn syncedView(s: *State) ?*RenderCaretText {
             const ro = s.ro orelse return null;
+            if (s.obscure) {
+                if (ro.text.len != s.buf.items.len) return null;
+                if (ro.caret != s.caret) ro.refresh(ro.text, s.caret);
+                return ro;
+            }
             if (ro.caret != s.caret or !std.mem.eql(u8, ro.text, s.buf.items)) {
                 ro.refresh(s.buf.items, s.caret);
                 if (!std.mem.eql(u8, ro.text, s.buf.items)) return null;

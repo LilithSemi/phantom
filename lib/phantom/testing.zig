@@ -188,14 +188,22 @@ pub const Harness = struct {
 
     /// Pass when `needle` is in the web page markup or in its stylesheet.
     pub fn expectHtml(self: *Harness, needle: []const u8) !void {
+        try std.testing.expect(try self.htmlContains(needle));
+    }
+
+    /// Pass when `needle` is absent from both the page markup and stylesheet.
+    pub fn expectNoHtml(self: *Harness, needle: []const u8) !void {
+        try std.testing.expect(!try self.htmlContains(needle));
+    }
+
+    fn htmlContains(self: *Harness, needle: []const u8) !bool {
         const physical = self.viewport.toPhysical(self.dpr);
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const tree = try phantom.backend.vdom.build(arena_state.allocator(), self.canvas.list, physical, phantom.Color.rgb(0, 0, 0), null);
         var page = try phantom.backend.dom.renderPage(self.gpa, tree, "/");
         defer page.deinit(self.gpa);
-        const found = std.mem.indexOf(u8, page.html, needle) != null or std.mem.indexOf(u8, page.css, needle) != null;
-        try std.testing.expect(found);
+        return std.mem.indexOf(u8, page.html, needle) != null or std.mem.indexOf(u8, page.css, needle) != null;
     }
 
     pub fn expectNoFaults(self: *Harness) !void {

@@ -26,6 +26,9 @@ sink: *FaultSink,
 /// overrides it with the process init.io; web.init overrides it with the browser
 /// clocks, before the tree is mounted so every initState reads the real one.
 io: std.Io = std.Io.failing,
+/// Process environment for native application services. Null in pure widget
+/// tests and browser builds, where no process environment exists.
+environ: ?*const std.process.Environ.Map = null,
 dirty: std.ArrayList(*Element) = .empty,
 /// The elements whose build read `MediaQuery.of`. `setActiveViewMetrics`
 /// rebuilds them when the metrics change.
@@ -59,6 +62,9 @@ dispatcher: ?*input_mod.Dispatcher = null,
 /// Set by the entry point that owns a focus manager. Null when nothing routes keys,
 /// which is every backend except the terminal today.
 focus: ?*@import("focus.zig").FocusManager = null,
+/// Native nested-compositor host, type-erased to keep the portable widget core
+/// free of Wayland and Prism types.
+compositor_host: ?*anyopaque = null,
 /// Filled in by the backend that has a browser. Every other backend leaves it
 /// empty, and the router then keeps its history in memory only.
 platform: @import("platform.zig").Platform = .{},

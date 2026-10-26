@@ -166,6 +166,9 @@ pub const RenderFlex = struct {
     main: MainAxisAlignment,
     cross: CrossAxisAlignment,
     main_size: MainAxisSize = .max,
+    /// Fixed logical space between adjacent children. Main-axis alignment is
+    /// applied to whatever remains after this space is reserved.
+    gap: f32 = 0,
     /// Where an allocation failure during layout is reported. A dropped child is
     /// invisible on screen, so it must never fail silently. Null only for a
     /// stack-owned RenderFlex that no widget mounted.
@@ -228,7 +231,9 @@ pub const RenderFlex = struct {
         };
         // First pass: only the children that size themselves. A flexible child is
         // held back because its share depends on what this pass leaves over.
-        var inflexible_main: f32 = 0;
+        const physical_gap = @max(0.0, self.gap) * c.scale;
+        const gap_count: usize = if (self.children.items.len > 0) self.children.items.len - 1 else 0;
+        var inflexible_main: f32 = physical_gap * @as(f32, @floatFromInt(gap_count));
         var total_cross: f32 = 0;
         var total_flex: u32 = 0;
         for (self.children.items) |ch| {
@@ -290,7 +295,7 @@ pub const RenderFlex = struct {
             self.offsets.append(self.gpa, offsetFor(self.direction, main_pos, cross_pos)) catch {
                 self.reportOom("out of memory recording a Flex child offset, child not painted");
             };
-            main_pos += cm + spacing.between;
+            main_pos += cm + physical_gap + spacing.between;
         }
         return final;
     }
@@ -323,6 +328,8 @@ pub const Flex = struct {
     main: MainAxisAlignment = .start,
     cross: CrossAxisAlignment = .start,
     main_size: MainAxisSize = .max,
+    /// Logical space inserted between adjacent children.
+    gap: f32 = 0,
     children: []const Widget,
 
     const vtable = Widget.VTable{ .mount = mount, .update = update };
@@ -354,6 +361,7 @@ pub const Flex = struct {
             .main = self.main,
             .cross = self.cross,
             .main_size = self.main_size,
+            .gap = self.gap,
             .sink = bctx.owner.sink,
         };
         const el = gpa.create(Element) catch |e| {
@@ -381,6 +389,7 @@ pub const Flex = struct {
         rf.main = self.main;
         rf.cross = self.cross;
         rf.main_size = self.main_size;
+        rf.gap = self.gap;
         try el.updateChildren(self.children, bctx);
         syncChildren(rf, el, bctx.owner.gpa);
     }
@@ -458,17 +467,19 @@ pub fn Column(opts: struct {
     main: MainAxisAlignment = .start,
     cross: CrossAxisAlignment = .start,
     main_size: MainAxisSize = .max,
+    gap: f32 = 0,
     children: []const Widget,
 }) Flex {
-    return .{ .direction = .vertical, .main = opts.main, .cross = opts.cross, .main_size = opts.main_size, .children = opts.children };
+    return .{ .direction = .vertical, .main = opts.main, .cross = opts.cross, .main_size = opts.main_size, .gap = opts.gap, .children = opts.children };
 }
 pub fn Row(opts: struct {
     main: MainAxisAlignment = .start,
     cross: CrossAxisAlignment = .start,
     main_size: MainAxisSize = .max,
+    gap: f32 = 0,
     children: []const Widget,
 }) Flex {
-    return .{ .direction = .horizontal, .main = opts.main, .cross = opts.cross, .main_size = opts.main_size, .children = opts.children };
+    return .{ .direction = .horizontal, .main = opts.main, .cross = opts.cross, .main_size = opts.main_size, .gap = opts.gap, .children = opts.children };
 }
 
 // Test-only render object: reports a fixed physical size (ignores constraints)

@@ -62,7 +62,12 @@ pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.A
         \\const app_options = @import("app_options");
         \\pub const panic = std.debug.FullPanic(phantom.tui.term.rootPanic);
         \\pub fn main(init: std.process.Init) !void {
-        \\    try phantom.App.runWithId(init, phantom.Root.plain(app.root), app_options.id);
+        \\    const args = try init.minimal.args.toSlice(init.arena.allocator());
+        \\    try phantom.App.runConfigured(init, phantom.Root.plain(app.root), .{
+        \\        .app_id = app_options.id,
+        \\        .compositor = app_options.compositor,
+        \\        .client_argv = if (args.len > 1) args[1..] else &.{},
+        \\    });
         \\}
     ;
     const entry = b.addWriteFiles().add("main.zig", entry_src);
@@ -74,6 +79,7 @@ pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.A
     exe.root_module.addImport("app_root", app_mod);
     const native_options = b.addOptions();
     native_options.addOption([]const u8, "id", opts.id);
+    native_options.addOption(bool, "compositor", opts.compositor);
     exe.root_module.addImport("app_options", native_options.createModule());
 
     const step = b.step(b.fmt("app-{s}", .{opts.id}), b.fmt("Package {s} (native)", .{opts.id}));

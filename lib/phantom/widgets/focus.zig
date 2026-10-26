@@ -29,6 +29,7 @@ const RenderFocus = struct {
     on_text_input: ?*const fn (*anyopaque, input.TextInputEvent) bool,
     on_focus_change: ?*const fn (*anyopaque, bool) void,
     user_ctx: *anyopaque,
+    autofocus: bool = false,
 
     fn layoutFn(base: *RenderObject, c: layout.BoxConstraints) geom.PhysicalSize {
         const self: *RenderFocus = @fieldParentPtr("base", base);
@@ -68,6 +69,9 @@ const RenderFocus = struct {
 pub const Focus = struct {
     child: Widget,
     accepts_text_input: bool = false,
+    /// Requests focus when this widget first mounts, or when this property
+    /// changes from false to true. It does not reassert focus on every rebuild.
+    autofocus: bool = false,
     /// Return true when the key was used. An unused key falls through to the focus
     /// traversal rules, which is how Tab keeps working inside a focusable widget.
     on_key: ?*const fn (ctx: *anyopaque, ev: input.KeyEvent) bool = null,
@@ -86,6 +90,9 @@ pub const Focus = struct {
     }
 
     fn install(ro: *RenderFocus, self: *const Focus) !void {
+        const request_autofocus = self.autofocus and !ro.autofocus;
+        const pending_autofocus = ro.handlers.autofocus_pending or request_autofocus;
+        ro.autofocus = self.autofocus;
         ro.on_key = self.on_key;
         ro.on_text_input = self.on_text_input;
         ro.on_focus_change = self.on_focus_change;
@@ -94,6 +101,7 @@ pub const Focus = struct {
         ro.handlers = .{
             .ctx = ro,
             .accepts_text_input = self.accepts_text_input,
+            .autofocus_pending = pending_autofocus,
             .on_key = if (self.on_key != null) RenderFocus.keyThunk else null,
             .on_text_input = if (self.on_text_input != null) RenderFocus.textInputThunk else null,
             .on_focus_change = if (self.on_focus_change != null) RenderFocus.focusChangeThunk else null,
@@ -195,6 +203,27 @@ test "two Focus widgets collect in the order they appear in the tree" {
     const one = mgr.current.?;
     mgr.focusNext();
     try std.testing.expect(mgr.current != one);
+}
+
+test "autofocus is consumed once and does not steal focus on later collections" {
+    const gpa = std.testing.allocator;
+    var leaf_a = phantom.ColoredBox{ .color = phantom.Color.rgb(1, 0, 0) };
+    var leaf_b = phantom.ColoredBox{ .color = phantom.Color.rgb(0, 1, 0) };
+    var first = Focus{ .id = "search", .autofocus = true, .child = leaf_a.widget() };
+    var second = Focus{ .id = "result", .child = leaf_b.widget() };
+    var children = [_]phantom.Widget{ first.widget(), second.widget() };
+    var column = phantom.Column(.{ .children = &children });
+    var h = try testing.mount(gpa, column.widget());
+    defer h.deinit();
+
+    var mgr = phantom.FocusManager{};
+    defer mgr.deinit(gpa);
+    try mgr.collect(gpa, h.root);
+    try std.testing.expectEqualStrings("search", mgr.focusedId().?);
+
+    try std.testing.expect(mgr.focusById("result"));
+    try mgr.collect(gpa, h.root);
+    try std.testing.expectEqualStrings("result", mgr.focusedId().?);
 }
 
 test "an id reaches one named Focus widget and its keys, whatever the Tab order says" {
