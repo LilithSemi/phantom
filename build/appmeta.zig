@@ -51,13 +51,53 @@ pub const AndroidOptions = struct {
     /// Development servers commonly use HTTP. This remains off unless an app
     /// explicitly opts into Android's cleartext transport policy.
     uses_cleartext_traffic: bool = false,
+    notification_channel_id: []const u8 = "general",
+    notification_channel_name: []const u8 = "General",
+    /// A long-running Zig module hosted by an Android foreground service. The
+    /// module exports `run(*phantom.android.BackgroundService) !void`; Phantom
+    /// starts it on a worker thread when the Activity first opens and asks it
+    /// to stop when Android destroys the service.
+    background_service: ?BackgroundService = null,
+
+    pub const BackgroundService = struct {
+        module: *std.Build.Module,
+        notification_title: []const u8,
+        notification_body: []const u8 = "Running in the background",
+        service_type: ForegroundServiceType = .special_use,
+        /// Required by Android for `.special_use` and ignored by other types.
+        special_use_subtype: []const u8 = "persistent application connection",
+    };
+
+    pub const ForegroundServiceType = enum {
+        data_sync,
+        remote_messaging,
+        special_use,
+
+        pub fn manifestName(self: ForegroundServiceType) []const u8 {
+            return switch (self) {
+                .data_sync => "dataSync",
+                .remote_messaging => "remoteMessaging",
+                .special_use => "specialUse",
+            };
+        }
+
+        pub fn permissionName(self: ForegroundServiceType) []const u8 {
+            return switch (self) {
+                .data_sync => "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+                .remote_messaging => "android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING",
+                .special_use => "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+            };
+        }
+    };
 
     pub const Permission = enum {
         internet,
+        notifications,
 
         pub fn manifestName(self: Permission) []const u8 {
             return switch (self) {
                 .internet => "android.permission.INTERNET",
+                .notifications => "android.permission.POST_NOTIFICATIONS",
             };
         }
     };
@@ -71,6 +111,19 @@ test "Android capabilities are opt-in" {
         "android.permission.INTERNET",
         AndroidOptions.Permission.internet.manifestName(),
     );
+    try std.testing.expectEqualStrings(
+        "android.permission.POST_NOTIFICATIONS",
+        AndroidOptions.Permission.notifications.manifestName(),
+    );
+}
+
+test "Android foreground service types carry their manifest names and permissions" {
+    try std.testing.expectEqualStrings("dataSync", AndroidOptions.ForegroundServiceType.data_sync.manifestName());
+    try std.testing.expectEqualStrings(
+        "android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING",
+        AndroidOptions.ForegroundServiceType.remote_messaging.permissionName(),
+    );
+    try std.testing.expectEqualStrings("specialUse", AndroidOptions.ForegroundServiceType.special_use.manifestName());
 }
 
 /// How a route appears in the address bar. `.hash` works on any static host

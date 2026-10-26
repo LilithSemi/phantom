@@ -1,8 +1,13 @@
 package @PACKAGE@;
 
 import android.app.Activity;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.database.Cursor;
 import android.graphics.Rect;
 import android.graphics.Insets;
 import android.net.Uri;
@@ -22,11 +27,18 @@ import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 import java.nio.charset.StandardCharsets;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 
 public final class MainActivity extends Activity {
     static { System.loadLibrary("@LIBRARY@"); }
+    private static final String NOTIFICATION_CHANNEL_ID = "@CHANNEL_ID@";
+    private static final String NOTIFICATION_CHANNEL_NAME = "@CHANNEL_NAME@";
+    private PhantomView phantomView;
 
-    private static native long nativeCreate(int width, int height, float density, float fontScale, int insetLeft, int insetTop, int insetRight, int insetBottom);
+    private static native long nativeCreate(int width, int height, float density, float fontScale, int insetLeft, int insetTop, int insetRight, int insetBottom, int notificationPermission);
+    private static native int nativeBeginFilesDir(int length);
+    private static native void nativeFilesDirByte(int index, int value);
     private static native void nativeDestroy(long handle);
     private static native int nativeSurfaceCreated(long handle, android.view.Surface surface, int width, int height, float density);
     private static native void nativeSurfaceDestroyed(long handle);
@@ -43,10 +55,73 @@ public final class MainActivity extends Activity {
     private static native int nativePendingUrlByte(long handle, int index);
     private static native int nativePendingUrlMode(long handle);
     private static native void nativeClearPendingUrl(long handle);
+    private static native int nativePendingNotificationLength(long handle, int field);
+    private static native int nativePendingNotificationByte(long handle, int field, int index);
+    private static native void nativeClearPendingNotification(long handle);
+    private static native int nativeTakeNotificationPermissionRequest(long handle);
+    private static native void nativeNotificationPermission(long handle, int permission);
+    private static native int nativePendingFilePickerLength(long handle);
+    private static native int nativePendingFilePickerByte(long handle, int index);
+    private static native void nativeStartFilePicker(long handle);
+    private static native int nativeBeginFilePickerResult(long handle, int nameLength, int typeLength, int dataLength);
+    private static native void nativeFilePickerResultByte(long handle, int field, int index, int value);
+    private static native void nativeFinishFilePicker(long handle, int kind);
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        setContentView(new PhantomView(this));
+        createNotificationChannel();
+@START_BACKGROUND_SERVICE@
+        phantomView = new PhantomView(this);
+        setContentView(phantomView);
+    }
+
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT < 26) return;
+        getSystemService(NotificationManager.class).createNotificationChannel(
+                new NotificationChannel(NOTIFICATION_CHANNEL_ID, NOTIFICATION_CHANNEL_NAME, NotificationManager.IMPORTANCE_DEFAULT));
+    }
+
+    private int notificationPermission() {
+        if (Build.VERSION.SDK_INT < 33) return 0;
+        return checkSelfPermission("android.permission.POST_NOTIFICATIONS") == android.content.pm.PackageManager.PERMISSION_GRANTED ? 0 : 2;
+    }
+
+    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode == 71 && phantomView != null && phantomView.handle != 0) {
+            int result = results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED ? 0 : 1;
+            nativeNotificationPermission(phantomView.handle, result);
+        }
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != 72 || phantomView == null || phantomView.handle == 0) return;
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            nativeFinishFilePicker(phantomView.handle, 1);
+            return;
+        }
+        Uri uri = data.getData();
+        try {
+            String name = "file";
+            try (Cursor cursor = getContentResolver().query(uri, new String[]{android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    int column = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                    if (column >= 0 && cursor.getString(column) != null) name = cursor.getString(column);
+                }
+            }
+            String type = getContentResolver().getType(uri);
+            if (type == null) type = "application/octet-stream";
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (InputStream input = getContentResolver().openInputStream(uri)) {
+                if (input == null) throw new java.io.IOException("no stream");
+                byte[] chunk = new byte[16384];
+                for (int count; (count = input.read(chunk)) >= 0;) output.write(chunk, 0, count);
+            }
+            phantomView.deliverFile(name, type, output.toByteArray());
+        } catch (Exception ignored) {
+            nativeFinishFilePicker(phantomView.handle, 2);
+        }
     }
 
     private static final class PhantomView extends SurfaceView implements SurfaceHolder.Callback, Choreographer.FrameCallback {
@@ -57,6 +132,10 @@ public final class MainActivity extends Activity {
 
         PhantomView(Context context) {
             super(context);
+            byte[] filesDir = context.getFilesDir().getAbsolutePath().getBytes(StandardCharsets.UTF_8);
+            if (nativeBeginFilesDir(filesDir.length) != 0) {
+                for (int i = 0; i < filesDir.length; ++i) nativeFilesDirByte(i, filesDir[i] & 0xff);
+            }
             getHolder().addCallback(this);
             setFocusable(true);
             setFocusableInTouchMode(true);
@@ -71,7 +150,7 @@ public final class MainActivity extends Activity {
             float density = getResources().getDisplayMetrics().density;
             float fontScale = getResources().getConfiguration().fontScale;
             Rect insets = systemBarInsets();
-            if (handle == 0) handle = nativeCreate(width, height, density, fontScale, insets.left, insets.top, insets.right, insets.bottom);
+            if (handle == 0) handle = nativeCreate(width, height, density, fontScale, insets.left, insets.top, insets.right, insets.bottom, ((MainActivity)getContext()).notificationPermission());
             surfaceAttached = handle != 0 && nativeSurfaceCreated(handle, holder.getSurface(), width, height, density) != 0;
             scheduleFrame();
         }
@@ -102,6 +181,7 @@ public final class MainActivity extends Activity {
                     insets.right,
                     insets.bottom,
                     frameNanos);
+            drainPlatformRequests();
             scheduleFrame();
         }
 
@@ -152,7 +232,7 @@ public final class MainActivity extends Activity {
                 if (translated == 0) updateIme(wantsIme);
                 if (action == MotionEvent.ACTION_UP) performClick();
             }
-            openPendingUrl();
+            drainPlatformRequests();
             scheduleFrame();
             return true;
         }
@@ -180,6 +260,93 @@ public final class MainActivity extends Activity {
                 // No activity accepted the URI, or the URI was malformed.
             }
         }
+
+        private String pendingNotificationField(int field) {
+            int length = nativePendingNotificationLength(handle, field);
+            if (length < 0) return null;
+            byte[] bytes = new byte[length];
+            for (int i = 0; i < length; ++i) {
+                int value = nativePendingNotificationByte(handle, field, i);
+                if (value < 0) return null;
+                bytes[i] = (byte)value;
+            }
+            return new String(bytes, StandardCharsets.UTF_8);
+        }
+
+        private void drainPlatformRequests() {
+            openPendingUrl();
+            String id = pendingNotificationField(0);
+            if (id != null) {
+                String title = pendingNotificationField(1);
+                String body = pendingNotificationField(2);
+                nativeClearPendingNotification(handle);
+                if (title != null && body != null) {
+                    Intent launch = new Intent(getContext(), MainActivity.class)
+                            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                    PendingIntent pending = PendingIntent.getActivity(getContext(), 0, launch,
+                            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                    Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                            ? new Notification.Builder(getContext(), NOTIFICATION_CHANNEL_ID)
+                            : new Notification.Builder(getContext());
+                    builder.setSmallIcon(android.R.drawable.ic_dialog_info)
+                            .setContentTitle(title).setContentText(body)
+                            .setContentIntent(pending).setAutoCancel(true);
+                    try {
+                        getContext().getSystemService(NotificationManager.class).notify(id.hashCode(), builder.build());
+                    } catch (SecurityException ignored) {}
+                }
+            }
+            if (nativeTakeNotificationPermissionRequest(handle) != 0) {
+                if (Build.VERSION.SDK_INT >= 33) {
+                    ((Activity)getContext()).requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 71);
+                } else {
+                    nativeNotificationPermission(handle, 0);
+                }
+            }
+            int acceptLength = nativePendingFilePickerLength(handle);
+            if (acceptLength >= 0) {
+                byte[] bytes = new byte[acceptLength];
+                boolean valid = true;
+                for (int i = 0; i < acceptLength; ++i) {
+                    int value = nativePendingFilePickerByte(handle, i);
+                    if (value < 0) { valid = false; break; }
+                    bytes[i] = (byte)value;
+                }
+                nativeStartFilePicker(handle);
+                if (!valid) {
+                    nativeFinishFilePicker(handle, 2);
+                } else {
+                    Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                            .addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
+                    String accept = new String(bytes, StandardCharsets.UTF_8);
+                    if (!accept.isEmpty()) {
+                        String[] choices = java.util.Arrays.stream(accept.split(","))
+                                .map(String::trim).filter(s -> s.contains("/")).toArray(String[]::new);
+                        if (choices.length == 1) picker.setType(choices[0]);
+                        else if (choices.length > 1) picker.putExtra(Intent.EXTRA_MIME_TYPES, choices);
+                    }
+                    try { ((Activity)getContext()).startActivityForResult(picker, 72); }
+                    catch (RuntimeException ignored) { nativeFinishFilePicker(handle, 2); }
+                }
+            }
+        }
+
+        private void deliverFile(String name, String type, byte[] data) {
+            byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+            byte[] typeBytes = type.getBytes(StandardCharsets.UTF_8);
+            if (nativeBeginFilePickerResult(handle, nameBytes.length, typeBytes.length, data.length) == 0) {
+                nativeFinishFilePicker(handle, 2);
+                return;
+            }
+            byte[][] fields = new byte[][]{nameBytes, typeBytes, data};
+            for (int field = 0; field < fields.length; ++field) {
+                for (int i = 0; i < fields[field].length; ++i) {
+                    nativeFilePickerResultByte(handle, field, i, fields[field][i] & 0xff);
+                }
+            }
+            nativeFinishFilePicker(handle, 0);
+        }
+
 
         private void updateIme(boolean enabled) {
             if (imeEnabled == enabled) return;

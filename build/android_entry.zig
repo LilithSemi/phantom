@@ -1,6 +1,7 @@
 const std = @import("std");
 const phantom = @import("phantom");
 const app = @import("app_root");
+const background_module = @import("background_service");
 const options = @import("android_options");
 
 pub const std_options: std.Options = .{ .enable_segfault_handler = false };
@@ -9,6 +10,11 @@ extern "log" fn __android_log_write(priority: c_int, tag: [*:0]const u8, message
 const Session = phantom.android.Session;
 const gpa = std.heap.c_allocator;
 const log_tag: [*:0]const u8 = "Phantom";
+var files_dir: std.ArrayList(u8) = .empty;
+var service_files_dir: std.ArrayList(u8) = .empty;
+var background_service: ?*phantom.android.BackgroundService = null;
+var background_thread: ?std.Thread = null;
+var background_finished: std.atomic.Value(bool) = .init(true);
 
 extern "android" fn ANativeWindow_fromSurface(env: ?*anyopaque, surface: ?*anyopaque) ?*anyopaque;
 
@@ -37,14 +43,36 @@ export fn JNI_OnLoad(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
     return 0x00010006;
 }
 
-fn nativeCreate(_: ?*anyopaque, _: ?*anyopaque, width: c_int, height: c_int, density: f32, text_scale: f32, inset_left: c_int, inset_top: c_int, inset_right: c_int, inset_bottom: c_int) callconv(.c) i64 {
+fn nativeCreate(_: ?*anyopaque, _: ?*anyopaque, width: c_int, height: c_int, density: f32, text_scale: f32, inset_left: c_int, inset_top: c_int, inset_right: c_int, inset_bottom: c_int, notification_permission: c_int) callconv(.c) i64 {
     if (width <= 0 or height <= 0) return 0;
-    const value = Session.create(gpa, phantom.Root.plain(app.root), @intCast(width), @intCast(height), density, text_scale, physicalInsets(inset_left, inset_top, inset_right, inset_bottom)) catch |err| {
+    if (files_dir.items.len == 0) return 0;
+    const value = Session.create(gpa, phantom.Root.plain(app.root), @intCast(width), @intCast(height), density, text_scale, physicalInsets(inset_left, inset_top, inset_right, inset_bottom), files_dir.items, permissionFromInt(notification_permission)) catch |err| {
         log(@errorName(err));
         return 0;
     };
     log("Prism renderer ready");
     return @bitCast(@as(u64, @intFromPtr(value)));
+}
+
+fn permissionFromInt(value: c_int) phantom.NotificationPermission {
+    return switch (value) {
+        0 => .granted,
+        1 => .denied,
+        2 => .prompt,
+        else => .unsupported,
+    };
+}
+
+fn nativeBeginFilesDir(_: ?*anyopaque, _: ?*anyopaque, length: c_int) callconv(.c) c_int {
+    if (length <= 0) return 0;
+    files_dir.resize(gpa, @intCast(length)) catch return 0;
+    return 1;
+}
+
+fn nativeFilesDirByte(_: ?*anyopaque, _: ?*anyopaque, index: c_int, byte: c_int) callconv(.c) void {
+    if (index < 0 or byte < 0 or byte > 255) return;
+    const i: usize = @intCast(index);
+    if (i < files_dir.items.len) files_dir.items[i] = @intCast(byte);
 }
 
 fn nativeDestroy(_: ?*anyopaque, _: ?*anyopaque, handle: i64) callconv(.c) void {
@@ -157,8 +185,135 @@ fn nativeClearPendingUrl(_: ?*anyopaque, _: ?*anyopaque, handle: i64) callconv(.
     if (session(handle)) |value| value.clearPendingUrl();
 }
 
+fn nativePendingNotificationLength(_: ?*anyopaque, _: ?*anyopaque, handle: i64, field: c_int) callconv(.c) c_int {
+    if (field < 0) return -1;
+    const value = session(handle) orelse return -1;
+    const len = value.pendingNotificationLength(@intCast(field)) orelse return -1;
+    return if (len <= std.math.maxInt(c_int)) @intCast(len) else -1;
+}
+
+fn nativePendingNotificationByte(_: ?*anyopaque, _: ?*anyopaque, handle: i64, field: c_int, index: c_int) callconv(.c) c_int {
+    if (field < 0 or index < 0) return -1;
+    const value = session(handle) orelse return -1;
+    return value.pendingNotificationByte(@intCast(field), @intCast(index)) orelse -1;
+}
+
+fn nativeClearPendingNotification(_: ?*anyopaque, _: ?*anyopaque, handle: i64) callconv(.c) void {
+    if (session(handle)) |value| value.clearPendingNotification();
+}
+
+fn nativeTakeNotificationPermissionRequest(_: ?*anyopaque, _: ?*anyopaque, handle: i64) callconv(.c) c_int {
+    const value = session(handle) orelse return 0;
+    return @intFromBool(value.takeNotificationPermissionRequest());
+}
+
+fn nativeNotificationPermission(_: ?*anyopaque, _: ?*anyopaque, handle: i64, permission: c_int) callconv(.c) void {
+    if (session(handle)) |value| value.setNotificationPermission(permissionFromInt(permission));
+}
+
+fn nativePendingFilePickerLength(_: ?*anyopaque, _: ?*anyopaque, handle: i64) callconv(.c) c_int {
+    const value = session(handle) orelse return -1;
+    const len = value.pendingFilePickerLength() orelse return -1;
+    return if (len <= std.math.maxInt(c_int)) @intCast(len) else -1;
+}
+
+fn nativePendingFilePickerByte(_: ?*anyopaque, _: ?*anyopaque, handle: i64, index: c_int) callconv(.c) c_int {
+    if (index < 0) return -1;
+    const value = session(handle) orelse return -1;
+    return value.pendingFilePickerByte(@intCast(index)) orelse -1;
+}
+
+fn nativeStartFilePicker(_: ?*anyopaque, _: ?*anyopaque, handle: i64) callconv(.c) void {
+    if (session(handle)) |value| value.startFilePicker();
+}
+
+fn nativeBeginFilePickerResult(_: ?*anyopaque, _: ?*anyopaque, handle: i64, name_len: c_int, type_len: c_int, data_len: c_int) callconv(.c) c_int {
+    if (name_len < 0 or type_len < 0 or data_len < 0) return 0;
+    const value = session(handle) orelse return 0;
+    value.beginFilePickerResult(@intCast(name_len), @intCast(type_len), @intCast(data_len)) catch return 0;
+    return 1;
+}
+
+fn nativeFilePickerResultByte(_: ?*anyopaque, _: ?*anyopaque, handle: i64, field: c_int, index: c_int, byte: c_int) callconv(.c) void {
+    if (field < 0 or index < 0 or byte < 0 or byte > 255) return;
+    if (session(handle)) |value| value.setFilePickerResultByte(@intCast(field), @intCast(index), @intCast(byte));
+}
+
+fn nativeFinishFilePicker(_: ?*anyopaque, _: ?*anyopaque, handle: i64, kind: c_int) callconv(.c) void {
+    if (session(handle)) |value| value.finishFilePicker(if (kind < 0) 2 else @intCast(kind));
+}
+
+fn nativeBeginServiceFilesDir(_: ?*anyopaque, _: ?*anyopaque, length: c_int) callconv(.c) c_int {
+    if (!options.has_background_service or length <= 0) return 0;
+    service_files_dir.resize(gpa, @intCast(length)) catch return 0;
+    return 1;
+}
+
+fn nativeServiceFilesDirByte(_: ?*anyopaque, _: ?*anyopaque, index: c_int, byte: c_int) callconv(.c) void {
+    if (index < 0 or byte < 0 or byte > 255) return;
+    const i: usize = @intCast(index);
+    if (i < service_files_dir.items.len) service_files_dir.items[i] = @intCast(byte);
+}
+
+fn runBackgroundService(value: *phantom.android.BackgroundService) void {
+    background_module.run(value) catch |err| log(@errorName(err));
+    background_finished.store(true, .release);
+}
+
+fn nativeServiceStart(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    if (!options.has_background_service or background_service != null or service_files_dir.items.len == 0) return 0;
+    const value = phantom.android.BackgroundService.create(gpa, service_files_dir.items) catch |err| {
+        log(@errorName(err));
+        return 0;
+    };
+    background_finished.store(false, .release);
+    const thread = std.Thread.spawn(.{}, runBackgroundService, .{value}) catch |err| {
+        log(@errorName(err));
+        background_finished.store(true, .release);
+        value.destroy();
+        return 0;
+    };
+    background_service = value;
+    background_thread = thread;
+    return 1;
+}
+
+fn nativeServiceStop(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    const value = background_service orelse return;
+    value.requestStop();
+    if (@hasDecl(background_module, "stop")) background_module.stop(value);
+    if (background_thread) |thread| thread.join();
+    background_thread = null;
+    background_service = null;
+    background_finished.store(true, .release);
+    value.destroy();
+}
+
+fn nativeServiceRunning(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    return @intFromBool(background_service != null and !background_finished.load(.acquire));
+}
+
+fn nativeServiceNotificationLength(_: ?*anyopaque, _: ?*anyopaque, field: c_int) callconv(.c) c_int {
+    if (field < 0) return -1;
+    const value = background_service orelse return -1;
+    const len = value.pendingNotificationLength(@intCast(field)) orelse return -1;
+    return if (len <= std.math.maxInt(c_int)) @intCast(len) else -1;
+}
+
+fn nativeServiceNotificationByte(_: ?*anyopaque, _: ?*anyopaque, field: c_int, index: c_int) callconv(.c) c_int {
+    if (field < 0 or index < 0) return -1;
+    const value = background_service orelse return -1;
+    return value.pendingNotificationByte(@intCast(field), @intCast(index)) orelse -1;
+}
+
+fn nativeServiceClearNotification(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    if (background_service) |value| value.clearPendingNotification();
+}
+
 comptime {
     @export(&nativeCreate, .{ .name = options.jni_prefix ++ "nativeCreate" });
+    @export(&nativeBeginFilesDir, .{ .name = options.jni_prefix ++ "nativeBeginFilesDir" });
+    @export(&nativeFilesDirByte, .{ .name = options.jni_prefix ++ "nativeFilesDirByte" });
     @export(&nativeDestroy, .{ .name = options.jni_prefix ++ "nativeDestroy" });
     @export(&nativeSurfaceCreated, .{ .name = options.jni_prefix ++ "nativeSurfaceCreated" });
     @export(&nativeSurfaceDestroyed, .{ .name = options.jni_prefix ++ "nativeSurfaceDestroyed" });
@@ -175,4 +330,23 @@ comptime {
     @export(&nativePendingUrlByte, .{ .name = options.jni_prefix ++ "nativePendingUrlByte" });
     @export(&nativePendingUrlMode, .{ .name = options.jni_prefix ++ "nativePendingUrlMode" });
     @export(&nativeClearPendingUrl, .{ .name = options.jni_prefix ++ "nativeClearPendingUrl" });
+    @export(&nativePendingNotificationLength, .{ .name = options.jni_prefix ++ "nativePendingNotificationLength" });
+    @export(&nativePendingNotificationByte, .{ .name = options.jni_prefix ++ "nativePendingNotificationByte" });
+    @export(&nativeClearPendingNotification, .{ .name = options.jni_prefix ++ "nativeClearPendingNotification" });
+    @export(&nativeTakeNotificationPermissionRequest, .{ .name = options.jni_prefix ++ "nativeTakeNotificationPermissionRequest" });
+    @export(&nativeNotificationPermission, .{ .name = options.jni_prefix ++ "nativeNotificationPermission" });
+    @export(&nativePendingFilePickerLength, .{ .name = options.jni_prefix ++ "nativePendingFilePickerLength" });
+    @export(&nativePendingFilePickerByte, .{ .name = options.jni_prefix ++ "nativePendingFilePickerByte" });
+    @export(&nativeStartFilePicker, .{ .name = options.jni_prefix ++ "nativeStartFilePicker" });
+    @export(&nativeBeginFilePickerResult, .{ .name = options.jni_prefix ++ "nativeBeginFilePickerResult" });
+    @export(&nativeFilePickerResultByte, .{ .name = options.jni_prefix ++ "nativeFilePickerResultByte" });
+    @export(&nativeFinishFilePicker, .{ .name = options.jni_prefix ++ "nativeFinishFilePicker" });
+    @export(&nativeBeginServiceFilesDir, .{ .name = options.service_jni_prefix ++ "nativeBeginServiceFilesDir" });
+    @export(&nativeServiceFilesDirByte, .{ .name = options.service_jni_prefix ++ "nativeServiceFilesDirByte" });
+    @export(&nativeServiceStart, .{ .name = options.service_jni_prefix ++ "nativeServiceStart" });
+    @export(&nativeServiceStop, .{ .name = options.service_jni_prefix ++ "nativeServiceStop" });
+    @export(&nativeServiceRunning, .{ .name = options.service_jni_prefix ++ "nativeServiceRunning" });
+    @export(&nativeServiceNotificationLength, .{ .name = options.service_jni_prefix ++ "nativeServiceNotificationLength" });
+    @export(&nativeServiceNotificationByte, .{ .name = options.service_jni_prefix ++ "nativeServiceNotificationByte" });
+    @export(&nativeServiceClearNotification, .{ .name = options.service_jni_prefix ++ "nativeServiceClearNotification" });
 }

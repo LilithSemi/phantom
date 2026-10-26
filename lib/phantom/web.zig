@@ -44,6 +44,8 @@ pub const WebApp = struct {
     net: phantom.web_net.Net,
     /// The open server-sent event streams. See `Platform.openEventSource`.
     event_sources: [max_event_sources]EventSourceSlot = @splat(.{}),
+    file_picker_sink: ?phantom.FilePickerSink = null,
+    notification_permission_sink: ?phantom.NotificationPermissionSink = null,
     /// The fonts already registered with the browser, so each is registered
     /// once. Page-lifetime, because a face registered on one frame has to still
     /// count as registered on the next.
@@ -101,6 +103,20 @@ pub const WebApp = struct {
         const sink = slot.sink orelse return;
         if (slot.id(index) != id) return;
         sink.on_event(sink.ctx, event);
+    }
+
+    /// Complete the page's one outstanding picker request. The browser-owned
+    /// slices are borrowed for this call and never retained here.
+    pub fn filePicked(self: *WebApp, result: phantom.FilePickerResult) void {
+        const sink = self.file_picker_sink orelse return;
+        self.file_picker_sink = null;
+        sink.on_result(sink.ctx, result);
+    }
+
+    pub fn notificationPermissionResult(self: *WebApp, result: phantom.NotificationPermission) void {
+        const sink = self.notification_permission_sink orelse return;
+        self.notification_permission_sink = null;
+        sink.on_result(sink.ctx, result);
     }
 
     /// Register every font this frame draws with that has not been registered
@@ -469,6 +485,53 @@ fn openUrlThunk(ctx: *anyopaque, url: []const u8, mode: phantom.OpenMode) bool {
     // hook is never null here. Its answer is passed through rather than
     // replaced with `true`: a browser that refused the call said so.
     return app.ops.open_url.?(app.ops.ctx, url, mode);
+}
+
+fn readSettingThunk(ctx: *anyopaque, key: []const u8, buf: []u8) phantom.SettingsError!?[]const u8 {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    return app.ops.read_setting.?(app.ops.ctx, key, buf);
+}
+
+fn writeSettingThunk(ctx: *anyopaque, key: []const u8, value: []const u8) phantom.SettingsError!void {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    return app.ops.write_setting.?(app.ops.ctx, key, value);
+}
+
+fn removeSettingThunk(ctx: *anyopaque, key: []const u8) phantom.SettingsError!void {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    return app.ops.remove_setting.?(app.ops.ctx, key);
+}
+
+fn pickFileThunk(ctx: *anyopaque, options: phantom.FilePickerOptions, sink: phantom.FilePickerSink) bool {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    if (app.file_picker_sink != null) return false;
+    app.file_picker_sink = sink;
+    if (!app.ops.pick_file.?(app.ops.ctx, @intFromPtr(app), options.accept)) {
+        app.file_picker_sink = null;
+        return false;
+    }
+    return true;
+}
+
+fn notificationPermissionThunk(ctx: *anyopaque) phantom.NotificationPermission {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    return app.ops.notification_permission.?(app.ops.ctx);
+}
+
+fn requestNotificationPermissionThunk(ctx: *anyopaque, sink: phantom.NotificationPermissionSink) bool {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    if (app.notification_permission_sink != null) return false;
+    app.notification_permission_sink = sink;
+    if (!app.ops.request_notification_permission.?(app.ops.ctx, @intFromPtr(app))) {
+        app.notification_permission_sink = null;
+        return false;
+    }
+    return true;
+}
+
+fn showNotificationThunk(ctx: *anyopaque, notification: phantom.Notification) bool {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    return app.ops.show_notification.?(app.ops.ctx, notification);
 }
 
 fn readLocationThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
@@ -1070,6 +1133,13 @@ pub fn mount(
         .http = .{ .ptr = app, .vtable = &web_http_vtable },
         .open_event_source = if (has_event_source) openEventSourceThunk else null,
         .close_event_source = if (has_event_source) closeEventSourceThunk else null,
+        .read_setting = if (ops.read_setting != null) readSettingThunk else null,
+        .write_setting = if (ops.write_setting != null) writeSettingThunk else null,
+        .remove_setting = if (ops.remove_setting != null) removeSettingThunk else null,
+        .pick_file = if (ops.pick_file != null) pickFileThunk else null,
+        .notification_permission = if (ops.notification_permission != null) notificationPermissionThunk else null,
+        .request_notification_permission = if (ops.request_notification_permission != null) requestNotificationPermissionThunk else null,
+        .show_notification = if (ops.show_notification != null) showNotificationThunk else null,
         .strategy = strategy,
         .native_scrollbars = true,
     };

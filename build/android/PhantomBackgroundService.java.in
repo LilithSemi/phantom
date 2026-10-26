@@ -1,0 +1,121 @@
+package @PACKAGE@;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Intent;
+import android.content.pm.ServiceInfo;
+import android.os.Build;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import java.nio.charset.StandardCharsets;
+
+/** Hosts an application-supplied Zig module while its Activity is not visible. */
+public final class PhantomBackgroundService extends Service {
+    static { System.loadLibrary("@LIBRARY@"); }
+
+    private static final String CHANNEL_ID = "@CHANNEL_ID@";
+    private static final String CHANNEL_NAME = "@CHANNEL_NAME@";
+    private static final int FOREGROUND_ID = 0x50484e54;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+
+    private static native int nativeBeginServiceFilesDir(int length);
+    private static native void nativeServiceFilesDirByte(int index, int value);
+    private static native int nativeServiceStart();
+    private static native void nativeServiceStop();
+    private static native int nativeServiceRunning();
+    private static native int nativeServiceNotificationLength(int field);
+    private static native int nativeServiceNotificationByte(int field, int index);
+    private static native void nativeServiceClearNotification();
+
+    private final Runnable drain = new Runnable() {
+        @Override public void run() {
+            drainNotification();
+            if (nativeServiceRunning() != 0) handler.postDelayed(this, 100);
+            else stopSelf();
+        }
+    };
+
+    @Override public void onCreate() {
+        super.onCreate();
+        createNotificationChannel();
+        Notification foreground = notification("@FOREGROUND_TITLE@", "@FOREGROUND_BODY@", true);
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(FOREGROUND_ID, foreground, ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST);
+        } else {
+            startForeground(FOREGROUND_ID, foreground);
+        }
+
+        byte[] filesDir = getFilesDir().getAbsolutePath().getBytes(StandardCharsets.UTF_8);
+        if (nativeBeginServiceFilesDir(filesDir.length) == 0) {
+            stopSelf();
+            return;
+        }
+        for (int i = 0; i < filesDir.length; ++i) {
+            nativeServiceFilesDirByte(i, filesDir[i] & 0xff);
+        }
+        if (nativeServiceStart() == 0) {
+            stopSelf();
+            return;
+        }
+        handler.post(drain);
+    }
+
+    @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        return START_STICKY;
+    }
+
+    @Override public void onDestroy() {
+        handler.removeCallbacks(drain);
+        nativeServiceStop();
+        super.onDestroy();
+    }
+
+    @Override public IBinder onBind(Intent intent) { return null; }
+
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT < 26) return;
+        getSystemService(NotificationManager.class).createNotificationChannel(
+                new NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_DEFAULT));
+    }
+
+    private Notification notification(String title, String body, boolean ongoing) {
+        Intent launch = new Intent(this, MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent pending = PendingIntent.getActivity(this, 0, launch,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, CHANNEL_ID)
+                : new Notification.Builder(this);
+        return builder.setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle(title).setContentText(body).setContentIntent(pending)
+                .setOngoing(ongoing).setAutoCancel(!ongoing).build();
+    }
+
+    private String pendingField(int field) {
+        int length = nativeServiceNotificationLength(field);
+        if (length < 0) return null;
+        byte[] bytes = new byte[length];
+        for (int i = 0; i < length; ++i) {
+            int value = nativeServiceNotificationByte(field, i);
+            if (value < 0) return null;
+            bytes[i] = (byte)value;
+        }
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    private void drainNotification() {
+        String id = pendingField(0);
+        if (id == null) return;
+        String title = pendingField(1);
+        String body = pendingField(2);
+        nativeServiceClearNotification();
+        if (title == null || body == null) return;
+        try {
+            getSystemService(NotificationManager.class).notify(id.hashCode(), notification(title, body, false));
+        } catch (SecurityException ignored) {}
+    }
+}

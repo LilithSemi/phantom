@@ -59,9 +59,10 @@ pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.A
         \\const std = @import("std");
         \\const phantom = @import("phantom");
         \\const app = @import("app_root");
+        \\const app_options = @import("app_options");
         \\pub const panic = std.debug.FullPanic(phantom.tui.term.rootPanic);
         \\pub fn main(init: std.process.Init) !void {
-        \\    try phantom.App.run(init, phantom.Root.plain(app.root));
+        \\    try phantom.App.runWithId(init, phantom.Root.plain(app.root), app_options.id);
         \\}
     ;
     const entry = b.addWriteFiles().add("main.zig", entry_src);
@@ -71,6 +72,9 @@ pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.A
     });
     exe.root_module.addImport("phantom", phantom_mod);
     exe.root_module.addImport("app_root", app_mod);
+    const native_options = b.addOptions();
+    native_options.addOption([]const u8, "id", opts.id);
+    exe.root_module.addImport("app_options", native_options.createModule());
 
     const step = b.step(b.fmt("app-{s}", .{opts.id}), b.fmt("Package {s} (native)", .{opts.id}));
     step.dependOn(&b.addInstallArtifact(exe, .{}).step);
@@ -133,7 +137,9 @@ fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod:
     addAppImports(app_mod, phantom_mod, opts.imports);
 
     const android_options = b.addOptions();
-    android_options.addOption([]const u8, "jni_prefix", jniPrefix(b, opts.id));
+    android_options.addOption([]const u8, "jni_prefix", jniPrefix(b, opts.id, "MainActivity"));
+    android_options.addOption([]const u8, "service_jni_prefix", jniPrefix(b, opts.id, "PhantomBackgroundService"));
+    android_options.addOption(bool, "has_background_service", opts.android.background_service != null);
     const root_mod = b.createModule(.{
         .root_source_file = phantom_dep.path("build/android_entry.zig"),
         .target = opts.target,
@@ -142,6 +148,18 @@ fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod:
     root_mod.addImport("phantom", phantom_mod);
     root_mod.addImport("app_root", app_mod);
     root_mod.addImport("android_options", android_options.createModule());
+    if (opts.android.background_service) |service| {
+        if (service.module.import_table.get("phantom") == null) service.module.addImport("phantom", phantom_mod);
+        root_mod.addImport("background_service", service.module);
+    } else {
+        const stub = b.createModule(.{
+            .root_source_file = phantom_dep.path("build/android_service_stub.zig"),
+            .target = opts.target,
+            .optimize = opts.optimize,
+        });
+        stub.addImport("phantom", phantom_mod);
+        root_mod.addImport("background_service", stub);
+    }
 
     const lib = b.addLibrary(.{
         .name = execName(b, opts.id, opts.exec_name),
@@ -164,14 +182,23 @@ fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod:
     lib.setLibCFile(libc);
 
     const library_name = execName(b, opts.id, opts.exec_name);
+    const android_release = opts.optimize != .debug;
     const activity = configureAndroidFile(b, phantom_dep.path("build/android/MainActivity.java.in"), "MainActivity.java", .{
         .PACKAGE = opts.id,
         .LIBRARY = library_name,
+        .CHANNEL_ID = androidStringEscape(b, opts.android.notification_channel_id),
+        .CHANNEL_NAME = androidStringEscape(b, opts.android.notification_channel_name),
+        .START_BACKGROUND_SERVICE = if (opts.android.background_service != null)
+            "        try {\n            Intent service = new Intent(this, PhantomBackgroundService.class);\n            if (Build.VERSION.SDK_INT >= 26) startForegroundService(service);\n            else startService(service);\n        } catch (RuntimeException ignored) {}"
+        else
+            "",
     });
     const android_build = configureAndroidFile(b, phantom_dep.path("build/android/app.build.gradle.kts.in"), "build.gradle.kts", .{
         .APP_ID = opts.id,
         .API_LEVEL = api_level,
         .APP_NAME = androidStringEscape(b, opts.name.default),
+        .ASSEMBLE_TASK = if (android_release) "assembleRelease" else "assembleDebug",
+        .APK_SOURCE = if (android_release) "outputs/apk/release/app-release-unsigned.apk" else "outputs/apk/debug/app-debug.apk",
     });
     const android_manifest = androidManifest(b, opts.android);
 
@@ -184,12 +211,23 @@ fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod:
     _ = project.addCopyFile(android_build, "app/build.gradle.kts");
     _ = project.addCopyFile(android_manifest, "app/src/main/AndroidManifest.xml");
     _ = project.addCopyFile(activity, "app/src/main/java/MainActivity.java");
+    if (opts.android.background_service) |service| {
+        const java_service = configureAndroidFile(b, phantom_dep.path("build/android/PhantomBackgroundService.java.in"), "PhantomBackgroundService.java", .{
+            .PACKAGE = opts.id,
+            .LIBRARY = library_name,
+            .CHANNEL_ID = androidStringEscape(b, opts.android.notification_channel_id),
+            .CHANNEL_NAME = androidStringEscape(b, opts.android.notification_channel_name),
+            .FOREGROUND_TITLE = androidStringEscape(b, service.notification_title),
+            .FOREGROUND_BODY = androidStringEscape(b, service.notification_body),
+        });
+        _ = project.addCopyFile(java_service, "app/src/main/java/PhantomBackgroundService.java");
+    }
     _ = project.addCopyFile(lib.getEmittedBin(), b.fmt("app/src/main/jniLibs/{s}/lib{s}.so", .{ abi, library_name }));
 
     const gradle_exe = b.option([]const u8, "android-gradle", "Gradle executable used to package Android APKs") orelse "gradle";
     const gradle = b.addSystemCommand(&.{ gradle_exe, "--no-daemon", "phantomApk" });
     gradle.setCwd(project.getDirectory());
-    const apk_name = b.fmt("{s}-debug.apk", .{library_name});
+    const apk_name = b.fmt("{s}-{s}.apk", .{ library_name, if (android_release) "release" else "debug" });
     const apk = gradle.addOutputFileArg2(apk_name, .{ .prefix = "-PphantomOutput=", .make_absolute = true });
 
     const install_apk = b.addInstallFile(apk, b.fmt("bin/{s}", .{apk_name}));
@@ -233,13 +271,22 @@ fn androidStringEscape(b: *std.Build, value: []const u8) []const u8 {
     return out.toOwnedSlice(b.allocator) catch @panic("oom");
 }
 
-fn androidPermissionsXml(b: *std.Build, permissions: []const appmeta.AndroidOptions.Permission) []const u8 {
+fn androidPermissionsXml(b: *std.Build, options: appmeta.AndroidOptions) []const u8 {
     var out: std.ArrayList(u8) = .empty;
-    for (permissions) |permission| {
+    for (options.permissions) |permission| {
         const line = std.fmt.allocPrint(
             b.allocator,
             "    <uses-permission android:name=\"{s}\" />\n",
             .{permission.manifestName()},
+        ) catch @panic("oom");
+        out.appendSlice(b.allocator, line) catch @panic("oom");
+    }
+    if (options.background_service) |service| {
+        out.appendSlice(b.allocator, "    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE\" />\n") catch @panic("oom");
+        const line = std.fmt.allocPrint(
+            b.allocator,
+            "    <uses-permission android:name=\"{s}\" />\n",
+            .{service.service_type.permissionName()},
         ) catch @panic("oom");
         out.appendSlice(b.allocator, line) catch @panic("oom");
     }
@@ -252,19 +299,44 @@ fn androidManifest(b: *std.Build, options: appmeta.AndroidOptions) std.Build.Laz
         b.allocator,
         @embedFile("build/android/AndroidManifest.xml"),
         "@PERMISSIONS@",
-        androidPermissionsXml(b, options.permissions),
+        androidPermissionsXml(b, options),
     ) catch @panic("oom");
-    const text = std.mem.replaceOwned(
+    const with_transport = std.mem.replaceOwned(
         u8,
         b.allocator,
         with_permissions,
         "@USES_CLEARTEXT_TRAFFIC@",
         if (options.uses_cleartext_traffic) "true" else "false",
     ) catch @panic("oom");
+    const service_xml = androidBackgroundServiceXml(b, options);
+    const text = std.mem.replaceOwned(
+        u8,
+        b.allocator,
+        with_transport,
+        "@BACKGROUND_SERVICE@",
+        service_xml,
+    ) catch @panic("oom");
     return b.addWriteFiles().add("AndroidManifest.xml", text);
 }
 
-fn jniPrefix(b: *std.Build, app_id: []const u8) []const u8 {
+fn androidBackgroundServiceXml(b: *std.Build, options: appmeta.AndroidOptions) []const u8 {
+    const service = options.background_service orelse return "";
+    const property = if (service.service_type == .special_use)
+        std.fmt.allocPrint(
+            b.allocator,
+            "\n            <property android:name=\"android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE\" android:value=\"{s}\" />\n        ",
+            .{appmeta.xmlEscape(b.allocator, service.special_use_subtype) catch @panic("oom")},
+        ) catch @panic("oom")
+    else
+        "";
+    return std.fmt.allocPrint(
+        b.allocator,
+        "        <service android:name=\".PhantomBackgroundService\" android:exported=\"false\" android:foregroundServiceType=\"{s}\">{s}</service>",
+        .{ service.service_type.manifestName(), property },
+    ) catch @panic("oom");
+}
+
+fn jniPrefix(b: *std.Build, app_id: []const u8, class_name: []const u8) []const u8 {
     var out: std.ArrayList(u8) = .empty;
     out.appendSlice(b.allocator, "Java_") catch @panic("oom");
     for (app_id) |char| switch (char) {
@@ -272,7 +344,9 @@ fn jniPrefix(b: *std.Build, app_id: []const u8) []const u8 {
         '_' => out.appendSlice(b.allocator, "_1") catch @panic("oom"),
         else => out.append(b.allocator, char) catch @panic("oom"),
     };
-    out.appendSlice(b.allocator, "_MainActivity_") catch @panic("oom");
+    out.append(b.allocator, '_') catch @panic("oom");
+    out.appendSlice(b.allocator, class_name) catch @panic("oom");
+    out.append(b.allocator, '_') catch @panic("oom");
     return out.toOwnedSlice(b.allocator) catch @panic("oom");
 }
 
@@ -427,6 +501,7 @@ pub fn addWebDist(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appme
     const entry_options = b.addOptions();
     entry_options.addOption(bool, "strategy_is_hash", opts.url_strategy == .hash);
     entry_options.addOption([]const u8, "base_path", opts.base_path);
+    entry_options.addOption([]const u8, "app_id", opts.id);
 
     const wasm = b.addExecutable(.{
         .name = wasm_name,

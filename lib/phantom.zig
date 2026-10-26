@@ -212,6 +212,14 @@ pub const OpenMode = platform.OpenMode;
 pub const ServerEvent = platform.ServerEvent;
 pub const ServerEventSink = platform.ServerEventSink;
 pub const EventSource = platform.EventSource;
+pub const SettingsError = platform.SettingsError;
+pub const PickedFile = platform.PickedFile;
+pub const FilePickerResult = platform.FilePickerResult;
+pub const FilePickerOptions = platform.FilePickerOptions;
+pub const FilePickerSink = platform.FilePickerSink;
+pub const Notification = platform.Notification;
+pub const NotificationPermission = platform.NotificationPermission;
+pub const NotificationPermissionSink = platform.NotificationPermissionSink;
 pub const link_widget = @import("phantom/widgets/link.zig");
 pub const Link = link_widget.Link;
 

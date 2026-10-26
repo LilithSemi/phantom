@@ -114,6 +114,13 @@ pub const DomOps = struct {
     /// when the browser refuses the URL.
     open_event_source: ?*const fn (ctx: *anyopaque, id: u32, url: []const u8, types: []const u8) bool = null,
     close_event_source: ?*const fn (ctx: *anyopaque, id: u32) void = null,
+    read_setting: ?*const fn (ctx: *anyopaque, key: []const u8, buf: []u8) platform.SettingsError!?[]const u8 = null,
+    write_setting: ?*const fn (ctx: *anyopaque, key: []const u8, value: []const u8) platform.SettingsError!void = null,
+    remove_setting: ?*const fn (ctx: *anyopaque, key: []const u8) platform.SettingsError!void = null,
+    pick_file: ?*const fn (ctx: *anyopaque, app: usize, accept: []const u8) bool = null,
+    notification_permission: ?*const fn (ctx: *anyopaque) platform.NotificationPermission = null,
+    request_notification_permission: ?*const fn (ctx: *anyopaque, app: usize) bool = null,
+    show_notification: ?*const fn (ctx: *anyopaque, notification: platform.Notification) bool = null,
     /// Puts `path` in the address bar without loading a new page, in `mode`.
     write_location: ?*const fn (ctx: *anyopaque, path: []const u8, mode: platform.WriteMode) void = null,
     /// Reads a scroll region's current offset (scrollLeft/scrollTop) from the

@@ -72,6 +72,55 @@ pub const ServerEventSink = struct {
 /// An open server-sent event stream. Close it with `Platform.closeEventSource`.
 pub const EventSource = struct { id: u32 };
 
+/// Failures common to the small persistent key/value store exposed by each
+/// host. Values are opaque bytes; applications can put ZON (or any other
+/// encoding) inside them without the platform layer interpreting it.
+pub const SettingsError = error{
+    Unsupported,
+    InvalidKey,
+    BufferTooSmall,
+    StorageFailure,
+};
+
+/// A file selected by a person. All slices are borrowed and valid only for the
+/// duration of `FilePickerSink.on_result`; copy anything retained afterwards.
+pub const PickedFile = struct {
+    name: []const u8,
+    media_type: []const u8 = "application/octet-stream",
+    bytes: []const u8,
+};
+
+pub const FilePickerResult = union(enum) {
+    selected: PickedFile,
+    cancelled,
+    failed,
+};
+
+pub const FilePickerOptions = struct {
+    /// Comma-separated MIME types and extensions, using the HTML `accept`
+    /// grammar (for example `image/*,.svg`). Native hosts translate it.
+    accept: []const u8 = "",
+};
+
+pub const FilePickerSink = struct {
+    ctx: *anyopaque,
+    on_result: *const fn (ctx: *anyopaque, result: FilePickerResult) void,
+};
+
+pub const Notification = struct {
+    /// Stable application-defined id. Reusing it replaces the prior notice.
+    id: []const u8,
+    title: []const u8,
+    body: []const u8,
+};
+
+pub const NotificationPermission = enum { granted, denied, prompt, unsupported };
+
+pub const NotificationPermissionSink = struct {
+    ctx: *anyopaque,
+    on_result: *const fn (ctx: *anyopaque, result: NotificationPermission) void,
+};
+
 pub const Platform = struct {
     ctx: ?*anyopaque = null,
     /// The HTTP client of a backend that has its own, such as the page `fetch`
@@ -114,6 +163,18 @@ pub const Platform = struct {
     /// True when the host draws its own scrollbars, as a browser does. Scroll
     /// views then draw none.
     native_scrollbars: bool = false,
+    /// Persistent application settings. Keys are portable path components:
+    /// non-empty UTF-8 without '/', '\\', NUL, or `..`. A read returns null
+    /// when the key has never been written and `BufferTooSmall` rather than a
+    /// truncated value. Linux stores these in an XDG ZON file; browser and
+    /// Android hosts map them to their platform stores.
+    read_setting: ?*const fn (*anyopaque, key: []const u8, buf: []u8) SettingsError!?[]const u8 = null,
+    write_setting: ?*const fn (*anyopaque, key: []const u8, value: []const u8) SettingsError!void = null,
+    remove_setting: ?*const fn (*anyopaque, key: []const u8) SettingsError!void = null,
+    pick_file: ?*const fn (*anyopaque, FilePickerOptions, FilePickerSink) bool = null,
+    notification_permission: ?*const fn (*anyopaque) NotificationPermission = null,
+    request_notification_permission: ?*const fn (*anyopaque, NotificationPermissionSink) bool = null,
+    show_notification: ?*const fn (*anyopaque, Notification) bool = null,
 
     /// True when the URL was opened. False means NOTHING HAPPENED, and a caller
     /// should say so: no hook on this backend, or a browser that refused the
@@ -181,11 +242,89 @@ pub const Platform = struct {
         const c = self.ctx orelse return;
         f(c, source);
     }
+
+    pub fn readSetting(self: Platform, key: []const u8, buf: []u8) SettingsError!?[]const u8 {
+        const f = self.read_setting orelse return error.Unsupported;
+        const c = self.ctx orelse return error.Unsupported;
+        return f(c, key, buf);
+    }
+
+    pub fn writeSetting(self: Platform, key: []const u8, value: []const u8) SettingsError!void {
+        const f = self.write_setting orelse return error.Unsupported;
+        const c = self.ctx orelse return error.Unsupported;
+        return f(c, key, value);
+    }
+
+    pub fn removeSetting(self: Platform, key: []const u8) SettingsError!void {
+        const f = self.remove_setting orelse return error.Unsupported;
+        const c = self.ctx orelse return error.Unsupported;
+        return f(c, key);
+    }
+
+    pub fn pickFile(self: Platform, options: FilePickerOptions, sink: FilePickerSink) bool {
+        const f = self.pick_file orelse return false;
+        const c = self.ctx orelse return false;
+        return f(c, options, sink);
+    }
+
+    pub fn notificationPermission(self: Platform) NotificationPermission {
+        const f = self.notification_permission orelse return .unsupported;
+        const c = self.ctx orelse return .unsupported;
+        return f(c);
+    }
+
+    pub fn requestNotificationPermission(self: Platform, sink: NotificationPermissionSink) bool {
+        const f = self.request_notification_permission orelse return false;
+        const c = self.ctx orelse return false;
+        return f(c, sink);
+    }
+
+    pub fn showNotification(self: Platform, notification: Notification) bool {
+        const f = self.show_notification orelse return false;
+        const c = self.ctx orelse return false;
+        return f(c, notification);
+    }
 };
+
+pub fn validSettingKey(key: []const u8) bool {
+    if (key.len == 0 or std.mem.eql(u8, key, ".") or std.mem.eql(u8, key, "..")) return false;
+    return std.mem.indexOfAny(u8, key, "/\\\x00") == null and std.unicode.utf8ValidateSlice(key);
+}
 
 test "an empty platform opens nothing and reports that it did not" {
     const p = Platform{};
     try std.testing.expect(!p.openUrl("https://example.com", .new_tab));
+}
+
+test "an empty platform reports settings as unsupported" {
+    const p = Platform{};
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(error.Unsupported, p.readSetting("theme", &buf));
+    try std.testing.expectError(error.Unsupported, p.writeSetting("theme", "dark"));
+    try std.testing.expectError(error.Unsupported, p.removeSetting("theme"));
+}
+
+test "an empty platform reports interactive services as unsupported" {
+    const Sink = struct {
+        fn file(_: *anyopaque, _: FilePickerResult) void {}
+        fn permission(_: *anyopaque, _: NotificationPermission) void {}
+    };
+    var context: u8 = 0;
+    const p = Platform{};
+    try std.testing.expect(!p.pickFile(.{}, .{ .ctx = &context, .on_result = Sink.file }));
+    try std.testing.expectEqual(NotificationPermission.unsupported, p.notificationPermission());
+    try std.testing.expect(!p.requestNotificationPermission(.{ .ctx = &context, .on_result = Sink.permission }));
+    try std.testing.expect(!p.showNotification(.{ .id = "id", .title = "title", .body = "body" }));
+}
+
+test "portable setting keys reject paths and malformed UTF-8" {
+    try std.testing.expect(validSettingKey("theme.mode"));
+    try std.testing.expect(validSettingKey("文字"));
+    try std.testing.expect(!validSettingKey(""));
+    try std.testing.expect(!validSettingKey("../secret"));
+    try std.testing.expect(!validSettingKey("a/b"));
+    try std.testing.expect(!validSettingKey("a\\b"));
+    try std.testing.expect(!validSettingKey(&.{0xff}));
 }
 
 test "openUrl passes the url and the mode through, and answers what the hook answered" {

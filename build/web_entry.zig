@@ -25,6 +25,7 @@ const app_root = @import("app_root");
 const strategy_is_hash = @import("build_options").strategy_is_hash;
 /// The path the site is served at, from `base_path` of `addApp`.
 const base_path = @import("build_options").base_path;
+const app_id = @import("build_options").app_id;
 
 const DomCtx = struct { doc: u32, window: u32 };
 var dom_ctx: DomCtx = undefined;
@@ -174,6 +175,13 @@ fn release(ctx: *anyopaque, node: u32) void {
 extern "phantom" fn __phantom_set_style(node: u32, ptr: [*]const u8, len: usize) void;
 extern "phantom" fn __phantom_add_rule(ptr: [*]const u8, len: usize) void;
 extern "phantom" fn __phantom_add_font(fam_ptr: [*]const u8, fam_len: usize, src_ptr: [*]const u8, src_len: usize) void;
+extern "phantom" fn __phantom_setting_read(app_ptr: [*]const u8, app_len: usize, key_ptr: [*]const u8, key_len: usize, out_ptr: [*]u8, out_len: usize) i32;
+extern "phantom" fn __phantom_setting_write(app_ptr: [*]const u8, app_len: usize, key_ptr: [*]const u8, key_len: usize, value_ptr: [*]const u8, value_len: usize) u32;
+extern "phantom" fn __phantom_setting_remove(app_ptr: [*]const u8, app_len: usize, key_ptr: [*]const u8, key_len: usize) u32;
+extern "phantom" fn __phantom_pick_file(app: usize, accept_ptr: [*]const u8, accept_len: usize) u32;
+extern "phantom" fn __phantom_notification_permission() u32;
+extern "phantom" fn __phantom_notification_permission_request(app: usize) u32;
+extern "phantom" fn __phantom_notification_show(id_ptr: [*]const u8, id_len: usize, title_ptr: [*]const u8, title_len: usize, body_ptr: [*]const u8, body_len: usize) u32;
 
 fn setStyle(ctx: *anyopaque, node: u32, decl: []const u8) void {
     _ = ctx;
@@ -190,6 +198,54 @@ fn addFont(ctx: *anyopaque, family: []const u8, src: []const u8) void {
     _ = ctx;
     if (family.len == 0 or src.len == 0) return;
     __phantom_add_font(family.ptr, family.len, src.ptr, src.len);
+}
+
+fn readSetting(ctx: *anyopaque, key: []const u8, buf: []u8) phantom.SettingsError!?[]const u8 {
+    _ = ctx;
+    if (!phantom.platform.validSettingKey(key)) return error.InvalidKey;
+    const result = __phantom_setting_read(app_id.ptr, app_id.len, key.ptr, key.len, buf.ptr, buf.len);
+    if (result == -1) return null;
+    if (result == -2) return error.BufferTooSmall;
+    if (result < 0) return error.StorageFailure;
+    return buf[0..@intCast(result)];
+}
+
+fn writeSetting(ctx: *anyopaque, key: []const u8, value: []const u8) phantom.SettingsError!void {
+    _ = ctx;
+    if (!phantom.platform.validSettingKey(key)) return error.InvalidKey;
+    if (__phantom_setting_write(app_id.ptr, app_id.len, key.ptr, key.len, value.ptr, value.len) == 0) return error.StorageFailure;
+}
+
+fn removeSetting(ctx: *anyopaque, key: []const u8) phantom.SettingsError!void {
+    _ = ctx;
+    if (!phantom.platform.validSettingKey(key)) return error.InvalidKey;
+    if (__phantom_setting_remove(app_id.ptr, app_id.len, key.ptr, key.len) == 0) return error.StorageFailure;
+}
+
+fn pickFile(ctx: *anyopaque, app: usize, accept: []const u8) bool {
+    _ = ctx;
+    return __phantom_pick_file(app, accept.ptr, accept.len) != 0;
+}
+
+fn permissionFromInt(value: u32) phantom.NotificationPermission {
+    return switch (value) {
+        0 => .granted,
+        1 => .denied,
+        2 => .prompt,
+        else => .unsupported,
+    };
+}
+
+fn notificationPermission(_: *anyopaque) phantom.NotificationPermission {
+    return permissionFromInt(__phantom_notification_permission());
+}
+
+fn requestNotificationPermission(_: *anyopaque, app: usize) bool {
+    return __phantom_notification_permission_request(app) != 0;
+}
+
+fn showNotification(_: *anyopaque, notification: phantom.Notification) bool {
+    return __phantom_notification_show(notification.id.ptr, notification.id.len, notification.title.ptr, notification.title.len, notification.body.ptr, notification.body.len) != 0;
 }
 fn appendChild(ctx: *anyopaque, parent: u32, child: u32) void {
     _ = ctx;
@@ -485,6 +541,13 @@ export fn init(doc_handle: u32, body_handle: u32, window_handle: u32, root_font:
         .http_send = httpSend,
         .open_event_source = openEventSource,
         .close_event_source = closeEventSource,
+        .read_setting = readSetting,
+        .write_setting = writeSetting,
+        .remove_setting = removeSetting,
+        .pick_file = pickFile,
+        .notification_permission = notificationPermission,
+        .request_notification_permission = requestNotificationPermission,
+        .show_notification = showNotification,
         .release = release,
         .remove_child = removeChild,
         .insert_before = insertBefore,
@@ -532,6 +595,29 @@ export fn locationChanged(app: usize) void {
     if (app == 0) return;
     const a: *phantom.web.WebApp = @ptrFromInt(app);
     a.locationChanged();
+}
+
+/// `kind`: 0 selected, 1 cancelled, anything else failed. JS allocated all
+/// three buffers from wasm and frees them after this borrowed callback returns.
+export fn filePicked(app: usize, kind: u32, name_ptr: u32, name_len: u32, type_ptr: u32, type_len: u32, data_ptr: u32, data_len: u32) void {
+    if (app == 0) return;
+    const a: *phantom.web.WebApp = @ptrFromInt(app);
+    const result: phantom.FilePickerResult = switch (kind) {
+        0 => .{ .selected = .{
+            .name = rawSlice(name_ptr, name_len),
+            .media_type = rawSlice(type_ptr, type_len),
+            .bytes = rawSlice(data_ptr, data_len),
+        } },
+        1 => .cancelled,
+        else => .failed,
+    };
+    a.filePicked(result);
+}
+
+export fn notificationPermissionResult(app: usize, result: u32) void {
+    if (app == 0) return;
+    const a: *phantom.web.WebApp = @ptrFromInt(app);
+    a.notificationPermissionResult(permissionFromInt(result));
 }
 
 // The keyboard. A wasm export carries numbers only, so the page packs the

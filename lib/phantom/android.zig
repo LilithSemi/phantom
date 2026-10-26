@@ -3,6 +3,7 @@
 const std = @import("std");
 const phantom = @import("../phantom.zig");
 const lattice = @import("lattice");
+const Settings = @import("platform/zon_settings.zig").Store;
 
 const OpenUrlRequest = struct {
     bytes: std.ArrayList(u8) = .empty,
@@ -28,6 +29,143 @@ const OpenUrlRequest = struct {
     }
 };
 
+const NotificationRequest = struct {
+    id: std.ArrayList(u8) = .empty,
+    title: std.ArrayList(u8) = .empty,
+    body: std.ArrayList(u8) = .empty,
+    pending: bool = false,
+
+    fn deinit(self: *NotificationRequest, gpa: std.mem.Allocator) void {
+        self.id.deinit(gpa);
+        self.title.deinit(gpa);
+        self.body.deinit(gpa);
+    }
+
+    fn queue(self: *NotificationRequest, gpa: std.mem.Allocator, value: phantom.Notification) bool {
+        self.pending = false;
+        self.id.clearRetainingCapacity();
+        self.title.clearRetainingCapacity();
+        self.body.clearRetainingCapacity();
+        self.id.appendSlice(gpa, value.id) catch return false;
+        self.title.appendSlice(gpa, value.title) catch return false;
+        self.body.appendSlice(gpa, value.body) catch return false;
+        self.pending = true;
+        return true;
+    }
+};
+
+const FilePickerRequest = struct {
+    accept: std.ArrayList(u8) = .empty,
+    sink: ?phantom.FilePickerSink = null,
+    pending: bool = false,
+    name: std.ArrayList(u8) = .empty,
+    media_type: std.ArrayList(u8) = .empty,
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *FilePickerRequest, gpa: std.mem.Allocator) void {
+        self.accept.deinit(gpa);
+        self.name.deinit(gpa);
+        self.media_type.deinit(gpa);
+        self.bytes.deinit(gpa);
+    }
+};
+
+/// Runtime passed to an application-supplied Android background-service
+/// module. The module's `run` function executes on a dedicated thread and must
+/// return after `shouldStop` becomes true. Blocking implementations may also
+/// export `stop(*BackgroundService)`, which Phantom calls before joining the
+/// worker so the module can close a socket or otherwise wake `run`.
+pub const BackgroundService = struct {
+    gpa: std.mem.Allocator,
+    threaded: std.Io.Threaded,
+    files_dir: []u8,
+    stopping: std.atomic.Value(bool) = .init(false),
+    notification_mutex: std.Io.Mutex = .init,
+    notification_request: NotificationRequest = .{},
+
+    pub fn create(gpa: std.mem.Allocator, files_dir: []const u8) !*BackgroundService {
+        const self = try gpa.create(BackgroundService);
+        errdefer gpa.destroy(self);
+        const owned_files_dir = try gpa.dupe(u8, files_dir);
+        errdefer gpa.free(owned_files_dir);
+        self.* = .{
+            .gpa = gpa,
+            .threaded = std.Io.Threaded.init(gpa, .{}),
+            .files_dir = owned_files_dir,
+        };
+        return self;
+    }
+
+    pub fn destroy(self: *BackgroundService) void {
+        self.notification_request.deinit(self.gpa);
+        self.threaded.deinit();
+        self.gpa.free(self.files_dir);
+        const gpa = self.gpa;
+        gpa.destroy(self);
+    }
+
+    pub fn allocator(self: *BackgroundService) std.mem.Allocator {
+        return self.gpa;
+    }
+
+    pub fn io(self: *BackgroundService) std.Io {
+        return self.threaded.io();
+    }
+
+    pub fn filesDir(self: *const BackgroundService) []const u8 {
+        return self.files_dir;
+    }
+
+    pub fn shouldStop(self: *const BackgroundService) bool {
+        return self.stopping.load(.acquire);
+    }
+
+    pub fn requestStop(self: *BackgroundService) void {
+        self.stopping.store(true, .release);
+    }
+
+    /// Queues one Android notification. False means the Java host has not yet
+    /// consumed the previous one; callers can retry without losing ownership
+    /// of any slices passed here.
+    pub fn showNotification(self: *BackgroundService, notification: phantom.Notification) bool {
+        self.notification_mutex.lockUncancelable(self.threaded.io());
+        defer self.notification_mutex.unlock(self.threaded.io());
+        if (self.notification_request.pending) return false;
+        return self.notification_request.queue(self.gpa, notification);
+    }
+
+    pub fn pendingNotificationLength(self: *BackgroundService, field: u32) ?usize {
+        self.notification_mutex.lockUncancelable(self.threaded.io());
+        defer self.notification_mutex.unlock(self.threaded.io());
+        if (!self.notification_request.pending) return null;
+        return switch (field) {
+            0 => self.notification_request.id.items.len,
+            1 => self.notification_request.title.items.len,
+            2 => self.notification_request.body.items.len,
+            else => null,
+        };
+    }
+
+    pub fn pendingNotificationByte(self: *BackgroundService, field: u32, index: usize) ?u8 {
+        self.notification_mutex.lockUncancelable(self.threaded.io());
+        defer self.notification_mutex.unlock(self.threaded.io());
+        if (!self.notification_request.pending) return null;
+        const bytes = switch (field) {
+            0 => self.notification_request.id.items,
+            1 => self.notification_request.title.items,
+            2 => self.notification_request.body.items,
+            else => return null,
+        };
+        return if (index < bytes.len) bytes[index] else null;
+    }
+
+    pub fn clearPendingNotification(self: *BackgroundService) void {
+        self.notification_mutex.lockUncancelable(self.threaded.io());
+        defer self.notification_mutex.unlock(self.threaded.io());
+        self.notification_request.pending = false;
+    }
+};
+
 pub const Session = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -38,6 +176,7 @@ pub const Session = struct {
     el: *phantom.Element,
     canvas: phantom.Canvas,
     threaded: std.Io.Threaded,
+    settings: Settings,
     host: *lattice.backends.Android,
     surface: lattice.Surface,
     renderer: phantom.backend.PrismBackend,
@@ -48,6 +187,11 @@ pub const Session = struct {
     touch_scroll: phantom.input.TouchScrollRecognizer = .{},
     preedit_buffer: std.ArrayList(u8) = .empty,
     open_url_request: OpenUrlRequest = .{},
+    notification_request: NotificationRequest = .{},
+    notification_permission: phantom.NotificationPermission,
+    notification_permission_sink: ?phantom.NotificationPermissionSink = null,
+    notification_permission_request: bool = false,
+    file_picker_request: FilePickerRequest = .{},
 
     pub fn create(
         gpa: std.mem.Allocator,
@@ -57,6 +201,8 @@ pub const Session = struct {
         density: f32,
         text_scale: f32,
         system_insets: phantom.PhysicalEdgeInsets,
+        files_dir: []const u8,
+        notification_permission: phantom.NotificationPermission,
     ) !*Session {
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
@@ -75,11 +221,30 @@ pub const Session = struct {
         self.threaded = std.Io.Threaded.init(gpa, .{});
         errdefer self.threaded.deinit();
         self.owner.io = self.threaded.io();
-        self.owner.platform = .{ .ctx = self, .open_url = queueOpenUrl };
+        const settings_path = try std.fs.path.join(gpa, &.{ files_dir, "settings.zon" });
+        defer gpa.free(settings_path);
+        self.settings = try Settings.initPath(gpa, self.threaded.io(), settings_path);
+        errdefer self.settings.deinit();
+        self.owner.platform = .{
+            .ctx = self,
+            .open_url = queueOpenUrl,
+            .read_setting = readSetting,
+            .write_setting = writeSetting,
+            .remove_setting = removeSetting,
+            .notification_permission = getNotificationPermission,
+            .request_notification_permission = requestNotificationPermission,
+            .show_notification = showNotification,
+            .pick_file = pickFile,
+        };
         self.scale = validDensity(density);
         self.text_scale = validTextScale(text_scale);
         self.preedit_buffer = .empty;
         self.open_url_request = .{};
+        self.notification_request = .{};
+        self.notification_permission = notification_permission;
+        self.notification_permission_sink = null;
+        self.notification_permission_request = false;
+        self.file_picker_request = .{};
 
         _ = try phantom.View.open(&self.owner, .{
             .title = "Android",
@@ -125,8 +290,11 @@ pub const Session = struct {
         self.owner.deinit();
         self.arena.deinit();
         self.threaded.deinit();
+        self.settings.deinit();
         self.preedit_buffer.deinit(self.gpa);
         self.open_url_request.deinit(self.gpa);
+        self.notification_request.deinit(self.gpa);
+        self.file_picker_request.deinit(self.gpa);
         const gpa = self.gpa;
         gpa.destroy(self);
     }
@@ -266,6 +434,90 @@ pub const Session = struct {
         self.open_url_request.clear();
     }
 
+    pub fn pendingNotificationLength(self: *const Session, field: u32) ?usize {
+        if (!self.notification_request.pending) return null;
+        return switch (field) {
+            0 => self.notification_request.id.items.len,
+            1 => self.notification_request.title.items.len,
+            2 => self.notification_request.body.items.len,
+            else => null,
+        };
+    }
+
+    pub fn pendingNotificationByte(self: *const Session, field: u32, index: usize) ?u8 {
+        const bytes = switch (field) {
+            0 => self.notification_request.id.items,
+            1 => self.notification_request.title.items,
+            2 => self.notification_request.body.items,
+            else => return null,
+        };
+        if (!self.notification_request.pending or index >= bytes.len) return null;
+        return bytes[index];
+    }
+
+    pub fn clearPendingNotification(self: *Session) void {
+        self.notification_request.pending = false;
+    }
+
+    pub fn takeNotificationPermissionRequest(self: *Session) bool {
+        const pending = self.notification_permission_request;
+        self.notification_permission_request = false;
+        return pending;
+    }
+
+    pub fn setNotificationPermission(self: *Session, permission: phantom.NotificationPermission) void {
+        self.notification_permission = permission;
+        if (self.notification_permission_sink) |sink| {
+            self.notification_permission_sink = null;
+            sink.on_result(sink.ctx, permission);
+        }
+    }
+
+    pub fn pendingFilePickerLength(self: *const Session) ?usize {
+        if (!self.file_picker_request.pending) return null;
+        return self.file_picker_request.accept.items.len;
+    }
+
+    pub fn pendingFilePickerByte(self: *const Session, index: usize) ?u8 {
+        if (!self.file_picker_request.pending or index >= self.file_picker_request.accept.items.len) return null;
+        return self.file_picker_request.accept.items[index];
+    }
+
+    pub fn startFilePicker(self: *Session) void {
+        self.file_picker_request.pending = false;
+    }
+
+    pub fn beginFilePickerResult(self: *Session, name_len: usize, type_len: usize, data_len: usize) !void {
+        try self.file_picker_request.name.resize(self.gpa, name_len);
+        try self.file_picker_request.media_type.resize(self.gpa, type_len);
+        try self.file_picker_request.bytes.resize(self.gpa, data_len);
+    }
+
+    pub fn setFilePickerResultByte(self: *Session, field: u32, index: usize, value: u8) void {
+        const bytes = switch (field) {
+            0 => self.file_picker_request.name.items,
+            1 => self.file_picker_request.media_type.items,
+            2 => self.file_picker_request.bytes.items,
+            else => return,
+        };
+        if (index < bytes.len) bytes[index] = value;
+    }
+
+    pub fn finishFilePicker(self: *Session, kind: u32) void {
+        const sink = self.file_picker_request.sink orelse return;
+        self.file_picker_request.sink = null;
+        const result: phantom.FilePickerResult = switch (kind) {
+            0 => .{ .selected = .{
+                .name = self.file_picker_request.name.items,
+                .media_type = self.file_picker_request.media_type.items,
+                .bytes = self.file_picker_request.bytes.items,
+            } },
+            1 => .cancelled,
+            else => .failed,
+        };
+        sink.on_result(sink.ctx, result);
+    }
+
     fn drainEvents(self: *Session) !void {
         try self.host.backend().pump(0, handleEvent, self);
     }
@@ -372,6 +624,54 @@ pub const Session = struct {
 fn queueOpenUrl(ctx: *anyopaque, url: []const u8, mode: phantom.OpenMode) bool {
     const self: *Session = @ptrCast(@alignCast(ctx));
     return self.open_url_request.queue(self.gpa, url, mode);
+}
+
+fn readSetting(ctx: *anyopaque, key: []const u8, buf: []u8) phantom.SettingsError!?[]const u8 {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    return self.settings.read(key, buf);
+}
+
+fn writeSetting(ctx: *anyopaque, key: []const u8, value: []const u8) phantom.SettingsError!void {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    return self.settings.write(key, value);
+}
+
+fn removeSetting(ctx: *anyopaque, key: []const u8) phantom.SettingsError!void {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    return self.settings.remove(key);
+}
+
+fn getNotificationPermission(ctx: *anyopaque) phantom.NotificationPermission {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    return self.notification_permission;
+}
+
+fn requestNotificationPermission(ctx: *anyopaque, sink: phantom.NotificationPermissionSink) bool {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    if (self.notification_permission != .prompt) {
+        sink.on_result(sink.ctx, self.notification_permission);
+        return true;
+    }
+    if (self.notification_permission_sink != null) return false;
+    self.notification_permission_sink = sink;
+    self.notification_permission_request = true;
+    return true;
+}
+
+fn showNotification(ctx: *anyopaque, notification: phantom.Notification) bool {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    if (self.notification_permission != .granted or self.notification_request.pending) return false;
+    return self.notification_request.queue(self.gpa, notification);
+}
+
+fn pickFile(ctx: *anyopaque, options: phantom.FilePickerOptions, sink: phantom.FilePickerSink) bool {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    if (self.file_picker_request.sink != null) return false;
+    self.file_picker_request.accept.clearRetainingCapacity();
+    self.file_picker_request.accept.appendSlice(self.gpa, options.accept) catch return false;
+    self.file_picker_request.sink = sink;
+    self.file_picker_request.pending = true;
+    return true;
 }
 
 fn touchPoint(touch: lattice.event.TouchPoint) phantom.PhysicalOffset {

@@ -96,6 +96,11 @@ pub const App = struct {
     /// terminal on stdout gives the terminal path, and neither is a runtime fault:
     /// it fails loudly instead of drawing nothing and leaving the person to guess why.
     pub fn run(init: std.process.Init, root: phantom.Root) !void {
+        return runWithId(init, root, "phantom");
+    }
+
+    /// Run with the stable application id used by platform services.
+    pub fn runWithId(init: std.process.Init, root: phantom.Root, app_id: []const u8) !void {
         // The terminal backend draws every frame to stdout (see Term.out in
         // lib/phantom/tui/term.zig), so stdout is the fd that decides whether the
         // terminal path can work. A terminal on stderr with stdout piped elsewhere
@@ -110,7 +115,7 @@ pub const App = struct {
         // the only honest way to know a window is possible, so the answer comes
         // with the thing itself, and dropping it here would mean connecting a
         // second time for something already in hand.
-        const opts = phantom.window.Options{};
+        const opts = phantom.window.Options{ .app_id = app_id };
         var opened = phantom.window.open(init.gpa, init.io, init.environ_map, opts);
         // Whatever this function does next, an unused window is given back. Every
         // path that takes it over clears this first, so it is closed once or not
@@ -126,7 +131,7 @@ pub const App = struct {
                 opened = null;
                 return phantom.window.App.runOn(init, win, root, opts);
             },
-            .tui => return phantom.Tui.run(init, root, .{}),
+            .tui => return phantom.Tui.run(init, root, .{ .app_id = app_id }),
             .none => {
                 // A clear message, because "it did nothing" is the worst outcome here.
                 var buf: [256]u8 = undefined;

@@ -18,12 +18,12 @@ android {
 
 val phantomOutput = providers.gradleProperty("phantomOutput")
 tasks.register("phantomApk") {
-    dependsOn("assembleDebug")
+    dependsOn("@ASSEMBLE_TASK@")
     doLast {
         val output = file(phantomOutput.get())
         output.parentFile.mkdirs()
         copy {
-            from(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk"))
+            from(layout.buildDirectory.file("@APK_SOURCE@"))
             into(output.parentFile)
             rename { output.name }
         }

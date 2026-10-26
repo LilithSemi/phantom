@@ -17,7 +17,7 @@ const tui_pixels = @import("backend/tui_pixels.zig");
 const kitty_gfx = @import("tui/kitty_gfx.zig");
 
 const linux_open_url_builds = builtin.os.tag == .linux and !builtin.abi.isAndroid();
-const LinuxUrlOpener = if (linux_open_url_builds) @import("linux_open_url.zig").Opener else void;
+const LinuxPlatformHost = if (linux_open_url_builds) @import("platform/linux.zig").Host else void;
 
 pub const Mode = enum { cells, pixels };
 
@@ -311,6 +311,8 @@ pub const StderrPolicy = union(enum) {
 /// so a program that EMBEDS phantom, and already owns its own signal handling,
 /// its own logging, or its own event loop, can keep the piece it owns.
 pub const Options = struct {
+    /// Reverse-DNS id used to namespace persistent platform settings.
+    app_id: []const u8 = "phantom",
     /// The terminal device. Null takes the process's own stdin and stdout.
     in: ?std.Io.File = null,
     out: ?std.Io.File = null,
@@ -487,7 +489,7 @@ pub const Session = struct {
     arena: std.heap.ArenaAllocator,
     sink: phantom.FaultSink,
     owner: phantom.BuildOwner,
-    url_opener: LinuxUrlOpener,
+    platform_host: LinuxPlatformHost,
     focus_mgr: phantom.FocusManager,
     el: *phantom.Element,
     canvas: phantom.Canvas,
@@ -650,10 +652,12 @@ pub const Session = struct {
         self.owner = .{ .gpa = gpa, .sink = &self.sink, .io = io };
         errdefer self.owner.deinit();
         if (linux_open_url_builds) {
-            self.url_opener = LinuxUrlOpener.init(gpa, io, environ.get("DBUS_SESSION_BUS_ADDRESS"));
-            self.owner.platform = self.url_opener.asPlatform();
+            self.platform_host = LinuxPlatformHost.initForApp(gpa, io, environ.get("DBUS_SESSION_BUS_ADDRESS"), environ, opts.app_id) catch
+                LinuxPlatformHost.init(gpa, io, environ.get("DBUS_SESSION_BUS_ADDRESS"));
+            errdefer self.platform_host.deinit();
+            self.owner.platform = self.platform_host.asPlatform();
         } else {
-            self.url_opener = {};
+            self.platform_host = {};
         }
         // The mono metrics are in physical pixels, the same space the cell grid
         // uses.
@@ -756,6 +760,7 @@ pub const Session = struct {
         self.el.deinit(self.gpa);
         self.focus_mgr.deinit(self.gpa);
         self.owner.deinit();
+        if (linux_open_url_builds) self.platform_host.deinit();
         self.arena.deinit();
         self.leaveModes();
         self.leaveScreen();

@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 const phantom = @import("../phantom.zig");
 
 const linux_open_url_builds = builtin.os.tag == .linux and !builtin.abi.isAndroid();
-const LinuxUrlOpener = if (linux_open_url_builds) @import("linux_open_url.zig").Opener else void;
+const LinuxPlatformHost = if (linux_open_url_builds) @import("platform/linux.zig").Host else void;
 
 /// Whether the window path can be COMPILED here at all. Not a claim about
 /// hardware, and not a claim about whether a window can be opened.
@@ -164,6 +164,8 @@ fn dispatchKey(focus_mgr: *phantom.FocusManager, k: lattice.event.KeyEvent) void
 /// field wherever the two backends have the same decision to make, so a caller
 /// that has driven one already knows how to drive the other.
 pub const Options = struct {
+    /// Reverse-DNS id used to namespace persistent platform settings.
+    app_id: []const u8 = "phantom",
     /// Override runtime mobile-device detection for unusual hosts.
     mobile: ?bool = null,
     title: []const u8 = "phantom",
@@ -229,6 +231,7 @@ pub const App = struct {
                 root,
                 opts,
                 process.environ_map.get("DBUS_SESSION_BUS_ADDRESS"),
+                process.environ_map,
             );
             defer session.deinit();
             while (try session.step()) {}
@@ -262,7 +265,7 @@ pub const Session = struct {
     arena: std.heap.ArenaAllocator,
     sink: phantom.FaultSink,
     owner: phantom.BuildOwner,
-    url_opener: LinuxUrlOpener,
+    platform_host: LinuxPlatformHost,
     el: *phantom.Element,
     canvas: phantom.Canvas,
 
@@ -302,7 +305,7 @@ pub const Session = struct {
         opts: Options,
     ) !void {
         const opened = open(gpa, io, environ, opts) orelse return error.NoWindowBackend;
-        return self.initOnWithBus(gpa, io, opened, root, opts, environ.get("DBUS_SESSION_BUS_ADDRESS"));
+        return self.initOnWithBus(gpa, io, opened, root, opts, environ.get("DBUS_SESSION_BUS_ADDRESS"), environ);
     }
 
     /// Build a session on a window that is already open, taking it over.
@@ -322,7 +325,7 @@ pub const Session = struct {
         root: phantom.Root,
         opts: Options,
     ) !void {
-        return self.initOnWithBus(gpa, io, opened, root, opts, null);
+        return self.initOnWithBus(gpa, io, opened, root, opts, null, null);
     }
 
     fn initOnWithBus(
@@ -333,6 +336,7 @@ pub const Session = struct {
         root: phantom.Root,
         opts: Options,
         session_bus_address: ?[]const u8,
+        environ: ?*const std.process.Environ.Map,
     ) !void {
         self.gpa = gpa;
         self.io = io;
@@ -365,10 +369,14 @@ pub const Session = struct {
         self.owner = .{ .gpa = gpa, .sink = &self.sink, .io = io };
         errdefer self.owner.deinit();
         if (linux_open_url_builds) {
-            self.url_opener = LinuxUrlOpener.init(gpa, io, session_bus_address);
-            self.owner.platform = self.url_opener.asPlatform();
+            self.platform_host = if (environ) |env|
+                LinuxPlatformHost.initForApp(gpa, io, session_bus_address, env, opts.app_id) catch LinuxPlatformHost.init(gpa, io, session_bus_address)
+            else
+                LinuxPlatformHost.init(gpa, io, session_bus_address);
+            errdefer self.platform_host.deinit();
+            self.owner.platform = self.platform_host.asPlatform();
         } else {
-            self.url_opener = {};
+            self.platform_host = {};
         }
 
         // Build a View from the surface's logical size. lattice does not
@@ -428,6 +436,7 @@ pub const Session = struct {
         self.el.deinit(self.gpa);
         self.focus_mgr.deinit(self.gpa);
         self.owner.deinit();
+        if (linux_open_url_builds) self.platform_host.deinit();
         self.arena.deinit();
         self.ctx.destroySurface(self.surface.id);
         self.backend.deinit();

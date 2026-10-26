@@ -89,6 +89,94 @@ const closeSource = (id) => {
   sources.delete(id);
 };
 
+// Persistent settings. The reverse-DNS app id is part of every key so two
+// Phantom applications served from the same origin do not share a namespace.
+const settingKey = (ap, al, kp, kl) => "phantom:" + str(ap, al) + ":" + str(kp, kl);
+const readSetting = (ap, al, kp, kl, out, cap) => {
+  try {
+    const value = localStorage.getItem(settingKey(ap, al, kp, kl));
+    if (value === null) return -1;
+    if (value.length > cap) return -2;
+    const bytes = new Uint8Array(mem(), out, value.length);
+    for (let i = 0; i < value.length; i++) bytes[i] = value.charCodeAt(i);
+    return value.length;
+  } catch { return -3; }
+};
+const writeSetting = (ap, al, kp, kl, vp, vl) => {
+  try {
+    const bytes = new Uint8Array(mem(), vp, vl);
+    let value = "";
+    // Avoid spreading a large value into one call (engines cap argument count).
+    for (let i = 0; i < bytes.length; i += 8192) {
+      value += String.fromCharCode(...bytes.subarray(i, i + 8192));
+    }
+    localStorage.setItem(settingKey(ap, al, kp, kl), value);
+    return 1;
+  } catch { return 0; }
+};
+const removeSetting = (ap, al, kp, kl) => {
+  try {
+    localStorage.removeItem(settingKey(ap, al, kp, kl));
+    return 1;
+  } catch { return 0; }
+};
+
+const giveBytes = (bytes) => {
+  if (bytes.length === 0) return [0, 0];
+  const ptr = instance.exports.webidl_rt_alloc(bytes.length);
+  if (ptr === 0) return [0, 0];
+  new Uint8Array(mem(), ptr, bytes.length).set(bytes);
+  return [ptr, bytes.length];
+};
+const pickFile = (app, acceptPtr, acceptLen) => {
+  try {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = str(acceptPtr, acceptLen);
+    let completed = false;
+    const finish = async (kind, file) => {
+      if (completed) return;
+      completed = true;
+      let name = [0, 0], type = [0, 0], data = [0, 0];
+      try {
+        if (file) {
+          name = give(file.name);
+          type = give(file.type || "application/octet-stream");
+          data = giveBytes(new Uint8Array(await file.arrayBuffer()));
+          if (file.size !== 0 && data[0] === 0) kind = 2;
+        }
+        await enter(() => w.filePicked(app, kind, name[0], name[1], type[0], type[1], data[0], data[1]));
+      } catch {
+        await enter(() => w.filePicked(app, 2, 0, 0, 0, 0, 0, 0));
+      } finally {
+        for (const part of [name, type, data]) if (part[0]) instance.exports.webidl_rt_free(part[0], part[1]);
+      }
+    };
+    input.addEventListener("change", () => finish(input.files?.length ? 0 : 1, input.files?.[0]));
+    input.addEventListener("cancel", () => finish(1));
+    input.click();
+    return 1;
+  } catch { return 0; }
+};
+const permissionCode = () => {
+  if (!("Notification" in globalThis)) return 3;
+  return Notification.permission === "granted" ? 0 : Notification.permission === "denied" ? 1 : 2;
+};
+const requestNotificationPermission = (app) => {
+  if (!("Notification" in globalThis)) return 0;
+  Notification.requestPermission()
+    .then(() => enter(() => w.notificationPermissionResult(app, permissionCode())))
+    .catch(() => enter(() => w.notificationPermissionResult(app, 1)));
+  return 1;
+};
+const showNotification = (ip, il, tp, tl, bp, bl) => {
+  if (!("Notification" in globalThis) || Notification.permission !== "granted") return 0;
+  try {
+    new Notification(str(tp, tl), { body: str(bp, bl), tag: str(ip, il) });
+    return 1;
+  } catch { return 0; }
+};
+
 // Five u32s: status, headers ptr and len, body ptr and len. Written
 // last, after every allocation, because allocating can grow the heap
 // and detach any view made before it.
@@ -329,6 +417,13 @@ const imports = {
     __phantom_add_font: addFont,
     __phantom_event_source_open: openSource,
     __phantom_event_source_close: closeSource,
+    __phantom_setting_read: readSetting,
+    __phantom_setting_write: writeSetting,
+    __phantom_setting_remove: removeSetting,
+    __phantom_pick_file: pickFile,
+    __phantom_notification_permission: permissionCode,
+    __phantom_notification_permission_request: requestNotificationPermission,
+    __phantom_notification_show: showNotification,
   },
 };
 ({ instance } = await WebAssembly.instantiateStreaming(fetch(new URL("./@wasm_name@.wasm", import.meta.url)), imports));
@@ -345,6 +440,8 @@ const w = {
   dispatchChar: wrap(ex.dispatchChar), dispatchText: wrap(ex.dispatchText),
   locationChanged: wrap(ex.locationChanged), serverEvent: wrap(ex.serverEvent),
   scrollChanged: wrap(ex.scrollChanged),
+  filePicked: wrap(ex.filePicked),
+  notificationPermissionResult: wrap(ex.notificationPermissionResult),
 };
 
 // True while the tree is on the stack, which under JSPI includes the
