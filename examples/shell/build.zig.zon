@@ -1,0 +1,14 @@
+.{
+    .name = .phantom_shell,
+    .fingerprint = 0xf527afe2ef70d577,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .phantom = .{ .path = "../.." },
+        .lattice = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/lattice#e7707673d549085709d98af75db6ded0c7ad34b2",
+            .hash = "lattice-0.1.0-TdtxHJV2CgBAvXAlWHNcloAUExbmWjtjRIfE_SS0PsGy",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "README.md" },
+}

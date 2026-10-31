@@ -15,6 +15,10 @@ pub const Connectivity = struct {
     strength: ?u8 = null,
     networking_enabled: bool = true,
     wifi_enabled: bool = false,
+    /// Whether the host has a cellular/WWAN radio. This is independent of
+    /// `cellular_enabled`: a disabled modem still needs a tile that can turn it
+    /// back on, while a machine with no modem should not show one at all.
+    cellular_available: bool = false,
     cellular_enabled: bool = false,
 };
 
@@ -27,6 +31,39 @@ pub const WifiNetwork = struct {
     strength: u8,
     security: Security,
     connected: bool = false,
+};
+
+/// One launchable application exposed by the host shell. Android uses an
+/// explicit `package/class` component as `id`; desktop hosts may use a desktop
+/// file id. The host owns all slices until its next catalog refresh.
+pub const Application = struct {
+    id: []const u8,
+    name: []const u8,
+    /// Encoded PNG supplied by the host, or empty when no icon was exported.
+    icon_png: []const u8 = "",
+    /// Encoded task/window preview supplied by a system shell host.
+    preview_png: []const u8 = "",
+    /// True when the host currently owns a live task/window for this app.
+    running: bool = false,
+};
+
+pub const Bluetooth = struct {
+    enabled: bool,
+    available: bool = true,
+    discovering: bool = false,
+    connected_devices: u16 = 0,
+    paired_devices: u16 = 0,
+};
+
+/// A notification posted by another application and visible to a system
+/// shell. `key` is opaque and is only passed back to dismiss/invoke actions.
+pub const SystemNotification = struct {
+    key: []const u8,
+    app_name: []const u8,
+    title: []const u8,
+    body: []const u8,
+    posted_ms: i64,
+    clearable: bool = true,
 };
 
 pub const Power = struct {

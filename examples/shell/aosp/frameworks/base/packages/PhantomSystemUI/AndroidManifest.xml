@@ -1,0 +1,25 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.android.systemui"
+    android:sharedUserId="android.uid.systemui"
+    coreApp="true">
+
+    <uses-permission android:name="android.permission.INJECT_EVENTS" />
+    <uses-permission android:name="android.permission.INTERNAL_SYSTEM_WINDOW" />
+    <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS_FULL" />
+    <uses-permission android:name="android.permission.GRANT_RUNTIME_PERMISSIONS" />
+    <uses-permission android:name="android.permission.MANAGE_NOTIFICATION_LISTENERS" />
+    <uses-permission android:name="android.permission.STATUS_BAR_SERVICE" />
+
+    <application
+        android:allowBackup="false"
+        android:defaultToDeviceProtectedStorage="true"
+        android:directBootAware="true"
+        android:label="Phantom System UI"
+        android:persistent="true"
+        android:process="com.android.systemui">
+        <!-- SystemServer starts this component from config_systemUIServiceComponent. -->
+        <service
+            android:name=".SystemUIService"
+            android:exported="true" />
+    </application>
+</manifest>

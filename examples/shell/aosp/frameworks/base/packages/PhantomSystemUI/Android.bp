@@ -1,0 +1,18 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+android_app {
+    name: "PhantomSystemUI",
+    manifest: "AndroidManifest.xml",
+    srcs: ["src/**/*.java"],
+    platform_apis: true,
+    certificate: "platform",
+    privileged: true,
+    system_ext_specific: true,
+    overrides: ["SystemUI"],
+    required: ["privapp_whitelist_com.android.systemui"],
+    optimize: {
+        enabled: false,
+    },
+}

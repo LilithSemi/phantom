@@ -1,49 +1,88 @@
 package @PACKAGE@;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.media.AudioManager;
 import android.content.Context;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.ComponentName;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.database.Cursor;
+import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.Insets;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.drawable.Drawable;
+import android.hardware.display.DisplayManager;
 import android.net.Uri;
+import android.net.ConnectivityManager;
+import android.net.NetworkCapabilities;
+import android.net.Network;
+import android.net.wifi.WifiManager;
+import android.net.wifi.ScanResult;
+import android.net.wifi.WifiConfiguration;
+import android.telephony.TelephonyManager;
+import android.bluetooth.BluetoothAdapter;
 import android.os.Build;
+import android.os.BatteryManager;
 import android.os.Bundle;
+import android.os.UserManager;
 import android.text.InputType;
 import android.view.Choreographer;
+import android.view.Display;
+import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.View;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.Window;
 import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.view.WindowMetrics;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
+import android.window.OnBackInvokedDispatcher;
 import java.nio.charset.StandardCharsets;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 public final class MainActivity extends Activity {
     static { System.loadLibrary("@LIBRARY@"); }
     private static final String NOTIFICATION_CHANNEL_ID = "@CHANNEL_ID@";
     private static final String NOTIFICATION_CHANNEL_NAME = "@CHANNEL_NAME@";
+    private static final boolean IMMERSIVE = @IMMERSIVE@;
+    private static final boolean HOME_SCREEN = @HOME_SCREEN@;
     private PhantomView phantomView;
 
-    private static native long nativeCreate(int width, int height, float density, float fontScale, int insetLeft, int insetTop, int insetRight, int insetBottom, int notificationPermission);
-    private static native int nativeBeginFilesDir(int length);
-    private static native void nativeFilesDirByte(int index, int value);
-    private static native void nativeDestroy(long handle);
-    private static native int nativeSurfaceCreated(long handle, android.view.Surface surface, int width, int height, float density);
-    private static native void nativeSurfaceDestroyed(long handle);
-    private static native int nativeRender(long handle, int width, int height, float density, float fontScale, int insetLeft, int insetTop, int insetRight, int insetBottom, long frameNanos);
-    private static native int nativeTouch(long handle, int action, int pointerId, float x, float y);
+    static native long nativeCreate(int surfaceRole, int width, int height, float density, float fontScale, int insetLeft, int insetTop, int insetRight, int insetBottom, int notificationPermission);
+    static native int nativeBeginFilesDir(int length);
+    static native void nativeFilesDirByte(int index, int value);
+    static native void nativeDestroy(long handle);
+    static native int nativeSurfaceCreated(long handle, android.view.Surface surface, int width, int height, float density);
+    static native void nativeSurfaceDestroyed(long handle);
+    static native int nativeRender(long handle, int width, int height, float density, float fontScale, int insetLeft, int insetTop, int insetRight, int insetBottom, long frameNanos);
+    static native int nativeTouch(long handle, int action, int pointerId, float x, float y);
+    static native int nativeTakeSystemAction();
+    static native int nativeSystemBarsChanged(int requestedVisibleTypes, int transientTypes, int behavior);
+    static native int nativeSystemShellState();
+    private static native void nativeHomeActivated(int action);
     private static native void nativeCommitCodepoint(long handle, int codepoint);
     private static native void nativeBeginPreedit(long handle);
     private static native void nativeAppendPreeditCodepoint(long handle, int codepoint);
@@ -66,13 +105,455 @@ public final class MainActivity extends Activity {
     private static native int nativeBeginFilePickerResult(long handle, int nameLength, int typeLength, int dataLength);
     private static native void nativeFilePickerResultByte(long handle, int field, int index, int value);
     private static native void nativeFinishFilePicker(long handle, int kind);
+    private static native int nativeKey(long handle, int keysym, int codepoint, int modifiers, int action);
+    private static native void nativePointerMove(long handle, float x, float y);
+    private static native void nativePointerScroll(long handle, float x, float y, float horizontal, float vertical);
+    private static native int nativePendingClipboardWriteLength(long handle);
+    private static native int nativePendingClipboardWriteByte(long handle, int index);
+    private static native void nativeClearClipboardWrite(long handle);
+    private static native int nativeTakeClipboardRead(long handle);
+    private static native int nativeBeginClipboardResult(long handle, int length);
+    private static native void nativeClipboardResultByte(long handle, int index, int value);
+    private static native void nativeFinishClipboardRead(long handle, int success);
+    private static native void nativeLifecycle(long handle, int foreground);
+    static native void nativePlatformConnectivity(int transport, int reachability, int strength, int flags);
+    static native void nativePlatformBluetooth(int flags, int connected, int paired);
+    static native void nativePlatformPower(int present, int percent, int status, long timeEmptyMs, long timeFullMs);
+    static native void nativePlatformAudio(int volume, int maximum, int muted);
+    static native void nativePlatformBrightness(float level);
+    static native int nativeBeginIdentity(int userNameLength, int displayNameLength, int systemNameLength);
+    static native void nativeIdentityByte(int field, int offset, int value);
+    static native int nativeBeginWifiNetworks(int count);
+    static native int nativeBeginWifiNetwork(int index, int idLength, int ssidLength, int strength, int secured, int connected);
+    static native void nativeWifiNetworkByte(int index, int field, int offset, int value);
+    static native int nativeBeginApplications(int count);
+    static native int nativeBeginApplication(int index, int idLength, int nameLength, int iconLength, int previewLength, int running);
+    static native void nativeApplicationByte(int index, int field, int offset, int value);
+    static native int nativeBeginSystemNotifications(int count);
+    static native int nativeBeginSystemNotification(int index, int keyLength, int appLength, int titleLength, int bodyLength, long postedMs, int clearable);
+    static native void nativeSystemNotificationByte(int index, int field, int offset, int value);
+    static native int nativeTakePlatformAction();
+    static native int nativePlatformActionValue();
+    static native float nativePlatformActionNumber();
+    static native int nativePlatformActionTextLength();
+    static native int nativePlatformActionTextByte(int index);
+    private static long nextPlatformRefresh;
+    private static final Map<String, byte[]> applicationIcons = new HashMap<>();
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         createNotificationChannel();
 @START_BACKGROUND_SERVICE@
+@START_SYSTEM_SHELL_SERVICE@
         phantomView = new PhantomView(this);
         setContentView(phantomView);
+        configureSystemUi();
+        pumpPlatform(this);
+        if (Build.VERSION.SDK_INT >= 33) {
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::handleBack);
+        }
+    }
+
+    static void pumpPlatform(Context context) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now >= nextPlatformRefresh) {
+            nextPlatformRefresh = now + 2000;
+            pushApplications(context);
+            pushConnectivity(context);
+            pushWifiNetworks(context);
+            pushBluetooth();
+            pushPower(context);
+            pushAudio(context);
+            pushBrightness(context);
+            pushIdentity(context);
+        }
+        drainSystemAction(context);
+    }
+
+    private static void pushApplications(Context context) {
+        PackageManager pm = context.getPackageManager();
+        Intent query = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+        List<ResolveInfo> apps = pm.queryIntentActivities(query, PackageManager.MATCH_ALL);
+        apps.removeIf(info -> info.activityInfo == null || info.activityInfo.packageName.equals(context.getPackageName()));
+        Collections.sort(apps, new ResolveInfo.DisplayNameComparator(pm));
+        Map<String, ActivityManager.RunningTaskInfo> runningTasks = runningTasks(context);
+        if (nativeBeginApplications(apps.size()) == 0) return;
+        for (int i = 0; i < apps.size(); ++i) {
+            ResolveInfo info = apps.get(i);
+            String id = info.activityInfo.packageName + "/" + info.activityInfo.name;
+            CharSequence label = info.loadLabel(pm);
+            ActivityManager.RunningTaskInfo task = runningTasks.get(info.activityInfo.packageName);
+            putApplication(pm, info, i, id,
+                    label == null ? info.activityInfo.packageName : label.toString(), task);
+        }
+    }
+
+    private static void putApplication(PackageManager pm, ResolveInfo info, int index, String id,
+            String name, ActivityManager.RunningTaskInfo task) {
+        byte[] idBytes = id.getBytes(StandardCharsets.UTF_8);
+        byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+        byte[] iconBytes = applicationIcons.computeIfAbsent(id, key -> encodeIcon(pm, info));
+        byte[] previewBytes = task == null ? new byte[0] : encodeTaskPreview(task.id);
+        if (nativeBeginApplication(index, idBytes.length, nameBytes.length, iconBytes.length,
+                previewBytes.length, task == null ? 0 : 1) == 0) return;
+        putApplicationBytes(index, 0, idBytes);
+        putApplicationBytes(index, 1, nameBytes);
+        putApplicationBytes(index, 2, iconBytes);
+        putApplicationBytes(index, 3, previewBytes);
+    }
+
+    private static void putApplicationBytes(int index, int field, byte[] bytes) {
+        for (int i = 0; i < bytes.length; ++i) nativeApplicationByte(index, field, i, bytes[i] & 0xff);
+    }
+
+    private static byte[] encodeIcon(PackageManager pm, ResolveInfo info) {
+        try {
+            Drawable icon = info.loadIcon(pm);
+            if (icon == null) return new byte[0];
+            Bitmap bitmap = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(bitmap);
+            icon.setBounds(0, 0, 96, 96);
+            icon.draw(canvas);
+            byte[] bytes = encodePng(bitmap);
+            bitmap.recycle();
+            return bytes;
+        } catch (RuntimeException ignored) { }
+        return new byte[0];
+    }
+
+    @SuppressWarnings("deprecation")
+    private static Map<String, ActivityManager.RunningTaskInfo> runningTasks(Context context) {
+        Map<String, ActivityManager.RunningTaskInfo> result = new HashMap<>();
+        try {
+            ActivityManager manager = context.getSystemService(ActivityManager.class);
+            for (ActivityManager.RunningTaskInfo task : manager.getRunningTasks(64)) {
+                ComponentName component = task.topActivity != null ? task.topActivity : task.baseActivity;
+                if (component != null && !component.getPackageName().equals(context.getPackageName())) {
+                    result.putIfAbsent(component.getPackageName(), task);
+                }
+            }
+        } catch (RuntimeException ignored) { }
+        return result;
+    }
+
+    private static byte[] encodeTaskPreview(int taskId) {
+        Object snapshot = null;
+        Bitmap hardware = null;
+        Bitmap software = null;
+        Bitmap scaled = null;
+        try {
+            Class<?> managerClass = Class.forName("android.window.TaskSnapshotManager");
+            Object manager = managerClass.getMethod("getInstance").invoke(null);
+            snapshot = managerClass.getMethod("getTaskSnapshot", int.class, int.class)
+                    .invoke(manager, taskId, 2);
+            if (snapshot == null) return new byte[0];
+            hardware = (Bitmap)snapshot.getClass().getMethod("wrapToBitmap").invoke(snapshot);
+            if (hardware == null) return new byte[0];
+            software = hardware.copy(Bitmap.Config.ARGB_8888, false);
+            if (software == null) return new byte[0];
+            int width = Math.min(360, software.getWidth());
+            int height = Math.max(1, Math.round(software.getHeight()
+                    * (width / (float)Math.max(1, software.getWidth()))));
+            scaled = Bitmap.createScaledBitmap(software, width, height, true);
+            return encodePng(scaled);
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            return new byte[0];
+        } finally {
+            if (scaled != null && scaled != software) scaled.recycle();
+            if (software != null) software.recycle();
+            if (snapshot != null) try {
+                snapshot.getClass().getMethod("closeBuffer").invoke(snapshot);
+            } catch (ReflectiveOperationException | RuntimeException ignored) { }
+        }
+    }
+
+    private static byte[] encodePng(Bitmap bitmap) {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, output);
+        return output.toByteArray();
+    }
+
+    private static void pushAudio(Context context) {
+        AudioManager manager = context.getSystemService(AudioManager.class);
+        if (manager == null) return;
+        int maximum = manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        nativePlatformAudio(
+                manager.getStreamVolume(AudioManager.STREAM_MUSIC),
+                maximum,
+                manager.isStreamMute(AudioManager.STREAM_MUSIC) ? 1 : 0);
+    }
+
+    private static void pushBrightness(Context context) {
+        try {
+            DisplayManager manager = context.getSystemService(DisplayManager.class);
+            if (manager == null) return;
+            float value = (float)manager.getClass()
+                    .getMethod("getBrightness", int.class)
+                    .invoke(manager, Display.DEFAULT_DISPLAY);
+            if (Float.isFinite(value) && value >= 0) nativePlatformBrightness(value);
+        } catch (ReflectiveOperationException | RuntimeException ignored) { }
+    }
+
+    private static void pushIdentity(Context context) {
+        UserManager manager = context.getSystemService(UserManager.class);
+        if (manager == null) return;
+        try {
+            String userName = manager.getUserName();
+            if (userName == null || userName.isEmpty()) userName = "User";
+            String release = Build.VERSION.RELEASE;
+            String systemName = release == null || release.isEmpty()
+                    ? "Android API " + Build.VERSION.SDK_INT
+                    : "Android " + release;
+            byte[][] fields = {
+                    userName.getBytes(StandardCharsets.UTF_8),
+                    userName.getBytes(StandardCharsets.UTF_8),
+                    systemName.getBytes(StandardCharsets.UTF_8),
+            };
+            if (nativeBeginIdentity(fields[0].length, fields[1].length, fields[2].length) == 0) return;
+            for (int field = 0; field < fields.length; ++field) {
+                for (int offset = 0; offset < fields[field].length; ++offset) {
+                    nativeIdentityByte(field, offset, fields[field][offset] & 0xff);
+                }
+            }
+        } catch (SecurityException ignored) { }
+    }
+
+    private static void pushConnectivity(Context context) {
+        ConnectivityManager manager = context.getSystemService(ConnectivityManager.class);
+        WifiManager wifi = context.getSystemService(WifiManager.class);
+        Network active = manager == null ? null : manager.getActiveNetwork();
+        NetworkCapabilities caps = active == null || manager == null ? null : manager.getNetworkCapabilities(active);
+        int transport = 0;
+        if (caps != null) {
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) transport = 2;
+            else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) transport = 3;
+            else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) transport = 1;
+        }
+        int reachability = caps == null ? 0 : caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ? 3
+                : caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ? 2 : 1;
+        int strength = -1;
+        if (transport == 2 && wifi != null) {
+            try { strength = WifiManager.calculateSignalLevel(wifi.getConnectionInfo().getRssi(), 101); }
+            catch (SecurityException ignored) {}
+        }
+        int flags = active != null ? 1 : 0;
+        if (wifi != null && wifi.isWifiEnabled()) flags |= 2;
+        boolean cellularAvailable = context.getPackageManager().hasSystemFeature(PackageManager.FEATURE_TELEPHONY);
+        if (cellularAvailable) flags |= 4;
+        if (cellularAvailable) {
+            TelephonyManager telephony = context.getSystemService(TelephonyManager.class);
+            try { if (telephony != null && telephony.isDataEnabled()) flags |= 8; }
+            catch (SecurityException ignored) { if (transport == 3) flags |= 8; }
+        }
+        nativePlatformConnectivity(transport, reachability, strength, flags);
+    }
+
+    private static void pushBluetooth() {
+        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+        if (adapter == null) { nativePlatformBluetooth(0, 0, 0); return; }
+        try {
+            int flags = 1 | (adapter.isEnabled() ? 2 : 0) | (adapter.isDiscovering() ? 4 : 0);
+            int paired = adapter.getBondedDevices().size();
+            nativePlatformBluetooth(flags, 0, paired);
+        } catch (SecurityException ignored) { nativePlatformBluetooth(1, 0, 0); }
+    }
+
+    private static void pushPower(Context context) {
+        BatteryManager manager = context.getSystemService(BatteryManager.class);
+        Intent battery = context.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        int present = battery == null || battery.getBooleanExtra(BatteryManager.EXTRA_PRESENT, true) ? 1 : 0;
+        int status = battery == null ? BatteryManager.BATTERY_STATUS_UNKNOWN
+                : battery.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN);
+        int level = battery == null ? -1 : battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = battery == null ? -1 : battery.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+        int percent = level >= 0 && scale > 0 ? Math.round(level * 100.0f / scale) : -1;
+        if (percent < 0 && manager != null) {
+            percent = manager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
+        }
+        long timeFull = -1;
+        if (manager != null && Build.VERSION.SDK_INT >= 28 && status == BatteryManager.BATTERY_STATUS_CHARGING) {
+            timeFull = manager.computeChargeTimeRemaining();
+        }
+        nativePlatformPower(present, Math.max(0, Math.min(percent, 100)), status, -1, timeFull);
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void pushWifiNetworks(Context context) {
+        WifiManager wifi = context.getSystemService(WifiManager.class);
+        if (wifi == null) { nativeBeginWifiNetworks(0); return; }
+        try {
+            List<ScanResult> results = wifi.getScanResults();
+            if (nativeBeginWifiNetworks(results.size()) == 0) return;
+            String connected = wifi.getConnectionInfo().getBSSID();
+            for (int i = 0; i < results.size(); ++i) {
+                ScanResult result = results.get(i);
+                String id = result.BSSID == null ? result.SSID : result.BSSID;
+                String ssid = result.SSID == null ? "" : result.SSID;
+                byte[] idBytes = id.getBytes(StandardCharsets.UTF_8);
+                byte[] ssidBytes = ssid.getBytes(StandardCharsets.UTF_8);
+                int strength = WifiManager.calculateSignalLevel(result.level, 101);
+                String capabilities = result.capabilities == null ? "" : result.capabilities;
+                boolean secured = capabilities.contains("WEP") || capabilities.contains("WPA")
+                        || capabilities.contains("SAE") || capabilities.contains("EAP");
+                if (nativeBeginWifiNetwork(i, idBytes.length, ssidBytes.length, strength,
+                        secured ? 1 : 0, id.equals(connected) ? 1 : 0) == 0) continue;
+                for (int n = 0; n < idBytes.length; ++n) nativeWifiNetworkByte(i, 0, n, idBytes[n] & 0xff);
+                for (int n = 0; n < ssidBytes.length; ++n) nativeWifiNetworkByte(i, 1, n, ssidBytes[n] & 0xff);
+            }
+        } catch (RuntimeException ignored) { nativeBeginWifiNetworks(0); }
+    }
+
+    private static ScanResult findWifi(Context context, String id) {
+        WifiManager wifi = context.getSystemService(WifiManager.class);
+        if (wifi == null) return null;
+        for (ScanResult result : wifi.getScanResults()) {
+            if (id.equals(result.BSSID) || id.equals(result.SSID)) return result;
+        }
+        return null;
+    }
+
+    private static String wifiQuoted(String value) { return "\"" + value.replace("\"", "\\\"") + "\""; }
+
+    private static String platformActionText() {
+        int length = nativePlatformActionTextLength();
+        if (length < 0) return "";
+        byte[] bytes = new byte[length];
+        for (int i = 0; i < length; ++i) bytes[i] = (byte)nativePlatformActionTextByte(i);
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void drainSystemAction(Context context) {
+        int action = nativeTakePlatformAction();
+        if (action == 0) return;
+        String value = platformActionText();
+        try {
+            switch (action) {
+                case 1: {
+                    ComponentName component = ComponentName.unflattenFromString(value);
+                    if (component != null) context.startActivity(new Intent().setComponent(component)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT));
+                    break;
+                }
+                case 2: context.getSystemService(WifiManager.class).setWifiEnabled(nativePlatformActionValue() != 0); break;
+                case 3: { BluetoothAdapter a = BluetoothAdapter.getDefaultAdapter(); if (a != null) { if (nativePlatformActionValue() != 0) a.enable(); else a.disable(); } break; }
+                case 4: { BluetoothAdapter a = BluetoothAdapter.getDefaultAdapter(); if (a != null) a.startDiscovery(); break; }
+                case 5: PhantomNotificationListener.dismiss(value); break;
+                case 6: PhantomNotificationListener.clearAll(); break;
+                case 7: PhantomNotificationListener.invoke(value); break;
+                case 8: context.getSystemService(WifiManager.class).startScan(); break;
+                case 9: {
+                    int separator = value.indexOf('\0');
+                    String id = separator < 0 ? value : value.substring(0, separator);
+                    String password = separator < 0 ? "" : value.substring(separator + 1);
+                    ScanResult result = findWifi(context, id);
+                    WifiManager wifi = context.getSystemService(WifiManager.class);
+                    if (result != null && wifi != null) {
+                        WifiConfiguration config = new WifiConfiguration();
+                        config.SSID = wifiQuoted(result.SSID);
+                        config.BSSID = result.BSSID;
+                        if (password.isEmpty()) config.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE);
+                        else config.preSharedKey = wifiQuoted(password);
+                        int networkId = wifi.addNetwork(config);
+                        if (networkId >= 0) wifi.enableNetwork(networkId, true);
+                    }
+                    break;
+                }
+                case 10: context.getSystemService(WifiManager.class).disconnect(); break;
+                case 11: {
+                    TelephonyManager telephony = context.getSystemService(TelephonyManager.class);
+                    if (telephony != null) telephony.setDataEnabled(nativePlatformActionValue() != 0);
+                    break;
+                }
+                case 12: {
+                    AudioManager audio = context.getSystemService(AudioManager.class);
+                    if (audio == null) break;
+                    int maximum = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                    int volume = Math.round(Math.max(0, Math.min(1, nativePlatformActionNumber())) * maximum);
+                    audio.setStreamVolume(AudioManager.STREAM_MUSIC, volume, 0);
+                    audio.adjustStreamVolume(
+                            AudioManager.STREAM_MUSIC,
+                            nativePlatformActionValue() != 0
+                                    ? AudioManager.ADJUST_MUTE
+                                    : AudioManager.ADJUST_UNMUTE,
+                            0);
+                    break;
+                }
+                case 13: {
+                    DisplayManager display = context.getSystemService(DisplayManager.class);
+                    if (display != null) display.getClass()
+                            .getMethod("setBrightness", int.class, float.class)
+                            .invoke(display, Display.DEFAULT_DISPLAY,
+                                    Math.max(0, Math.min(1, nativePlatformActionNumber())));
+                    break;
+                }
+                default: break;
+            }
+        } catch (ReflectiveOperationException | RuntimeException ignored) { }
+    }
+
+    @Override protected void onPause() {
+        if (phantomView != null) {
+            phantomView.setPaused(true);
+            if (phantomView.handle != 0) nativeLifecycle(phantomView.handle, 0);
+        }
+        super.onPause();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (IMMERSIVE) hideSystemBars();
+        if (phantomView != null) {
+            if (phantomView.handle != 0) nativeLifecycle(phantomView.handle, 1);
+            phantomView.setPaused(false);
+        }
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (Intent.ACTION_MAIN.equals(intent.getAction())
+                && intent.hasCategory(Intent.CATEGORY_HOME)) {
+            nativeHomeActivated(intent.getIntExtra("org.phantomui.extra.SHELL_ACTION", 0));
+            if (phantomView != null) phantomView.scheduleFrame();
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private void configureSystemUi() {
+        Window window = getWindow();
+        window.setStatusBarColor(Color.TRANSPARENT);
+        window.setNavigationBarColor(Color.TRANSPARENT);
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false);
+        } else {
+            int flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
+            window.getDecorView().setSystemUiVisibility(flags);
+        }
+        if (IMMERSIVE) hideSystemBars();
+    }
+
+    @SuppressWarnings("deprecation")
+    private void hideSystemBars() {
+        Window window = getWindow();
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController controller = window.getInsetsController();
+            if (controller == null) return;
+            controller.setSystemBarsBehavior(
+                    WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            controller.hide(WindowInsets.Type.systemBars());
+        } else {
+            window.getDecorView().setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        }
     }
 
     private void createNotificationChannel() {
@@ -124,10 +605,102 @@ public final class MainActivity extends Activity {
         }
     }
 
+    @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        if (HOME_SCREEN && (event.getKeyCode() == KeyEvent.KEYCODE_MENU
+                || event.getKeyCode() == KeyEvent.KEYCODE_APP_SWITCH)) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                nativeHomeActivated(1);
+                if (phantomView != null) phantomView.scheduleFrame();
+            }
+            return true;
+        }
+        if (phantomView != null && phantomView.handle != 0) {
+            int action;
+            if (event.getAction() == KeyEvent.ACTION_UP) action = 2;
+            else if (event.getRepeatCount() > 0) action = 1;
+            else action = 0;
+            int modifiers = (event.isShiftPressed() ? 1 : 0)
+                    | (event.isCtrlPressed() ? 2 : 0)
+                    | (event.isAltPressed() ? 4 : 0)
+                    | (event.isMetaPressed() ? 8 : 0);
+            // Keep Shift/Caps in the produced symbol, but remove shortcut
+            // modifiers: Ctrl+C is the `c` keysym with Ctrl held, not U+0003.
+            int unicodeMeta = event.getMetaState()
+                    & ~(KeyEvent.META_CTRL_MASK | KeyEvent.META_ALT_MASK | KeyEvent.META_META_MASK);
+            int codepoint = event.getUnicodeChar(unicodeMeta);
+            if (nativeKey(phantomView.handle, androidKeysym(event.getKeyCode()), codepoint, modifiers, action) != 0) {
+                phantomView.scheduleFrame();
+                return true;
+            }
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override public void onBackPressed() {
+        if (handleBack()) return;
+        if (Build.VERSION.SDK_INT < 33) super.onBackPressed();
+    }
+
+    private boolean handleBack() {
+        if (phantomView != null && phantomView.handle != 0
+                && nativeKey(phantomView.handle, 0xff1b, 0, 0, 0) != 0) {
+            nativeKey(phantomView.handle, 0xff1b, 0, 0, 2);
+            phantomView.scheduleFrame();
+            return true;
+        }
+        if (Build.VERSION.SDK_INT >= 33) finishAfterTransition();
+        return false;
+    }
+
+    /** X11 keysyms are Phantom's platform-neutral named-key representation. */
+    private static int androidKeysym(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_BACK: return 0xff1b;
+            case KeyEvent.KEYCODE_DEL: return 0xff08;
+            case KeyEvent.KEYCODE_TAB: return 0xff09;
+            case KeyEvent.KEYCODE_ENTER:
+            case KeyEvent.KEYCODE_NUMPAD_ENTER: return 0xff0d;
+            case KeyEvent.KEYCODE_ESCAPE: return 0xff1b;
+            case KeyEvent.KEYCODE_MOVE_HOME: return 0xff50;
+            case KeyEvent.KEYCODE_DPAD_LEFT: return 0xff51;
+            case KeyEvent.KEYCODE_DPAD_UP: return 0xff52;
+            case KeyEvent.KEYCODE_DPAD_RIGHT: return 0xff53;
+            case KeyEvent.KEYCODE_DPAD_DOWN: return 0xff54;
+            case KeyEvent.KEYCODE_PAGE_UP: return 0xff55;
+            case KeyEvent.KEYCODE_PAGE_DOWN: return 0xff56;
+            case KeyEvent.KEYCODE_MOVE_END: return 0xff57;
+            case KeyEvent.KEYCODE_INSERT: return 0xff63;
+            case KeyEvent.KEYCODE_FORWARD_DEL: return 0xffff;
+            case KeyEvent.KEYCODE_SHIFT_LEFT: return 0xffe1;
+            case KeyEvent.KEYCODE_SHIFT_RIGHT: return 0xffe2;
+            case KeyEvent.KEYCODE_CTRL_LEFT: return 0xffe3;
+            case KeyEvent.KEYCODE_CTRL_RIGHT: return 0xffe4;
+            case KeyEvent.KEYCODE_ALT_LEFT: return 0xffe9;
+            case KeyEvent.KEYCODE_ALT_RIGHT: return 0xffea;
+            case KeyEvent.KEYCODE_META_LEFT: return 0xffeb;
+            case KeyEvent.KEYCODE_META_RIGHT: return 0xffec;
+            case KeyEvent.KEYCODE_F1: return 0xffbe;
+            case KeyEvent.KEYCODE_F2: return 0xffbf;
+            case KeyEvent.KEYCODE_F3: return 0xffc0;
+            case KeyEvent.KEYCODE_F4: return 0xffc1;
+            case KeyEvent.KEYCODE_F5: return 0xffc2;
+            case KeyEvent.KEYCODE_F6: return 0xffc3;
+            case KeyEvent.KEYCODE_F7: return 0xffc4;
+            case KeyEvent.KEYCODE_F8: return 0xffc5;
+            case KeyEvent.KEYCODE_F9: return 0xffc6;
+            case KeyEvent.KEYCODE_F10: return 0xffc7;
+            case KeyEvent.KEYCODE_F11: return 0xffc8;
+            case KeyEvent.KEYCODE_F12: return 0xffc9;
+            default: return 0;
+        }
+    }
+
     private static final class PhantomView extends SurfaceView implements SurfaceHolder.Callback, Choreographer.FrameCallback {
         private long handle;
         private boolean surfaceAttached;
         private boolean frameScheduled;
+        private boolean paused;
         private boolean imeEnabled;
 
         PhantomView(Context context) {
@@ -150,7 +723,7 @@ public final class MainActivity extends Activity {
             float density = getResources().getDisplayMetrics().density;
             float fontScale = getResources().getConfiguration().fontScale;
             Rect insets = systemBarInsets();
-            if (handle == 0) handle = nativeCreate(width, height, density, fontScale, insets.left, insets.top, insets.right, insets.bottom, ((MainActivity)getContext()).notificationPermission());
+            if (handle == 0) handle = nativeCreate(0, width, height, density, fontScale, insets.left, insets.top, insets.right, insets.bottom, ((MainActivity)getContext()).notificationPermission());
             surfaceAttached = handle != 0 && nativeSurfaceCreated(handle, holder.getSurface(), width, height, density) != 0;
             scheduleFrame();
         }
@@ -169,6 +742,7 @@ public final class MainActivity extends Activity {
         @Override public void doFrame(long frameNanos) {
             frameScheduled = false;
             if (!surfaceAttached || handle == 0) return;
+            MainActivity.pumpPlatform(getContext());
             Rect insets = systemBarInsets();
             nativeRender(
                     handle,
@@ -186,9 +760,19 @@ public final class MainActivity extends Activity {
         }
 
         private void scheduleFrame() {
-            if (!surfaceAttached || frameScheduled) return;
+            if (!surfaceAttached || frameScheduled || paused) return;
             frameScheduled = true;
             Choreographer.getInstance().postFrameCallback(this);
+        }
+
+        private void setPaused(boolean value) {
+            paused = value;
+            if (paused && frameScheduled) {
+                Choreographer.getInstance().removeFrameCallback(this);
+                frameScheduled = false;
+            } else if (!paused) {
+                scheduleFrame();
+            }
         }
 
         @SuppressWarnings("deprecation")
@@ -198,14 +782,21 @@ public final class MainActivity extends Activity {
                 WindowManager manager = getContext().getSystemService(WindowManager.class);
                 WindowMetrics metrics = manager.getCurrentWindowMetrics();
                 windowInsets = metrics.getWindowInsets();
-                Insets value = windowInsets.getInsetsIgnoringVisibility(
-                        WindowInsets.Type.statusBars()
-                                | WindowInsets.Type.navigationBars()
-                                | WindowInsets.Type.displayCutout());
+                int types = WindowInsets.Type.displayCutout();
+                if (!IMMERSIVE) {
+                    types |= WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars();
+                }
+                Insets value = windowInsets.getInsetsIgnoringVisibility(types);
                 return new Rect(value.left, value.top, value.right, value.bottom);
             }
             windowInsets = getRootWindowInsets();
             if (windowInsets == null) return new Rect();
+            if (IMMERSIVE) {
+                if (Build.VERSION.SDK_INT < 28 || windowInsets.getDisplayCutout() == null) return new Rect();
+                android.view.DisplayCutout cutout = windowInsets.getDisplayCutout();
+                return new Rect(cutout.getSafeInsetLeft(), cutout.getSafeInsetTop(),
+                        cutout.getSafeInsetRight(), cutout.getSafeInsetBottom());
+            }
             return new Rect(
                     windowInsets.getSystemWindowInsetLeft(),
                     windowInsets.getSystemWindowInsetTop(),
@@ -235,6 +826,27 @@ public final class MainActivity extends Activity {
             drainPlatformRequests();
             scheduleFrame();
             return true;
+        }
+
+        @Override public boolean onGenericMotionEvent(MotionEvent event) {
+            if (handle == 0 || (event.getSource() & InputDevice.SOURCE_CLASS_POINTER) == 0) {
+                return super.onGenericMotionEvent(event);
+            }
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_HOVER_MOVE || action == MotionEvent.ACTION_MOVE) {
+                nativePointerMove(handle, event.getX(), event.getY());
+                scheduleFrame();
+                return true;
+            }
+            if (action == MotionEvent.ACTION_SCROLL) {
+                float step = 48.0f * getResources().getDisplayMetrics().density;
+                nativePointerScroll(handle, event.getX(), event.getY(),
+                        -event.getAxisValue(MotionEvent.AXIS_HSCROLL) * step,
+                        -event.getAxisValue(MotionEvent.AXIS_VSCROLL) * step);
+                scheduleFrame();
+                return true;
+            }
+            return super.onGenericMotionEvent(event);
         }
 
         private void openPendingUrl() {
@@ -275,6 +887,7 @@ public final class MainActivity extends Activity {
 
         private void drainPlatformRequests() {
             openPendingUrl();
+            drainClipboard();
             String id = pendingNotificationField(0);
             if (id != null) {
                 String title = pendingNotificationField(1);
@@ -328,6 +941,52 @@ public final class MainActivity extends Activity {
                     try { ((Activity)getContext()).startActivityForResult(picker, 72); }
                     catch (RuntimeException ignored) { nativeFinishFilePicker(handle, 2); }
                 }
+            }
+        }
+
+        private void drainClipboard() {
+            int writeLength = nativePendingClipboardWriteLength(handle);
+            if (writeLength >= 0) {
+                byte[] bytes = new byte[writeLength];
+                boolean valid = true;
+                for (int i = 0; i < writeLength; ++i) {
+                    int value = nativePendingClipboardWriteByte(handle, i);
+                    if (value < 0) { valid = false; break; }
+                    bytes[i] = (byte)value;
+                }
+                nativeClearClipboardWrite(handle);
+                if (valid) {
+                    try {
+                        ClipboardManager clipboard = (ClipboardManager)getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+                        clipboard.setPrimaryClip(ClipData.newPlainText("text", new String(bytes, StandardCharsets.UTF_8)));
+                    } catch (RuntimeException ignored) {}
+                }
+            }
+
+            if (nativeTakeClipboardRead(handle) == 0) return;
+            try {
+                ClipboardManager clipboard = (ClipboardManager)getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+                ClipData clip = clipboard.getPrimaryClip();
+                if (clip == null || clip.getItemCount() == 0) {
+                    nativeFinishClipboardRead(handle, 0);
+                    return;
+                }
+                CharSequence value = clip.getItemAt(0).coerceToText(getContext());
+                if (value == null) {
+                    nativeFinishClipboardRead(handle, 0);
+                    return;
+                }
+                byte[] bytes = value.toString().getBytes(StandardCharsets.UTF_8);
+                if (nativeBeginClipboardResult(handle, bytes.length) == 0) {
+                    nativeFinishClipboardRead(handle, 0);
+                    return;
+                }
+                for (int i = 0; i < bytes.length; ++i) {
+                    nativeClipboardResultByte(handle, i, bytes[i] & 0xff);
+                }
+                nativeFinishClipboardRead(handle, 1);
+            } catch (RuntimeException ignored) {
+                nativeFinishClipboardRead(handle, 0);
             }
         }
 

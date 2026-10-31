@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Phantom draws and owns the system navigation surface. -->
+    <bool name="config_showNavigationBar" translatable="false">false</bool>
+
+    <!-- Until Phantom has its own lock surface, boot straight into its shell
+         instead of exposing the stock Android keyguard. -->
+    <bool name="config_disableLockscreenByDefault" translatable="false">true</bool>
+</resources>

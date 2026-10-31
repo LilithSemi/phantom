@@ -1,0 +1,11 @@
+android_app_import {
+    name: "PhantomShellProvider",
+    apk: "shell-provider.apk",
+    certificate: "platform",
+    privileged: true,
+    system_ext_specific: true,
+    overrides: ["Launcher3QuickStep"],
+    dex_preopt: {
+        enabled: false,
+    },
+}

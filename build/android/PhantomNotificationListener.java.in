@@ -1,0 +1,83 @@
+package @PACKAGE@;
+
+import android.app.Notification;
+import android.app.PendingIntent;
+import android.content.pm.PackageManager;
+import android.service.notification.NotificationListenerService;
+import android.service.notification.StatusBarNotification;
+import java.nio.charset.StandardCharsets;
+
+/** Bridges Android's notification stream into the portable Phantom shell API. */
+public final class PhantomNotificationListener extends NotificationListenerService {
+    private static PhantomNotificationListener instance;
+
+    @Override public void onListenerConnected() {
+        instance = this;
+        publish();
+    }
+
+    @Override public void onListenerDisconnected() {
+        if (instance == this) instance = null;
+        MainActivity.nativeBeginSystemNotifications(0);
+        requestRebind(new android.content.ComponentName(this, PhantomNotificationListener.class));
+    }
+
+    @Override public void onNotificationPosted(StatusBarNotification notification) { publish(); }
+    @Override public void onNotificationRemoved(StatusBarNotification notification) { publish(); }
+
+    private void publish() {
+        StatusBarNotification[] active;
+        try { active = getActiveNotifications(); }
+        catch (RuntimeException ignored) { active = new StatusBarNotification[0]; }
+        if (MainActivity.nativeBeginSystemNotifications(active.length) == 0) return;
+        PackageManager pm = getPackageManager();
+        for (int i = 0; i < active.length; ++i) {
+            StatusBarNotification sbn = active[i];
+            Notification notification = sbn.getNotification();
+            String app = sbn.getPackageName();
+            try {
+                CharSequence label = pm.getApplicationLabel(pm.getApplicationInfo(app, 0));
+                if (label != null) app = label.toString();
+            } catch (PackageManager.NameNotFoundException ignored) { }
+            CharSequence titleValue = notification.extras.getCharSequence(Notification.EXTRA_TITLE);
+            CharSequence bodyValue = notification.extras.getCharSequence(Notification.EXTRA_TEXT);
+            put(i, sbn.getKey(), app, titleValue == null ? "" : titleValue.toString(),
+                    bodyValue == null ? "" : bodyValue.toString(), sbn.getPostTime(), sbn.isClearable());
+        }
+    }
+
+    private static void put(int index, String key, String app, String title, String body, long posted, boolean clearable) {
+        byte[][] fields = {
+                key.getBytes(StandardCharsets.UTF_8), app.getBytes(StandardCharsets.UTF_8),
+                title.getBytes(StandardCharsets.UTF_8), body.getBytes(StandardCharsets.UTF_8)
+        };
+        if (MainActivity.nativeBeginSystemNotification(index, fields[0].length, fields[1].length,
+                fields[2].length, fields[3].length, posted, clearable ? 1 : 0) == 0) return;
+        for (int field = 0; field < fields.length; ++field) {
+            for (int offset = 0; offset < fields[field].length; ++offset) {
+                MainActivity.nativeSystemNotificationByte(index, field, offset, fields[field][offset] & 0xff);
+            }
+        }
+    }
+
+    static void dismiss(String key) {
+        PhantomNotificationListener value = instance;
+        if (value != null) value.cancelNotification(key);
+    }
+
+    static void clearAll() {
+        PhantomNotificationListener value = instance;
+        if (value != null) value.cancelAllNotifications();
+    }
+
+    static void invoke(String key) {
+        PhantomNotificationListener value = instance;
+        if (value == null) return;
+        for (StatusBarNotification sbn : value.getActiveNotifications()) {
+            if (!sbn.getKey().equals(key)) continue;
+            PendingIntent intent = sbn.getNotification().contentIntent;
+            if (intent != null) try { intent.send(); } catch (PendingIntent.CanceledException ignored) { }
+            return;
+        }
+    }
+}
