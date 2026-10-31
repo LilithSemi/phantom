@@ -182,6 +182,8 @@ extern "phantom" fn __phantom_pick_file(app: usize, accept_ptr: [*]const u8, acc
 extern "phantom" fn __phantom_notification_permission() u32;
 extern "phantom" fn __phantom_notification_permission_request(app: usize) u32;
 extern "phantom" fn __phantom_notification_show(id_ptr: [*]const u8, id_len: usize, title_ptr: [*]const u8, title_len: usize, body_ptr: [*]const u8, body_len: usize) u32;
+extern "phantom" fn __phantom_clipboard_read(app: usize) u32;
+extern "phantom" fn __phantom_clipboard_write(ptr: [*]const u8, len: usize) u32;
 
 fn setStyle(ctx: *anyopaque, node: u32, decl: []const u8) void {
     _ = ctx;
@@ -246,6 +248,14 @@ fn requestNotificationPermission(_: *anyopaque, app: usize) bool {
 
 fn showNotification(_: *anyopaque, notification: phantom.Notification) bool {
     return __phantom_notification_show(notification.id.ptr, notification.id.len, notification.title.ptr, notification.title.len, notification.body.ptr, notification.body.len) != 0;
+}
+
+fn readClipboard(_: *anyopaque, app: usize) bool {
+    return __phantom_clipboard_read(app) != 0;
+}
+
+fn writeClipboard(_: *anyopaque, text: []const u8) bool {
+    return __phantom_clipboard_write(text.ptr, text.len) != 0;
 }
 fn appendChild(ctx: *anyopaque, parent: u32, child: u32) void {
     _ = ctx;
@@ -548,6 +558,8 @@ export fn init(doc_handle: u32, body_handle: u32, window_handle: u32, root_font:
         .notification_permission = notificationPermission,
         .request_notification_permission = requestNotificationPermission,
         .show_notification = showNotification,
+        .read_clipboard = readClipboard,
+        .write_clipboard = writeClipboard,
         .release = release,
         .remove_child = removeChild,
         .insert_before = insertBefore,
@@ -618,6 +630,18 @@ export fn notificationPermissionResult(app: usize, result: u32) void {
     if (app == 0) return;
     const a: *phantom.web.WebApp = @ptrFromInt(app);
     a.notificationPermissionResult(permissionFromInt(result));
+}
+
+export fn clipboardRead(app: usize, success: u32, ptr: u32, len: u32) void {
+    if (app == 0) return;
+    const a: *phantom.web.WebApp = @ptrFromInt(app);
+    a.clipboardRead(if (success != 0) rawSlice(ptr, len) else null);
+}
+
+export fn lifecycleChanged(app: usize, foreground: u32) void {
+    if (app == 0) return;
+    const a: *phantom.web.WebApp = @ptrFromInt(app);
+    a.lifecycleChanged(if (foreground != 0) .foreground else .background);
 }
 
 // The keyboard. A wasm export carries numbers only, so the page packs the

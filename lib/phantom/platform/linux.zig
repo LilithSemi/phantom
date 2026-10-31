@@ -737,12 +737,14 @@ pub const Host = struct {
         const state = (try self.getProperty(bus, &loop, nm_name, nm_path, nm_interface, "State")) orelse return error.InvalidReply;
         const networking = (try self.getProperty(bus, &loop, nm_name, nm_path, nm_interface, "NetworkingEnabled")) orelse return error.InvalidReply;
         const wifi = (try self.getProperty(bus, &loop, nm_name, nm_path, nm_interface, "WirelessEnabled")) orelse return error.InvalidReply;
+        const cellular_hardware = (try self.getProperty(bus, &loop, nm_name, nm_path, nm_interface, "WwanHardwareEnabled")) orelse return error.InvalidReply;
         const cellular = (try self.getProperty(bus, &loop, nm_name, nm_path, nm_interface, "WwanEnabled")) orelse return error.InvalidReply;
         const primary = (try self.getProperty(bus, &loop, nm_name, nm_path, nm_interface, "PrimaryConnection")) orelse return error.InvalidReply;
 
         var result = platform.Connectivity{
             .networking_enabled = networking.asBool() orelse return error.InvalidReply,
             .wifi_enabled = wifi.asBool() orelse return error.InvalidReply,
+            .cellular_available = cellular_hardware.asBool() orelse return error.InvalidReply,
             .cellular_enabled = cellular.asBool() orelse return error.InvalidReply,
             .reachability = reachability(state.asU32() orelse return error.InvalidReply),
         };

@@ -121,6 +121,8 @@ pub const DomOps = struct {
     notification_permission: ?*const fn (ctx: *anyopaque) platform.NotificationPermission = null,
     request_notification_permission: ?*const fn (ctx: *anyopaque, app: usize) bool = null,
     show_notification: ?*const fn (ctx: *anyopaque, notification: platform.Notification) bool = null,
+    read_clipboard: ?*const fn (ctx: *anyopaque, app: usize) bool = null,
+    write_clipboard: ?*const fn (ctx: *anyopaque, text: []const u8) bool = null,
     /// Puts `path` in the address bar without loading a new page, in `mode`.
     write_location: ?*const fn (ctx: *anyopaque, path: []const u8, mode: platform.WriteMode) void = null,
     /// Reads a scroll region's current offset (scrollLeft/scrollTop) from the

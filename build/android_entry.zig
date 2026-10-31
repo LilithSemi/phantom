@@ -43,15 +43,55 @@ export fn JNI_OnLoad(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
     return 0x00010006;
 }
 
-fn nativeCreate(_: ?*anyopaque, _: ?*anyopaque, width: c_int, height: c_int, density: f32, text_scale: f32, inset_left: c_int, inset_top: c_int, inset_right: c_int, inset_bottom: c_int, notification_permission: c_int) callconv(.c) i64 {
+fn nativeCreate(_: ?*anyopaque, _: ?*anyopaque, surface_role: c_int, width: c_int, height: c_int, density: f32, text_scale: f32, inset_left: c_int, inset_top: c_int, inset_right: c_int, inset_bottom: c_int, notification_permission: c_int) callconv(.c) i64 {
     if (width <= 0 or height <= 0) return 0;
     if (files_dir.items.len == 0) return 0;
-    const value = Session.create(gpa, phantom.Root.plain(app.root), @intCast(width), @intCast(height), density, text_scale, physicalInsets(inset_left, inset_top, inset_right, inset_bottom), files_dir.items, permissionFromInt(notification_permission)) catch |err| {
+    const root = if (comptime @hasDecl(app, "androidRoot"))
+        app.androidRoot(surface_role)
+    else
+        phantom.Root.plain(app.root);
+    const value = Session.create(gpa, root, @intCast(width), @intCast(height), density, text_scale, physicalInsets(inset_left, inset_top, inset_right, inset_bottom), files_dir.items, permissionFromInt(notification_permission), surface_role != 0) catch |err| {
         log(@errorName(err));
         return 0;
     };
     log("Prism renderer ready");
     return @bitCast(@as(u64, @intFromPtr(value)));
+}
+
+fn nativeTakeSystemAction(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    if (comptime @hasDecl(app, "takeAndroidSystemAction")) {
+        return @intCast(app.takeAndroidSystemAction());
+    }
+    return 0;
+}
+
+fn nativeSystemBarsChanged(_: ?*anyopaque, _: ?*anyopaque, requested_visible_types: c_int, transient_types: c_int, behavior: c_int) callconv(.c) c_int {
+    const status_type: c_int = 1;
+    const navigation_type: c_int = 2;
+    const state = phantom.android.SystemBarsState{
+        .status_requested_visible = requested_visible_types & status_type != 0,
+        .navigation_requested_visible = requested_visible_types & navigation_type != 0,
+        .status_transient = transient_types & status_type != 0,
+        .navigation_transient = transient_types & navigation_type != 0,
+        .behavior = behavior,
+    };
+    const visibility = if (comptime @hasDecl(app, "androidSystemBarsChanged"))
+        app.androidSystemBarsChanged(state)
+    else
+        state.effectiveVisibility();
+    return (if (visibility.status) status_type else 0) |
+        (if (visibility.navigation) navigation_type else 0);
+}
+
+fn nativeSystemShellState(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    if (comptime @hasDecl(app, "androidSystemShellState")) {
+        return @intCast(app.androidSystemShellState());
+    }
+    return 0;
+}
+
+fn nativeHomeActivated(_: ?*anyopaque, _: ?*anyopaque, action: c_int) callconv(.c) void {
+    if (comptime @hasDecl(app, "androidHomeActivated")) app.androidHomeActivated(action);
 }
 
 fn permissionFromInt(value: c_int) phantom.NotificationPermission {
@@ -243,6 +283,60 @@ fn nativeFinishFilePicker(_: ?*anyopaque, _: ?*anyopaque, handle: i64, kind: c_i
     if (session(handle)) |value| value.finishFilePicker(if (kind < 0) 2 else @intCast(kind));
 }
 
+fn nativeKey(_: ?*anyopaque, _: ?*anyopaque, handle: i64, keysym: c_int, codepoint: c_int, modifiers: c_int, action: c_int) callconv(.c) c_int {
+    const value = session(handle) orelse return 0;
+    return @intFromBool(value.key(keysym, codepoint, modifiers, action));
+}
+
+fn nativePointerMove(_: ?*anyopaque, _: ?*anyopaque, handle: i64, x: f32, y: f32) callconv(.c) void {
+    if (session(handle)) |value| value.pointerMove(x, y);
+}
+
+fn nativePointerScroll(_: ?*anyopaque, _: ?*anyopaque, handle: i64, x: f32, y: f32, horizontal: f32, vertical: f32) callconv(.c) void {
+    if (session(handle)) |value| value.pointerScroll(x, y, horizontal, vertical);
+}
+
+fn nativePendingClipboardWriteLength(_: ?*anyopaque, _: ?*anyopaque, handle: i64) callconv(.c) c_int {
+    const value = session(handle) orelse return -1;
+    const len = value.pendingClipboardWriteLength() orelse return -1;
+    return if (len <= std.math.maxInt(c_int)) @intCast(len) else -1;
+}
+
+fn nativePendingClipboardWriteByte(_: ?*anyopaque, _: ?*anyopaque, handle: i64, index: c_int) callconv(.c) c_int {
+    if (index < 0) return -1;
+    const value = session(handle) orelse return -1;
+    return value.pendingClipboardWriteByte(@intCast(index)) orelse -1;
+}
+
+fn nativeClearClipboardWrite(_: ?*anyopaque, _: ?*anyopaque, handle: i64) callconv(.c) void {
+    if (session(handle)) |value| value.clearClipboardWrite();
+}
+
+fn nativeTakeClipboardRead(_: ?*anyopaque, _: ?*anyopaque, handle: i64) callconv(.c) c_int {
+    const value = session(handle) orelse return 0;
+    return @intFromBool(value.takeClipboardRead());
+}
+
+fn nativeBeginClipboardResult(_: ?*anyopaque, _: ?*anyopaque, handle: i64, length: c_int) callconv(.c) c_int {
+    if (length < 0) return 0;
+    const value = session(handle) orelse return 0;
+    value.beginClipboardResult(@intCast(length)) catch return 0;
+    return 1;
+}
+
+fn nativeClipboardResultByte(_: ?*anyopaque, _: ?*anyopaque, handle: i64, index: c_int, byte: c_int) callconv(.c) void {
+    if (index < 0 or byte < 0 or byte > 255) return;
+    if (session(handle)) |value| value.setClipboardResultByte(@intCast(index), @intCast(byte));
+}
+
+fn nativeFinishClipboardRead(_: ?*anyopaque, _: ?*anyopaque, handle: i64, success: c_int) callconv(.c) void {
+    if (session(handle)) |value| value.finishClipboardRead(success != 0);
+}
+
+fn nativeLifecycle(_: ?*anyopaque, _: ?*anyopaque, handle: i64, foreground: c_int) callconv(.c) void {
+    if (session(handle)) |value| value.setLifecycleState(if (foreground != 0) .foreground else .background);
+}
+
 fn nativeBeginServiceFilesDir(_: ?*anyopaque, _: ?*anyopaque, length: c_int) callconv(.c) c_int {
     if (!options.has_background_service or length <= 0) return 0;
     service_files_dir.resize(gpa, @intCast(length)) catch return 0;
@@ -310,6 +404,156 @@ fn nativeServiceClearNotification(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) v
     if (background_service) |value| value.clearPendingNotification();
 }
 
+fn nativePlatformConnectivity(_: ?*anyopaque, _: ?*anyopaque, transport: c_int, reachability: c_int, strength: c_int, flags: c_int) callconv(.c) void {
+    phantom.android.HostBridge.setConnectivity(.{
+        .transport = switch (transport) {
+            1 => .ethernet,
+            2 => .wifi,
+            3 => .cellular,
+            else => .none,
+        },
+        .reachability = switch (reachability) {
+            1 => .local,
+            2 => .site,
+            3 => .internet,
+            else => .disconnected,
+        },
+        .strength = if (strength >= 0 and strength <= 100) @intCast(strength) else null,
+        .networking_enabled = flags & 1 != 0,
+        .wifi_enabled = flags & 2 != 0,
+        .cellular_available = flags & 4 != 0,
+        .cellular_enabled = flags & 8 != 0,
+    });
+}
+
+fn nativePlatformBluetooth(_: ?*anyopaque, _: ?*anyopaque, flags: c_int, connected: c_int, paired: c_int) callconv(.c) void {
+    phantom.android.HostBridge.setBluetooth(.{
+        .available = flags & 1 != 0,
+        .enabled = flags & 2 != 0,
+        .discovering = flags & 4 != 0,
+        .connected_devices = @intCast(@max(0, @min(connected, std.math.maxInt(u16)))),
+        .paired_devices = @intCast(@max(0, @min(paired, std.math.maxInt(u16)))),
+    });
+}
+
+fn nativePlatformPower(_: ?*anyopaque, _: ?*anyopaque, present: c_int, percent: c_int, status: c_int, time_empty_ms: i64, time_full_ms: i64) callconv(.c) void {
+    phantom.android.HostBridge.setPower(.{
+        .present = present != 0,
+        .percent = @intCast(@max(0, @min(percent, 100))),
+        .status = switch (status) {
+            2 => .charging,
+            3 => if (percent <= 0) .empty else .discharging,
+            4 => .pending,
+            5 => .full,
+            else => .unknown,
+        },
+        .time_to_empty_s = if (time_empty_ms >= 0) @intCast(@divTrunc(time_empty_ms, 1000)) else null,
+        .time_to_full_s = if (time_full_ms >= 0) @intCast(@divTrunc(time_full_ms, 1000)) else null,
+    });
+}
+
+fn nativePlatformAudio(_: ?*anyopaque, _: ?*anyopaque, volume: c_int, maximum: c_int, muted: c_int) callconv(.c) void {
+    if (maximum <= 0) return;
+    phantom.android.HostBridge.setAudio(.{
+        .output_volume = @max(0, @min(1, @as(f32, @floatFromInt(volume)) / @as(f32, @floatFromInt(maximum)))),
+        .muted = muted != 0,
+    });
+}
+
+fn nativePlatformBrightness(_: ?*anyopaque, _: ?*anyopaque, level: f32) callconv(.c) void {
+    if (!std.math.isFinite(level)) return;
+    phantom.android.HostBridge.setBrightness(.{ .level = @max(0, @min(1, level)) });
+}
+
+fn nativeBeginIdentity(_: ?*anyopaque, _: ?*anyopaque, user_name_len: c_int, display_name_len: c_int, system_name_len: c_int) callconv(.c) c_int {
+    if (user_name_len < 0 or display_name_len < 0 or system_name_len < 0) return 0;
+    return @intFromBool(phantom.android.HostBridge.beginIdentity(
+        @intCast(user_name_len),
+        @intCast(display_name_len),
+        @intCast(system_name_len),
+    ));
+}
+
+fn nativeIdentityByte(_: ?*anyopaque, _: ?*anyopaque, field: c_int, offset: c_int, value: c_int) callconv(.c) void {
+    if (field < 0 or offset < 0 or value < 0 or value > 255) return;
+    phantom.android.HostBridge.identityByte(@intCast(field), @intCast(offset), @intCast(value));
+}
+
+fn nativeBeginWifiNetworks(_: ?*anyopaque, _: ?*anyopaque, count: c_int) callconv(.c) c_int {
+    if (count < 0) return 0;
+    return @intFromBool(phantom.android.HostBridge.beginWifiNetworks(@intCast(count)));
+}
+
+fn nativeBeginWifiNetwork(_: ?*anyopaque, _: ?*anyopaque, index: c_int, id_len: c_int, ssid_len: c_int, strength: c_int, secured: c_int, connected: c_int) callconv(.c) c_int {
+    if (index < 0 or id_len < 0 or ssid_len < 0 or strength < 0 or strength > 100) return 0;
+    return @intFromBool(phantom.android.HostBridge.beginWifiNetwork(
+        @intCast(index),
+        @intCast(id_len),
+        @intCast(ssid_len),
+        @intCast(strength),
+        secured != 0,
+        connected != 0,
+    ));
+}
+
+fn nativeWifiNetworkByte(_: ?*anyopaque, _: ?*anyopaque, index: c_int, field: c_int, offset: c_int, value: c_int) callconv(.c) void {
+    if (index < 0 or field < 0 or offset < 0 or value < 0 or value > 255) return;
+    phantom.android.HostBridge.wifiNetworkByte(@intCast(index), @intCast(field), @intCast(offset), @intCast(value));
+}
+
+fn nativeBeginApplications(_: ?*anyopaque, _: ?*anyopaque, count: c_int) callconv(.c) c_int {
+    if (count < 0) return 0;
+    return @intFromBool(phantom.android.HostBridge.beginApplications(@intCast(count)));
+}
+
+fn nativeBeginApplication(_: ?*anyopaque, _: ?*anyopaque, index: c_int, id_len: c_int, name_len: c_int, icon_len: c_int, preview_len: c_int, running: c_int) callconv(.c) c_int {
+    if (index < 0 or id_len < 0 or name_len < 0 or icon_len < 0 or preview_len < 0) return 0;
+    return @intFromBool(phantom.android.HostBridge.beginApplication(@intCast(index), @intCast(id_len), @intCast(name_len), @intCast(icon_len), @intCast(preview_len), running != 0));
+}
+
+fn nativeApplicationByte(_: ?*anyopaque, _: ?*anyopaque, index: c_int, field: c_int, offset: c_int, value: c_int) callconv(.c) void {
+    if (index < 0 or field < 0 or offset < 0 or value < 0 or value > 255) return;
+    phantom.android.HostBridge.applicationByte(@intCast(index), @intCast(field), @intCast(offset), @intCast(value));
+}
+
+fn nativeBeginSystemNotifications(_: ?*anyopaque, _: ?*anyopaque, count: c_int) callconv(.c) c_int {
+    if (count < 0) return 0;
+    return @intFromBool(phantom.android.HostBridge.beginNotifications(@intCast(count)));
+}
+
+fn nativeBeginSystemNotification(_: ?*anyopaque, _: ?*anyopaque, index: c_int, key_len: c_int, app_len: c_int, title_len: c_int, body_len: c_int, posted_ms: i64, clearable: c_int) callconv(.c) c_int {
+    if (index < 0 or key_len < 0 or app_len < 0 or title_len < 0 or body_len < 0) return 0;
+    return @intFromBool(phantom.android.HostBridge.beginNotification(
+        @intCast(index),
+        .{ @intCast(key_len), @intCast(app_len), @intCast(title_len), @intCast(body_len) },
+        posted_ms,
+        clearable != 0,
+    ));
+}
+
+fn nativeSystemNotificationByte(_: ?*anyopaque, _: ?*anyopaque, index: c_int, field: c_int, offset: c_int, value: c_int) callconv(.c) void {
+    if (index < 0 or field < 0 or offset < 0 or value < 0 or value > 255) return;
+    phantom.android.HostBridge.notificationByte(@intCast(index), @intCast(field), @intCast(offset), @intCast(value));
+}
+
+fn nativeTakePlatformAction(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    return phantom.android.HostBridge.takeAction();
+}
+fn nativePlatformActionValue(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    return @intFromBool(phantom.android.HostBridge.actionValue());
+}
+fn nativePlatformActionNumber(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) f32 {
+    return phantom.android.HostBridge.actionNumber();
+}
+fn nativePlatformActionTextLength(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+    const len = phantom.android.HostBridge.actionTextLength();
+    return if (len <= std.math.maxInt(c_int)) @intCast(len) else -1;
+}
+fn nativePlatformActionTextByte(_: ?*anyopaque, _: ?*anyopaque, index: c_int) callconv(.c) c_int {
+    if (index < 0) return -1;
+    return phantom.android.HostBridge.actionTextByte(@intCast(index)) orelse -1;
+}
+
 comptime {
     @export(&nativeCreate, .{ .name = options.jni_prefix ++ "nativeCreate" });
     @export(&nativeBeginFilesDir, .{ .name = options.jni_prefix ++ "nativeBeginFilesDir" });
@@ -319,6 +563,10 @@ comptime {
     @export(&nativeSurfaceDestroyed, .{ .name = options.jni_prefix ++ "nativeSurfaceDestroyed" });
     @export(&nativeRender, .{ .name = options.jni_prefix ++ "nativeRender" });
     @export(&nativeTouch, .{ .name = options.jni_prefix ++ "nativeTouch" });
+    @export(&nativeTakeSystemAction, .{ .name = options.jni_prefix ++ "nativeTakeSystemAction" });
+    @export(&nativeSystemBarsChanged, .{ .name = options.jni_prefix ++ "nativeSystemBarsChanged" });
+    @export(&nativeSystemShellState, .{ .name = options.jni_prefix ++ "nativeSystemShellState" });
+    @export(&nativeHomeActivated, .{ .name = options.jni_prefix ++ "nativeHomeActivated" });
     @export(&nativeCommitCodepoint, .{ .name = options.jni_prefix ++ "nativeCommitCodepoint" });
     @export(&nativeBeginPreedit, .{ .name = options.jni_prefix ++ "nativeBeginPreedit" });
     @export(&nativeAppendPreeditCodepoint, .{ .name = options.jni_prefix ++ "nativeAppendPreeditCodepoint" });
@@ -341,6 +589,38 @@ comptime {
     @export(&nativeBeginFilePickerResult, .{ .name = options.jni_prefix ++ "nativeBeginFilePickerResult" });
     @export(&nativeFilePickerResultByte, .{ .name = options.jni_prefix ++ "nativeFilePickerResultByte" });
     @export(&nativeFinishFilePicker, .{ .name = options.jni_prefix ++ "nativeFinishFilePicker" });
+    @export(&nativeKey, .{ .name = options.jni_prefix ++ "nativeKey" });
+    @export(&nativePointerMove, .{ .name = options.jni_prefix ++ "nativePointerMove" });
+    @export(&nativePointerScroll, .{ .name = options.jni_prefix ++ "nativePointerScroll" });
+    @export(&nativePendingClipboardWriteLength, .{ .name = options.jni_prefix ++ "nativePendingClipboardWriteLength" });
+    @export(&nativePendingClipboardWriteByte, .{ .name = options.jni_prefix ++ "nativePendingClipboardWriteByte" });
+    @export(&nativeClearClipboardWrite, .{ .name = options.jni_prefix ++ "nativeClearClipboardWrite" });
+    @export(&nativeTakeClipboardRead, .{ .name = options.jni_prefix ++ "nativeTakeClipboardRead" });
+    @export(&nativeBeginClipboardResult, .{ .name = options.jni_prefix ++ "nativeBeginClipboardResult" });
+    @export(&nativeClipboardResultByte, .{ .name = options.jni_prefix ++ "nativeClipboardResultByte" });
+    @export(&nativeFinishClipboardRead, .{ .name = options.jni_prefix ++ "nativeFinishClipboardRead" });
+    @export(&nativeLifecycle, .{ .name = options.jni_prefix ++ "nativeLifecycle" });
+    @export(&nativePlatformConnectivity, .{ .name = options.jni_prefix ++ "nativePlatformConnectivity" });
+    @export(&nativePlatformBluetooth, .{ .name = options.jni_prefix ++ "nativePlatformBluetooth" });
+    @export(&nativePlatformPower, .{ .name = options.jni_prefix ++ "nativePlatformPower" });
+    @export(&nativePlatformAudio, .{ .name = options.jni_prefix ++ "nativePlatformAudio" });
+    @export(&nativePlatformBrightness, .{ .name = options.jni_prefix ++ "nativePlatformBrightness" });
+    @export(&nativeBeginIdentity, .{ .name = options.jni_prefix ++ "nativeBeginIdentity" });
+    @export(&nativeIdentityByte, .{ .name = options.jni_prefix ++ "nativeIdentityByte" });
+    @export(&nativeBeginWifiNetworks, .{ .name = options.jni_prefix ++ "nativeBeginWifiNetworks" });
+    @export(&nativeBeginWifiNetwork, .{ .name = options.jni_prefix ++ "nativeBeginWifiNetwork" });
+    @export(&nativeWifiNetworkByte, .{ .name = options.jni_prefix ++ "nativeWifiNetworkByte" });
+    @export(&nativeBeginApplications, .{ .name = options.jni_prefix ++ "nativeBeginApplications" });
+    @export(&nativeBeginApplication, .{ .name = options.jni_prefix ++ "nativeBeginApplication" });
+    @export(&nativeApplicationByte, .{ .name = options.jni_prefix ++ "nativeApplicationByte" });
+    @export(&nativeBeginSystemNotifications, .{ .name = options.jni_prefix ++ "nativeBeginSystemNotifications" });
+    @export(&nativeBeginSystemNotification, .{ .name = options.jni_prefix ++ "nativeBeginSystemNotification" });
+    @export(&nativeSystemNotificationByte, .{ .name = options.jni_prefix ++ "nativeSystemNotificationByte" });
+    @export(&nativeTakePlatformAction, .{ .name = options.jni_prefix ++ "nativeTakePlatformAction" });
+    @export(&nativePlatformActionValue, .{ .name = options.jni_prefix ++ "nativePlatformActionValue" });
+    @export(&nativePlatformActionNumber, .{ .name = options.jni_prefix ++ "nativePlatformActionNumber" });
+    @export(&nativePlatformActionTextLength, .{ .name = options.jni_prefix ++ "nativePlatformActionTextLength" });
+    @export(&nativePlatformActionTextByte, .{ .name = options.jni_prefix ++ "nativePlatformActionTextByte" });
     @export(&nativeBeginServiceFilesDir, .{ .name = options.service_jni_prefix ++ "nativeBeginServiceFilesDir" });
     @export(&nativeServiceFilesDirByte, .{ .name = options.service_jni_prefix ++ "nativeServiceFilesDirByte" });
     @export(&nativeServiceStart, .{ .name = options.service_jni_prefix ++ "nativeServiceStart" });

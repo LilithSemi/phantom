@@ -176,6 +176,23 @@ const showNotification = (ip, il, tp, tl, bp, bl) => {
     return 1;
   } catch { return 0; }
 };
+const readClipboard = (app) => {
+  if (!navigator.clipboard?.readText) return 0;
+  navigator.clipboard.readText().then(async (text) => {
+    const value = give(text);
+    try {
+      await enter(() => w.clipboardRead(app, 1, value[0], value[1]));
+    } finally {
+      if (value[0]) instance.exports.webidl_rt_free(value[0], value[1]);
+    }
+  }).catch(() => enter(() => w.clipboardRead(app, 0, 0, 0)));
+  return 1;
+};
+const writeClipboard = (ptr, len) => {
+  if (!navigator.clipboard?.writeText) return 0;
+  navigator.clipboard.writeText(str(ptr, len)).catch(() => {});
+  return 1;
+};
 
 // Five u32s: status, headers ptr and len, body ptr and len. Written
 // last, after every allocation, because allocating can grow the heap
@@ -424,6 +441,8 @@ const imports = {
     __phantom_notification_permission: permissionCode,
     __phantom_notification_permission_request: requestNotificationPermission,
     __phantom_notification_show: showNotification,
+    __phantom_clipboard_read: readClipboard,
+    __phantom_clipboard_write: writeClipboard,
   },
 };
 ({ instance } = await WebAssembly.instantiateStreaming(fetch(new URL("./@wasm_name@.wasm", import.meta.url)), imports));
@@ -442,6 +461,8 @@ const w = {
   scrollChanged: wrap(ex.scrollChanged),
   filePicked: wrap(ex.filePicked),
   notificationPermissionResult: wrap(ex.notificationPermissionResult),
+  clipboardRead: wrap(ex.clipboardRead),
+  lifecycleChanged: wrap(ex.lifecycleChanged),
 };
 
 // True while the tree is on the stack, which under JSPI includes the
@@ -464,6 +485,9 @@ const windowHandle = host.intern(window);
 // each resize.
 const rootFont = () => parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
 const app = await w.init(documentHandle, bodyHandle, windowHandle, rootFont());
+const reportLifecycle = () => enter(() => w.lifecycleChanged(app, document.visibilityState === "visible" ? 1 : 0));
+document.addEventListener("visibilitychange", reportLifecycle);
+await reportLifecycle();
 document.body.addEventListener("click", (e) => enter(() => w.dispatchTap(app, e.clientX, e.clientY)));
 
 // The keyboard. These numbers are X11 keysyms, which is what

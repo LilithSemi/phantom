@@ -194,8 +194,14 @@ fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod:
         .LIBRARY = library_name,
         .CHANNEL_ID = androidStringEscape(b, opts.android.notification_channel_id),
         .CHANNEL_NAME = androidStringEscape(b, opts.android.notification_channel_name),
+        .IMMERSIVE = if (opts.android.system_ui == .immersive) "true" else "false",
+        .HOME_SCREEN = if (opts.android.home_screen) "true" else "false",
         .START_BACKGROUND_SERVICE = if (opts.android.background_service != null)
             "        try {\n            Intent service = new Intent(this, PhantomBackgroundService.class);\n            if (Build.VERSION.SDK_INT >= 26) startForegroundService(service);\n            else startService(service);\n        } catch (RuntimeException ignored) {}"
+        else
+            "",
+        .START_SYSTEM_SHELL_SERVICE = if (opts.android.system_shell)
+            "        startService(new Intent(this, PhantomSystemUiService.class));"
         else
             "",
     });
@@ -204,7 +210,7 @@ fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod:
         .API_LEVEL = api_level,
         .APP_NAME = androidStringEscape(b, opts.name.default),
         .ASSEMBLE_TASK = if (android_release) "assembleRelease" else "assembleDebug",
-        .APK_SOURCE = if (android_release) "outputs/apk/release/app-release-unsigned.apk" else "outputs/apk/debug/app-debug.apk",
+        .APK_SOURCE = if (android_release) "outputs/apk/release/app-release.apk" else "outputs/apk/debug/app-debug.apk",
     });
     const android_manifest = androidManifest(b, opts.android);
 
@@ -217,6 +223,10 @@ fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod:
     _ = project.addCopyFile(android_build, "app/build.gradle.kts");
     _ = project.addCopyFile(android_manifest, "app/src/main/AndroidManifest.xml");
     _ = project.addCopyFile(activity, "app/src/main/java/MainActivity.java");
+    const notification_listener = configureAndroidFile(b, phantom_dep.path("build/android/PhantomNotificationListener.java.in"), "PhantomNotificationListener.java", .{
+        .PACKAGE = opts.id,
+    });
+    _ = project.addCopyFile(notification_listener, "app/src/main/java/PhantomNotificationListener.java");
     if (opts.android.background_service) |service| {
         const java_service = configureAndroidFile(b, phantom_dep.path("build/android/PhantomBackgroundService.java.in"), "PhantomBackgroundService.java", .{
             .PACKAGE = opts.id,
@@ -227,6 +237,14 @@ fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod:
             .FOREGROUND_BODY = androidStringEscape(b, service.notification_body),
         });
         _ = project.addCopyFile(java_service, "app/src/main/java/PhantomBackgroundService.java");
+    }
+    if (opts.android.system_shell) {
+        const system_ui_service = configureAndroidFile(b, phantom_dep.path("build/android/PhantomSystemUiService.java.in"), "PhantomSystemUiService.java", .{
+            .PACKAGE = opts.id,
+            .ENABLE_STATUS_BAR = if (opts.android.system_shell_status_bar) "true" else "false",
+            .ENABLE_NAVIGATION_BAR = if (opts.android.system_shell_navigation_bar) "true" else "false",
+        });
+        _ = project.addCopyFile(system_ui_service, "app/src/main/java/PhantomSystemUiService.java");
     }
     _ = project.addCopyFile(lib.getEmittedBin(), b.fmt("app/src/main/jniLibs/{s}/lib{s}.so", .{ abi, library_name }));
 
@@ -314,13 +332,49 @@ fn androidManifest(b: *std.Build, options: appmeta.AndroidOptions) std.Build.Laz
         "@USES_CLEARTEXT_TRAFFIC@",
         if (options.uses_cleartext_traffic) "true" else "false",
     ) catch @panic("oom");
+    const with_home = std.mem.replaceOwned(
+        u8,
+        b.allocator,
+        std.mem.replaceOwned(
+            u8,
+            b.allocator,
+            with_transport,
+            "@HOME_ACTIVITY_ATTRIBUTES@",
+            if (options.home_screen) " android:launchMode=\"singleTask\"" else "",
+        ) catch @panic("oom"),
+        "@HOME_CATEGORIES@",
+        if (options.home_screen)
+            "\n                <category android:name=\"android.intent.category.HOME\" />\n                <category android:name=\"android.intent.category.DEFAULT\" />"
+        else
+            "",
+    ) catch @panic("oom");
     const service_xml = androidBackgroundServiceXml(b, options);
+    const with_background_service = std.mem.replaceOwned(
+        u8,
+        b.allocator,
+        with_home,
+        "@BACKGROUND_SERVICE@",
+        service_xml,
+    ) catch @panic("oom");
+    const with_system_shell = std.mem.replaceOwned(
+        u8,
+        b.allocator,
+        with_background_service,
+        "@SYSTEM_SHELL_SERVICE@",
+        if (options.system_shell)
+            "        <service android:name=\".PhantomSystemUiService\" android:exported=\"true\" android:permission=\"android.permission.STATUS_BAR_SERVICE\" android:stopWithTask=\"false\">\n            <intent-filter>\n                <action android:name=\"org.phantomui.intent.action.SYSTEM_SHELL\" />\n            </intent-filter>\n        </service>"
+        else
+            "",
+    ) catch @panic("oom");
     const text = std.mem.replaceOwned(
         u8,
         b.allocator,
-        with_transport,
-        "@BACKGROUND_SERVICE@",
-        service_xml,
+        with_system_shell,
+        "@NOTIFICATION_LISTENER@",
+        if (options.system_shell)
+            "        <service android:name=\".PhantomNotificationListener\" android:exported=\"false\" android:label=\"@string/app_name\" android:permission=\"android.permission.BIND_NOTIFICATION_LISTENER_SERVICE\">\n            <intent-filter><action android:name=\"android.service.notification.NotificationListenerService\" /></intent-filter>\n        </service>"
+        else
+            "",
     ) catch @panic("oom");
     return b.addWriteFiles().add("AndroidManifest.xml", text);
 }

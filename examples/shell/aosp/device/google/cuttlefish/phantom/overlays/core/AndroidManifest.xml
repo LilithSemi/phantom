@@ -1,0 +1,10 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.phantom.shell.framework.overlay">
+
+    <application android:hasCode="false" />
+
+    <overlay
+        android:targetPackage="android"
+        android:isStatic="true"
+        android:priority="10" />
+</manifest>

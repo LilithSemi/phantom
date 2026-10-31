@@ -9,6 +9,9 @@ const http_mod = @import("http.zig");
 pub const system = @import("platform/system.zig");
 pub const Connectivity = system.Connectivity;
 pub const WifiNetwork = system.WifiNetwork;
+pub const Application = system.Application;
+pub const Bluetooth = system.Bluetooth;
+pub const SystemNotification = system.SystemNotification;
 pub const Power = system.Power;
 pub const Audio = system.Audio;
 pub const Brightness = system.Brightness;
@@ -129,6 +132,20 @@ pub const NotificationPermissionSink = struct {
     on_result: *const fn (ctx: *anyopaque, result: NotificationPermission) void,
 };
 
+/// Clipboard text is borrowed for the duration of the callback. Null means the
+/// clipboard had no textual value or the host could not read it.
+pub const ClipboardReadSink = struct {
+    ctx: *anyopaque,
+    on_text: *const fn (ctx: *anyopaque, text: ?[]const u8) void,
+};
+
+pub const LifecycleState = enum { foreground, background };
+
+pub const LifecycleSink = struct {
+    ctx: *anyopaque,
+    on_state: *const fn (ctx: *anyopaque, state: LifecycleState) void,
+};
+
 pub const Platform = struct {
     ctx: ?*anyopaque = null,
     /// The HTTP client of a backend that has its own, such as the page `fetch`
@@ -195,6 +212,15 @@ pub const Platform = struct {
     request_wifi_scan: ?*const fn (*anyopaque) bool = null,
     connect_wifi: ?*const fn (*anyopaque, id: []const u8, password: []const u8) bool = null,
     disconnect_wifi: ?*const fn (*anyopaque, id: []const u8) bool = null,
+    read_bluetooth: ?*const fn (*anyopaque) ?Bluetooth = null,
+    set_bluetooth_enabled: ?*const fn (*anyopaque, bool) bool = null,
+    request_bluetooth_discovery: ?*const fn (*anyopaque) bool = null,
+    read_applications: ?*const fn (*anyopaque) ?[]const Application = null,
+    launch_application: ?*const fn (*anyopaque, id: []const u8) bool = null,
+    read_system_notifications: ?*const fn (*anyopaque) ?[]const SystemNotification = null,
+    dismiss_system_notification: ?*const fn (*anyopaque, key: []const u8) bool = null,
+    clear_system_notifications: ?*const fn (*anyopaque) bool = null,
+    invoke_system_notification: ?*const fn (*anyopaque, key: []const u8) bool = null,
     read_power: ?*const fn (*anyopaque) ?Power = null,
     read_audio: ?*const fn (*anyopaque) ?Audio = null,
     set_audio: ?*const fn (*anyopaque, Audio) bool = null,
@@ -207,6 +233,10 @@ pub const Platform = struct {
     restart_system: ?*const fn (*anyopaque) bool = null,
     power_off_system: ?*const fn (*anyopaque) bool = null,
     read_identity: ?*const fn (*anyopaque) ?Identity = null,
+    read_clipboard: ?*const fn (*anyopaque, ClipboardReadSink) bool = null,
+    write_clipboard: ?*const fn (*anyopaque, []const u8) bool = null,
+    lifecycle_state: ?*const fn (*anyopaque) LifecycleState = null,
+    set_lifecycle_sink: ?*const fn (*anyopaque, ?LifecycleSink) void = null,
 
     /// True when the URL was opened. False means NOTHING HAPPENED, and a caller
     /// should say so: no hook on this backend, or a browser that refused the
@@ -356,6 +386,51 @@ pub const Platform = struct {
         return f(c, id);
     }
 
+    pub fn readBluetooth(self: Platform) ?Bluetooth {
+        const f = self.read_bluetooth orelse return null;
+        return f(self.ctx orelse return null);
+    }
+
+    pub fn setBluetoothEnabled(self: Platform, enabled: bool) bool {
+        const f = self.set_bluetooth_enabled orelse return false;
+        return f(self.ctx orelse return false, enabled);
+    }
+
+    pub fn requestBluetoothDiscovery(self: Platform) bool {
+        const f = self.request_bluetooth_discovery orelse return false;
+        return f(self.ctx orelse return false);
+    }
+
+    pub fn readApplications(self: Platform) ?[]const Application {
+        const f = self.read_applications orelse return null;
+        return f(self.ctx orelse return null);
+    }
+
+    pub fn launchApplication(self: Platform, id: []const u8) bool {
+        const f = self.launch_application orelse return false;
+        return f(self.ctx orelse return false, id);
+    }
+
+    pub fn readSystemNotifications(self: Platform) ?[]const SystemNotification {
+        const f = self.read_system_notifications orelse return null;
+        return f(self.ctx orelse return null);
+    }
+
+    pub fn dismissSystemNotification(self: Platform, key: []const u8) bool {
+        const f = self.dismiss_system_notification orelse return false;
+        return f(self.ctx orelse return false, key);
+    }
+
+    pub fn clearSystemNotifications(self: Platform) bool {
+        const f = self.clear_system_notifications orelse return false;
+        return f(self.ctx orelse return false);
+    }
+
+    pub fn invokeSystemNotification(self: Platform, key: []const u8) bool {
+        const f = self.invoke_system_notification orelse return false;
+        return f(self.ctx orelse return false, key);
+    }
+
     pub fn setCellularEnabled(self: Platform, enabled: bool) bool {
         const f = self.set_cellular_enabled orelse return false;
         return f(self.ctx orelse return false, enabled);
@@ -423,6 +498,32 @@ pub const Platform = struct {
         const f = self.read_identity orelse return null;
         return f(self.ctx orelse return null);
     }
+
+    pub fn readClipboard(self: Platform, sink: ClipboardReadSink) bool {
+        const f = self.read_clipboard orelse return false;
+        const c = self.ctx orelse return false;
+        return f(c, sink);
+    }
+
+    pub fn writeClipboard(self: Platform, text: []const u8) bool {
+        const f = self.write_clipboard orelse return false;
+        const c = self.ctx orelse return false;
+        return f(c, text);
+    }
+
+    pub fn lifecycleState(self: Platform) LifecycleState {
+        const f = self.lifecycle_state orelse return .foreground;
+        const c = self.ctx orelse return .foreground;
+        return f(c);
+    }
+
+    /// Installs the single application lifecycle observer. Passing null removes
+    /// it. A host calls a newly installed sink immediately with current state.
+    pub fn setLifecycleSink(self: Platform, sink: ?LifecycleSink) void {
+        const f = self.set_lifecycle_sink orelse return;
+        const c = self.ctx orelse return;
+        f(c, sink);
+    }
 };
 
 pub fn validSettingKey(key: []const u8) bool {
@@ -447,6 +548,8 @@ test "an empty platform reports interactive services as unsupported" {
     const Sink = struct {
         fn file(_: *anyopaque, _: FilePickerResult) void {}
         fn permission(_: *anyopaque, _: NotificationPermission) void {}
+        fn clipboard(_: *anyopaque, _: ?[]const u8) void {}
+        fn lifecycle(_: *anyopaque, _: LifecycleState) void {}
     };
     var context: u8 = 0;
     const p = Platform{};
@@ -458,6 +561,15 @@ test "an empty platform reports interactive services as unsupported" {
     try std.testing.expect(!p.setNetworkingEnabled(true));
     try std.testing.expect(!p.setWifiEnabled(true));
     try std.testing.expect(!p.setCellularEnabled(true));
+    try std.testing.expectEqual(@as(?Bluetooth, null), p.readBluetooth());
+    try std.testing.expect(!p.setBluetoothEnabled(true));
+    try std.testing.expect(!p.requestBluetoothDiscovery());
+    try std.testing.expectEqual(@as(?[]const Application, null), p.readApplications());
+    try std.testing.expect(!p.launchApplication("org.example/.Main"));
+    try std.testing.expectEqual(@as(?[]const SystemNotification, null), p.readSystemNotifications());
+    try std.testing.expect(!p.dismissSystemNotification("key"));
+    try std.testing.expect(!p.clearSystemNotifications());
+    try std.testing.expect(!p.invokeSystemNotification("key"));
     try std.testing.expectEqual(@as(?Power, null), p.readPower());
     try std.testing.expectEqual(@as(?Audio, null), p.readAudio());
     try std.testing.expectEqual(@as(?Brightness, null), p.readBrightness());
@@ -468,6 +580,10 @@ test "an empty platform reports interactive services as unsupported" {
     try std.testing.expect(!p.restartSystem());
     try std.testing.expect(!p.powerOffSystem());
     try std.testing.expectEqual(@as(?Identity, null), p.readIdentity());
+    try std.testing.expect(!p.readClipboard(.{ .ctx = &context, .on_text = Sink.clipboard }));
+    try std.testing.expect(!p.writeClipboard("text"));
+    try std.testing.expectEqual(LifecycleState.foreground, p.lifecycleState());
+    p.setLifecycleSink(.{ .ctx = &context, .on_state = Sink.lifecycle });
 }
 
 test "normalized hardware writes are clamped before reaching a host" {

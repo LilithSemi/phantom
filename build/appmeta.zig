@@ -48,6 +48,23 @@ pub const Icon = struct { path: std.Build.LazyPath, size: u32 };
 
 pub const AndroidOptions = struct {
     permissions: []const Permission = &.{},
+    /// How the Activity shares the display with Android's system bars.
+    /// `.edge_to_edge` draws behind them and reports their safe insets to the
+    /// widget tree. `.immersive` hides them (temporarily revealable by a swipe)
+    /// and reports only the display cutout as unsafe.
+    system_ui: SystemUi = .edge_to_edge,
+    /// Advertise the Activity as a HOME implementation. This is intended for
+    /// platform images and dedicated shell experiments, not ordinary apps.
+    home_screen: bool = false,
+    /// Package persistent Phantom-rendered status and navigation surfaces.
+    /// This requires installation as a platform-signed privileged system app.
+    system_shell: bool = false,
+    /// Create the top system-bar surface when `system_shell` is enabled.
+    system_shell_status_bar: bool = true,
+    /// Create the bottom navigation surface when `system_shell` is enabled.
+    /// Shells that own navigation through gestures, a dock, or other chrome
+    /// can disable this instead of reserving a conventional Android nav bar.
+    system_shell_navigation_bar: bool = true,
     /// Development servers commonly use HTTP. This remains off unless an app
     /// explicitly opts into Android's cleartext transport policy.
     uses_cleartext_traffic: bool = false,
@@ -58,6 +75,11 @@ pub const AndroidOptions = struct {
     /// starts it on a worker thread when the Activity first opens and asks it
     /// to stop when Android destroys the service.
     background_service: ?BackgroundService = null,
+
+    pub const SystemUi = enum {
+        edge_to_edge,
+        immersive,
+    };
 
     pub const BackgroundService = struct {
         module: *std.Build.Module,
@@ -93,11 +115,51 @@ pub const AndroidOptions = struct {
     pub const Permission = enum {
         internet,
         notifications,
+        status_bar_service,
+        internal_system_window,
+        network_state,
+        wifi_state,
+        wifi_control,
+        wifi_privileged,
+        nearby_wifi,
+        fine_location,
+        cellular_state,
+        cellular_control,
+        bluetooth,
+        bluetooth_scan,
+        bluetooth_privileged,
+        app_discovery,
+        running_tasks,
+        manage_activity_tasks,
+        read_frame_buffer,
+        audio_settings,
+        control_display_brightness,
+        query_users,
 
         pub fn manifestName(self: Permission) []const u8 {
             return switch (self) {
                 .internet => "android.permission.INTERNET",
                 .notifications => "android.permission.POST_NOTIFICATIONS",
+                .status_bar_service => "android.permission.STATUS_BAR_SERVICE",
+                .internal_system_window => "android.permission.INTERNAL_SYSTEM_WINDOW",
+                .network_state => "android.permission.ACCESS_NETWORK_STATE",
+                .wifi_state => "android.permission.ACCESS_WIFI_STATE",
+                .wifi_control => "android.permission.CHANGE_WIFI_STATE",
+                .wifi_privileged => "android.permission.NETWORK_SETTINGS",
+                .nearby_wifi => "android.permission.NEARBY_WIFI_DEVICES",
+                .fine_location => "android.permission.ACCESS_FINE_LOCATION",
+                .cellular_state => "android.permission.READ_PHONE_STATE",
+                .cellular_control => "android.permission.MODIFY_PHONE_STATE",
+                .bluetooth => "android.permission.BLUETOOTH_CONNECT",
+                .bluetooth_scan => "android.permission.BLUETOOTH_SCAN",
+                .bluetooth_privileged => "android.permission.BLUETOOTH_PRIVILEGED",
+                .app_discovery => "android.permission.QUERY_ALL_PACKAGES",
+                .running_tasks => "android.permission.REAL_GET_TASKS",
+                .manage_activity_tasks => "android.permission.MANAGE_ACTIVITY_TASKS",
+                .read_frame_buffer => "android.permission.READ_FRAME_BUFFER",
+                .audio_settings => "android.permission.MODIFY_AUDIO_SETTINGS",
+                .control_display_brightness => "android.permission.CONTROL_DISPLAY_BRIGHTNESS",
+                .query_users => "android.permission.QUERY_USERS",
             };
         }
     };
@@ -107,6 +169,11 @@ test "Android capabilities are opt-in" {
     const defaults = AndroidOptions{};
     try std.testing.expectEqual(@as(usize, 0), defaults.permissions.len);
     try std.testing.expect(!defaults.uses_cleartext_traffic);
+    try std.testing.expectEqual(AndroidOptions.SystemUi.edge_to_edge, defaults.system_ui);
+    try std.testing.expect(!defaults.home_screen);
+    try std.testing.expect(!defaults.system_shell);
+    try std.testing.expect(defaults.system_shell_status_bar);
+    try std.testing.expect(defaults.system_shell_navigation_bar);
     try std.testing.expectEqualStrings(
         "android.permission.INTERNET",
         AndroidOptions.Permission.internet.manifestName(),
@@ -114,6 +181,10 @@ test "Android capabilities are opt-in" {
     try std.testing.expectEqualStrings(
         "android.permission.POST_NOTIFICATIONS",
         AndroidOptions.Permission.notifications.manifestName(),
+    );
+    try std.testing.expectEqualStrings(
+        "android.permission.INTERNAL_SYSTEM_WINDOW",
+        AndroidOptions.Permission.internal_system_window.manifestName(),
     );
 }
 

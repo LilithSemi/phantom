@@ -1,0 +1,354 @@
+package @PACKAGE@;
+
+import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.graphics.Insets;
+import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.os.Binder;
+import android.os.IBinder;
+import android.view.Choreographer;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.WindowInsets;
+import android.view.WindowManager;
+import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+
+/** Owns the Phantom shell surfaces selected by the shell package. */
+public final class PhantomSystemUiService extends Service {
+    public static final String ACTION_SYSTEM = "org.phantomui.intent.action.SYSTEM_UI_ACTION";
+    public static final String ACTION_SYSTEM_BARS = "org.phantomui.intent.action.SYSTEM_BARS_CHANGED";
+    public static final String EXTRA_SYSTEM_ACTION = "action";
+    private static final String EXTRA_REQUESTED_VISIBLE_TYPES = "requested_visible_types";
+    private static final String EXTRA_TRANSIENT_TYPES = "transient_types";
+    private static final String EXTRA_BEHAVIOR = "behavior";
+    private static final String STATUS_BAR_SERVICE_PERMISSION =
+            "android.permission.STATUS_BAR_SERVICE";
+
+    // Hidden platform window constants. The APK is platform-signed in AOSP and
+    // explicitly holds STATUS_BAR_SERVICE and INTERNAL_SYSTEM_WINDOW.
+    private static final int TYPE_STATUS_BAR = 2000;
+    private static final int TYPE_STATUS_BAR_SUB_PANEL = 2017;
+    private static final int TYPE_NAVIGATION_BAR = 2019;
+    private static final boolean ENABLE_STATUS_BAR = @ENABLE_STATUS_BAR@;
+    private static final boolean ENABLE_NAVIGATION_BAR = @ENABLE_NAVIGATION_BAR@;
+
+    private WindowManager windowManager;
+    private final Binder serviceBinder = new Binder();
+    private final Binder insetsSourceOwner = new Binder();
+    private ChromeView statusView;
+    private ChromeView statusMenuView;
+    private ChromeView navigationView;
+    private int requestedVisibleTypes =
+            WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars();
+    private int transientTypes;
+    private int behavior;
+
+    private final BroadcastReceiver systemBarsReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            requestedVisibleTypes = intent.getIntExtra(
+                    EXTRA_REQUESTED_VISIBLE_TYPES, requestedVisibleTypes);
+            transientTypes = intent.getIntExtra(EXTRA_TRANSIENT_TYPES, transientTypes);
+            behavior = intent.getIntExtra(EXTRA_BEHAVIOR, behavior);
+            applySystemBarState();
+        }
+    };
+
+    @Override public void onCreate() {
+        super.onCreate();
+        windowManager = getSystemService(WindowManager.class);
+        registerReceiver(
+                systemBarsReceiver,
+                new IntentFilter(ACTION_SYSTEM_BARS),
+                STATUS_BAR_SERVICE_PERMISSION,
+                null,
+                Context.RECEIVER_EXPORTED);
+        applySystemBarState();
+    }
+
+    private void applySystemBarState() {
+        int visibleTypes = MainActivity.nativeSystemBarsChanged(
+                requestedVisibleTypes, transientTypes, behavior);
+        boolean showStatus = ENABLE_STATUS_BAR
+                && (visibleTypes & WindowInsets.Type.statusBars()) != 0;
+        boolean showNavigation = ENABLE_NAVIGATION_BAR
+                && (visibleTypes & WindowInsets.Type.navigationBars()) != 0;
+
+        if (showStatus && statusView == null) {
+            statusView = new ChromeView(this, 1);
+            addChrome(statusView, TYPE_STATUS_BAR, Gravity.TOP, 36, true, "Phantom status");
+        } else if (!showStatus && statusView != null) {
+            setStatusExpanded(false);
+            windowManager.removeView(statusView);
+            statusView = null;
+        }
+        if (showNavigation && navigationView == null) {
+            navigationView = new ChromeView(this, 2);
+            addChrome(navigationView, TYPE_NAVIGATION_BAR, Gravity.BOTTOM, 64, true, "Phantom navigation");
+        } else if (!showNavigation && navigationView != null) {
+            windowManager.removeView(navigationView);
+            navigationView = null;
+        }
+    }
+
+    private void addChrome(
+            ChromeView view,
+            int type,
+            int gravity,
+            int heightDp,
+            boolean touchable,
+            String title) {
+        int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+        if (type == TYPE_STATUS_BAR) {
+            flags |= WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS;
+        } else {
+            flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH;
+        }
+        if (!touchable) flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+        int heightPx = Math.round(heightDp * getResources().getDisplayMetrics().density);
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                heightPx,
+                type,
+                flags,
+                PixelFormat.TRANSLUCENT);
+        params.gravity = gravity;
+        params.token = new Binder();
+        params.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        params.setFitInsetsTypes(0);
+        params.setTitle(title);
+        setProvidedInsets(params, type, heightPx);
+        windowManager.addView(view, params);
+    }
+
+    private void setStatusExpanded(boolean expanded) {
+        if (expanded && statusMenuView == null) {
+            statusMenuView = new ChromeView(this, 3);
+            int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+            WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    TYPE_STATUS_BAR_SUB_PANEL,
+                    flags,
+                    PixelFormat.TRANSLUCENT);
+            params.gravity = Gravity.TOP;
+            params.token = new Binder();
+            params.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+            params.setFitInsetsTypes(0);
+            params.setTitle("Phantom status menu");
+            windowManager.addView(statusMenuView, params);
+        } else if (!expanded && statusMenuView != null) {
+            windowManager.removeView(statusMenuView);
+            statusMenuView = null;
+        }
+    }
+
+    private void sendSystemAction(int action) {
+        Intent intent = new Intent(ACTION_SYSTEM)
+                .setPackage("com.android.systemui")
+                .putExtra(EXTRA_SYSTEM_ACTION, action);
+        sendBroadcast(intent);
+    }
+
+    /**
+     * Publish the same inset sources that Android's stock bar windows publish.
+     * InsetsFrameProvider is a hidden platform type, so the standalone SDK build
+     * reaches it reflectively. The AOSP product signs this APK with the platform
+     * key, which disables hidden-API enforcement for the installed shell.
+     */
+    private void setProvidedInsets(WindowManager.LayoutParams params, int windowType, int size) {
+        try {
+            Class<?> providerClass = Class.forName("android.view.InsetsFrameProvider");
+            Constructor<?> constructor =
+                    providerClass.getConstructor(Object.class, int.class, int.class);
+            Method setInsetsSize = providerClass.getMethod("setInsetsSize", Insets.class);
+
+            int[] types;
+            Insets inset;
+            if (windowType == TYPE_STATUS_BAR) {
+                types = new int[] {
+                        WindowInsets.Type.statusBars(),
+                        WindowInsets.Type.tappableElement()
+                };
+                inset = Insets.of(0, size, 0, 0);
+            } else {
+                types = new int[] {
+                        WindowInsets.Type.navigationBars(),
+                        WindowInsets.Type.tappableElement(),
+                        WindowInsets.Type.mandatorySystemGestures()
+                };
+                inset = Insets.of(0, 0, 0, size);
+            }
+
+            Object providers = Array.newInstance(providerClass, types.length);
+            for (int i = 0; i < types.length; ++i) {
+                Object provider = constructor.newInstance(insetsSourceOwner, 0, types[i]);
+                setInsetsSize.invoke(provider, inset);
+                Array.set(providers, i, provider);
+            }
+            Field providedInsets = WindowManager.LayoutParams.class.getField("providedInsets");
+            providedInsets.set(params, providers);
+        } catch (ReflectiveOperationException exception) {
+            throw new IllegalStateException("Unable to publish Phantom system-bar insets", exception);
+        }
+    }
+
+    @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        return START_STICKY;
+    }
+
+    @Override public void onDestroy() {
+        unregisterReceiver(systemBarsReceiver);
+        if (statusMenuView != null) windowManager.removeView(statusMenuView);
+        if (statusView != null) windowManager.removeView(statusView);
+        if (navigationView != null) windowManager.removeView(navigationView);
+        statusMenuView = null;
+        statusView = null;
+        navigationView = null;
+        super.onDestroy();
+    }
+
+    @Override public IBinder onBind(Intent intent) {
+        return serviceBinder;
+    }
+
+    private static final class ChromeView extends SurfaceView
+            implements SurfaceHolder.Callback, Choreographer.FrameCallback {
+        private final PhantomSystemUiService service;
+        private final int role;
+        private long handle;
+        private boolean attached;
+        private boolean frameScheduled;
+        private boolean expanded;
+
+        ChromeView(PhantomSystemUiService service, int role) {
+            super(service);
+            this.service = service;
+            this.role = role;
+            byte[] filesDir = service.getFilesDir().getAbsolutePath().getBytes(StandardCharsets.UTF_8);
+            if (MainActivity.nativeBeginFilesDir(filesDir.length) != 0) {
+                for (int i = 0; i < filesDir.length; ++i) {
+                    MainActivity.nativeFilesDirByte(i, filesDir[i] & 0xff);
+                }
+            }
+            getHolder().setFormat(PixelFormat.TRANSLUCENT);
+            // SurfaceView otherwise punches an opaque hole in its host window.
+            // The shell window's own type still determines ordering against apps.
+            setZOrderOnTop(true);
+            getHolder().addCallback(this);
+            setClickable(role == 1 || role == 2);
+        }
+
+        @Override public void surfaceCreated(SurfaceHolder holder) {
+            Rect frame = holder.getSurfaceFrame();
+            if (frame.width() == 0 || frame.height() == 0) return;
+            float density = getResources().getDisplayMetrics().density;
+            handle = MainActivity.nativeCreate(
+                    role,
+                    frame.width(),
+                    frame.height(),
+                    density,
+                    getResources().getConfiguration().fontScale,
+                    0, 0, 0, 0, 0);
+            attached = handle != 0 && MainActivity.nativeSurfaceCreated(
+                    handle, holder.getSurface(), frame.width(), frame.height(), density) != 0;
+            scheduleFrame();
+        }
+
+        @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+            scheduleFrame();
+        }
+
+        @Override public void surfaceDestroyed(SurfaceHolder holder) {
+            attached = false;
+            if (frameScheduled) Choreographer.getInstance().removeFrameCallback(this);
+            frameScheduled = false;
+            if (handle != 0) MainActivity.nativeSurfaceDestroyed(handle);
+        }
+
+        @Override protected void onDetachedFromWindow() {
+            if (handle != 0) {
+                MainActivity.nativeDestroy(handle);
+                handle = 0;
+            }
+            super.onDetachedFromWindow();
+        }
+
+        @Override public void doFrame(long frameNanos) {
+            frameScheduled = false;
+            if (!attached || handle == 0) return;
+            MainActivity.pumpPlatform(getContext());
+            MainActivity.nativeRender(
+                    handle,
+                    getWidth(),
+                    getHeight(),
+                    getResources().getDisplayMetrics().density,
+                    getResources().getConfiguration().fontScale,
+                    0, 0, 0, 0,
+                    frameNanos);
+            if (role == 1 || role == 3) {
+                boolean nextExpanded = (MainActivity.nativeSystemShellState() & 1) != 0;
+                if (expanded != nextExpanded) {
+                    expanded = nextExpanded;
+                    post(() -> service.setStatusExpanded(nextExpanded));
+                }
+            }
+            int action = MainActivity.nativeTakeSystemAction();
+            if (action != 0) service.sendSystemAction(action);
+            scheduleFrame();
+        }
+
+        private void scheduleFrame() {
+            if (!attached || frameScheduled) return;
+            frameScheduled = true;
+            Choreographer.getInstance().postFrameCallback(this);
+        }
+
+        @Override public boolean onTouchEvent(MotionEvent event) {
+            if (handle == 0 || (role != 1 && role != 2 && role != 3)) return false;
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_MOVE) {
+                for (int i = 0; i < event.getPointerCount(); ++i) {
+                    MainActivity.nativeTouch(
+                            handle, 1, event.getPointerId(i), event.getX(i), event.getY(i));
+                }
+            } else if (action == MotionEvent.ACTION_CANCEL) {
+                for (int i = 0; i < event.getPointerCount(); ++i) {
+                    MainActivity.nativeTouch(
+                            handle, 3, event.getPointerId(i), event.getX(i), event.getY(i));
+                }
+            } else if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN
+                    || action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP) {
+                int index = event.getActionIndex();
+                int translated = (action == MotionEvent.ACTION_DOWN
+                        || action == MotionEvent.ACTION_POINTER_DOWN) ? 0 : 2;
+                MainActivity.nativeTouch(
+                        handle,
+                        translated,
+                        event.getPointerId(index),
+                        event.getX(index),
+                        event.getY(index));
+                if (action == MotionEvent.ACTION_UP) performClick();
+            }
+            scheduleFrame();
+            return true;
+        }
+
+        @Override public boolean performClick() {
+            super.performClick();
+            return true;
+        }
+    }
+}

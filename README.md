@@ -232,91 +232,11 @@ also what lets two sessions run in one process.
 
 ## Platform services
 
-`BuildContext.owner.platform` exposes capabilities that do not belong to the
-widget tree: file selection, notifications, and persistent settings. Capability
-calls report unsupported hosts instead of silently succeeding. File selection
-and permission requests complete through callbacks because browsers and Android
-may show UI after the initiating frame has returned.
-
-Settings are opaque byte values addressed by portable UTF-8 keys. Linux writes
-one deterministic ZON document to
-`$XDG_CONFIG_HOME/<application-id>/settings.zon`, or
-`$HOME/.config/<application-id>/settings.zon` when `XDG_CONFIG_HOME` is not
-set. Writes replace the document atomically. Web builds use a namespace in
-`localStorage` scoped by the same reverse-DNS application id.
-
-Android local notifications use `NotificationManager`. Apps that enable the
-`.notifications` Android permission can request the Android 13 notification
-permission through the platform API. Phantom does not select or bundle a remote
-notification transport.
-
-An Android app can package a Zig module as a foreground background service:
-
-```zig
-const service = b.createModule(.{
-    .root_source_file = b.path("src/android/service.zig"),
-    .target = target,
-    .optimize = optimize,
-});
-
-.android = .{
-    .permissions = &.{ .internet, .notifications },
-    .background_service = .{
-        .module = service,
-        .notification_title = "Connected to Chock",
-        .notification_body = "Listening for session updates",
-        .service_type = .special_use,
-        .special_use_subtype = "persistent connection to a user-configured Chock daemon",
-    },
-},
-```
-
-The module exports `run(*phantom.android.BackgroundService) !void`. Phantom
-runs it on a worker thread; it can use `io()`, `filesDir()`, `shouldStop()`, and
-`showNotification()`. `run` must return when `shouldStop()` becomes true. A
-module blocked on its own socket can additionally export `stop(service)` to
-close that socket before Phantom joins the worker. Android always displays the
-configured ongoing notification while the service runs.
+[Platform services](docs/platform-services.md) documents file selection,
+clipboard access, notifications, lifecycle state, persistent settings, and
+Android foreground background-service modules.
 
 ## Building and running
 
-```sh
-zig build test          # the full test suite
-zig build run-hello     # the window backend (needs a Wayland compositor)
-zig build run-hello:web # builds the wasm + HTML demo
-zig build run-hello:tui # the terminal backend (needs a real terminal)
-```
-
-An Android target builds and packages an APK through the same `addApp` step as
-the native and web targets. Phantom mounts and lays out the application's real
-widget tree and renders its display list with Prism's Vulkan driver. Lattice
-owns the asynchronous Android surface lifecycle, and Prism presents directly to
-the `ANativeWindow` swapchain without a CPU readback or Android bitmap. This
-path shares Prism's text, images, clipping, rounded rectangles, and built-in
-icon rendering with the desktop backend. Raw multi-touch, virtual-keyboard
-commits, IME composition, deletion, and editor actions enter through Lattice's
-neutral event model.
-
-```sh
-cd examples/app
-zig build -Dtarget=aarch64-linux-android.24
-adb install -r zig-out/bin/demo-debug.apk
-```
-
-The Nix development shell supplies Android SDK 36, the NDK, JDK 17, and Gradle.
-Outside Nix, set `ANDROID_NDK_ROOT` and put Gradle on `PATH`. The
-`-Dandroid-ndk` and `-Dandroid-gradle` options override those locations.
-
-### Native window chrome
-
-Native window sessions add a draggable title bar with minimize, maximize/restore,
-and close buttons when Lattice negotiates client-side decorations. Fullscreen
-windows and windows with server-side decorations hide the bar. `WindowChrome`,
-`WindowTitleBar`, and `WindowController` are also exported for custom hosts.
-
-Mobile detection runs at startup, including on Linux: it checks mobile desktop
-sessions such as Phosh and Plasma Mobile, chassis metadata, and device-tree
-hints. Native Android and iOS targets are also classified as mobile. Devices
-without identifying metadata can use `window.Options.mobile = true` to suppress
-the chrome; `false` explicitly selects desktop behavior. Window width alone
-does not classify a device.
+See [Building and platform targets](docs/building.md) for native, web, terminal,
+Android, immersive shell, and native window-chrome instructions.

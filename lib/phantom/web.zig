@@ -46,6 +46,9 @@ pub const WebApp = struct {
     event_sources: [max_event_sources]EventSourceSlot = @splat(.{}),
     file_picker_sink: ?phantom.FilePickerSink = null,
     notification_permission_sink: ?phantom.NotificationPermissionSink = null,
+    clipboard_sink: ?phantom.ClipboardReadSink = null,
+    lifecycle_state: phantom.LifecycleState = .foreground,
+    lifecycle_sink: ?phantom.LifecycleSink = null,
     /// The fonts already registered with the browser, so each is registered
     /// once. Page-lifetime, because a face registered on one frame has to still
     /// count as registered on the next.
@@ -117,6 +120,18 @@ pub const WebApp = struct {
         const sink = self.notification_permission_sink orelse return;
         self.notification_permission_sink = null;
         sink.on_result(sink.ctx, result);
+    }
+
+    pub fn clipboardRead(self: *WebApp, text: ?[]const u8) void {
+        const sink = self.clipboard_sink orelse return;
+        self.clipboard_sink = null;
+        sink.on_text(sink.ctx, text);
+    }
+
+    pub fn lifecycleChanged(self: *WebApp, state: phantom.LifecycleState) void {
+        if (self.lifecycle_state == state) return;
+        self.lifecycle_state = state;
+        if (self.lifecycle_sink) |sink| sink.on_state(sink.ctx, state);
     }
 
     /// Register every font this frame draws with that has not been registered
@@ -532,6 +547,33 @@ fn requestNotificationPermissionThunk(ctx: *anyopaque, sink: phantom.Notificatio
 fn showNotificationThunk(ctx: *anyopaque, notification: phantom.Notification) bool {
     const app: *WebApp = @ptrCast(@alignCast(ctx));
     return app.ops.show_notification.?(app.ops.ctx, notification);
+}
+
+fn readClipboardThunk(ctx: *anyopaque, sink: phantom.ClipboardReadSink) bool {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    if (app.clipboard_sink != null) return false;
+    app.clipboard_sink = sink;
+    if (!app.ops.read_clipboard.?(app.ops.ctx, @intFromPtr(app))) {
+        app.clipboard_sink = null;
+        return false;
+    }
+    return true;
+}
+
+fn writeClipboardThunk(ctx: *anyopaque, text: []const u8) bool {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    return app.ops.write_clipboard.?(app.ops.ctx, text);
+}
+
+fn lifecycleStateThunk(ctx: *anyopaque) phantom.LifecycleState {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    return app.lifecycle_state;
+}
+
+fn setLifecycleSinkThunk(ctx: *anyopaque, sink: ?phantom.LifecycleSink) void {
+    const app: *WebApp = @ptrCast(@alignCast(ctx));
+    app.lifecycle_sink = sink;
+    if (sink) |value| value.on_state(value.ctx, app.lifecycle_state);
 }
 
 fn readLocationThunk(ctx: *anyopaque, buf: []u8) ?[]const u8 {
@@ -1140,6 +1182,10 @@ pub fn mount(
         .notification_permission = if (ops.notification_permission != null) notificationPermissionThunk else null,
         .request_notification_permission = if (ops.request_notification_permission != null) requestNotificationPermissionThunk else null,
         .show_notification = if (ops.show_notification != null) showNotificationThunk else null,
+        .read_clipboard = if (ops.read_clipboard != null) readClipboardThunk else null,
+        .write_clipboard = if (ops.write_clipboard != null) writeClipboardThunk else null,
+        .lifecycle_state = lifecycleStateThunk,
+        .set_lifecycle_sink = setLifecycleSinkThunk,
         .strategy = strategy,
         .native_scrollbars = true,
     };
