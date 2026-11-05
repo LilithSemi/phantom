@@ -225,7 +225,7 @@ pub const PixelSurface = struct {
             // it and force the software rasterizer, which has no display to sleep and
             // is correct whenever it starts at all.
             selected.device.deinit();
-            const sw = prism.drivers.select("software") orelse return error.NoPrismDevice;
+            const sw = prism.drivers.select("software", io) orelse return error.NoPrismDevice;
             const sw_device = try sw.createDevice(gpa, io);
             errdefer sw_device.deinit();
             const built = try bringUp(gpa, sw_device, width, height);

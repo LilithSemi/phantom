@@ -9,12 +9,12 @@
             .hash = "webidl_zig-0.1.0-FrIyV4ARBwDm9n_tOpop47X8vgsc-rZlldhnsVKfgy2A",
         },
         .lattice = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/lattice#d580243aa7f9f6787cf5e3e360d9103e16e0f47a",
-            .hash = "lattice-0.1.0-TdtxHEH1CgCgShY3GiWRoKfI3BMM5PIf4DRVVSrLprb8",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/lattice#6e2769766516ffe8fa8d332b73803fc3924418f5",
+            .hash = "lattice-0.1.0-TdtxHEX1CgCjKS5PE-1n2TqXhLaiLDZDJHVA8nX6HPqD",
         },
         .prism = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/prism#b1708b0ff61f1b77b804e2b4c4bfade1e8fc2d8e",
-            .hash = "prism-0.1.0-PSE12M3eOQARa-Ng1P1MeKN8yS7rWuiyGARebytb9S9O",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/prism#afa88e9db739130ce2ff7bd2dda90462ef31eaaf",
+            .hash = "prism-0.1.0-PSE12K7fNwCzNRFU7TWEcbqHxHNo0QNo2M8H2OjCO5KD",
         },
         .dbus = .{
             .url = "git+https://git.lilithsemi.com/LilithSemi/dbus.zig#ac21c343ceee75c0a5ea1793096751ca851abfa1",
