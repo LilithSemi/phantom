@@ -371,6 +371,7 @@ const RenderScrollView = struct {
     /// The controller this view is attached to, kept so `destroyFn` can detach.
     controller: ?*ScrollController = null,
     axis: ScrollView.Axis = .vertical,
+    fill_viewport: bool = false,
     moved: u32 = 0,
     owner: ?*phantom.BuildOwner = null,
     bars: Scrollbars = .{},
@@ -384,7 +385,7 @@ const RenderScrollView = struct {
                 .vertical => .{
                     .min_width = 0,
                     .max_width = vp.width,
-                    .min_height = 0,
+                    .min_height = if (self.fill_viewport) vp.height else 0,
                     .max_height = std.math.inf(f32),
                     .scale = c.scale,
                 },
@@ -527,6 +528,9 @@ const RenderScrollView = struct {
 pub const ScrollView = struct {
     child: Widget,
     axis: Axis = .vertical,
+    /// Make vertical content at least as tall as the viewport, so short content
+    /// can be aligned within the viewport while taller content still scrolls.
+    fill_viewport: bool = false,
     /// The handle an application scrolls this view through. The view attaches itself
     /// to it on mount and detaches on unmount, so the caller only has to keep the
     /// controller alive for as long as the widget is mounted.
@@ -557,6 +561,7 @@ pub const ScrollView = struct {
             .gpa = gpa,
             .handlers = .{ .ctx = ro },
             .axis = self.axis,
+            .fill_viewport = self.fill_viewport,
             .owner = bctx.owner,
         };
         ro.bars.setColors(parent);
@@ -590,6 +595,7 @@ pub const ScrollView = struct {
         const self: *const ScrollView = @ptrCast(@alignCast(ptr));
         const ro: *RenderScrollView = @fieldParentPtr("base", el.render_object.?);
         ro.axis = self.axis;
+        ro.fill_viewport = self.fill_viewport;
         try ro.id.set(ro.gpa, self.id);
         ro.bars.setColors(el.parent);
         ro.installHandlers();
@@ -633,6 +639,26 @@ test "ScrollView layout: viewport == tight constraints, content == child natural
 
     // content is the child's natural height (Text at size 200 > 100px)
     try std.testing.expect(ro.content.height > 100);
+}
+
+test "a vertical ScrollView can fill its viewport for short aligned content" {
+    const gpa = std.testing.allocator;
+    var sink = phantom.FaultSink{};
+    var owner = phantom.BuildOwner{ .gpa = gpa, .sink = &sink };
+    defer owner.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var bctx = phantom.BuildContext{ .arena = arena.allocator(), .owner = &owner };
+
+    const box = phantom.ColoredBox{ .color = phantom.Color.rgb(1, 1, 1) };
+    const short_content = phantom.SizedBox{ .width = 20, .height = 20, .child = box.widget() };
+    var sv = ScrollView{ .fill_viewport = true, .child = short_content.widget() };
+    const el = try sv.widget().mount(&bctx, null);
+    defer el.deinit(gpa);
+
+    _ = el.render_object.?.layout(layout.BoxConstraints.tight(.{ .width = 100, .height = 100 }));
+    const ro: *RenderScrollView = @fieldParentPtr("base", el.render_object.?);
+    try std.testing.expectEqual(@as(f32, 100), ro.content.height);
 }
 
 test "a horizontal ScrollView takes the height of its content, inside the constraints" {
