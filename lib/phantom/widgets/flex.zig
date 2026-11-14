@@ -272,12 +272,12 @@ pub const RenderFlex = struct {
             }
         }
 
-        // total_cross is the tallest (or widest) child seen above. Standard flex
-        // behaviour sizes the cross axis to that child whenever the parent did not
-        // hand this flex a bound to fill. The constraints have the last word on
-        // both axes, so a minimum extent makes the flex grow past its children.
+        // total_cross is the tallest (or widest) child seen above, and the cross axis
+        // takes it. The constraints have the last word, so a tight cross axis still
+        // fills. A loose one must not: a Row that filled the height a Column offered
+        // would leave the Column's other children none.
         const wanted_main = if (shrink_main) total_main else mainExtent(self.direction, size);
-        const wanted_cross = if (main_unbounded or cross_unbounded) total_cross else crossExtent(self.direction, size);
+        const wanted_cross = total_cross;
         const final = c.constrain(sizeFor(self.direction, wanted_main, wanted_cross));
         const cross_ext = crossExtent(self.direction, final);
         const spacing = spacingFor(self.main, mainExtent(self.direction, final) - total_main, self.children.items.len);
@@ -1453,4 +1453,46 @@ test "a Row inside a ScrollView gives its child nonzero height, and a tap there 
         .y = target.origin.y + target.size.height / 2.0,
     });
     try std.testing.expectEqual(@as(u32, 1), taps);
+}
+
+test "a Row inside a Column keeps the height of its children, so the Column's Expanded child gets the rest" {
+    const gpa = std.testing.allocator;
+    var bar_child = FixedBox.make(100, 40);
+    var bar = RenderFlex{
+        .base = .{ .layoutFn = RenderFlex.layoutFn, .paintFn = RenderFlex.paintFn, .destroyFn = RenderFlex.destroyFn },
+        .gpa = gpa,
+        .direction = .horizontal,
+        .main = .start,
+        .cross = .start,
+    };
+    defer {
+        bar.children.deinit(gpa);
+        bar.offsets.deinit(gpa);
+    }
+    try bar.children.append(gpa, &bar_child.base);
+
+    var body = GreedyBox.make();
+    var expanded = makeFlexible(&body.base, 1, .tight);
+    var column = RenderFlex{
+        .base = .{ .layoutFn = RenderFlex.layoutFn, .paintFn = RenderFlex.paintFn, .destroyFn = RenderFlex.destroyFn },
+        .gpa = gpa,
+        .direction = .vertical,
+        .main = .start,
+        .cross = .start,
+    };
+    defer {
+        column.children.deinit(gpa);
+        column.offsets.deinit(gpa);
+    }
+    try column.children.append(gpa, &bar.base);
+    try column.children.append(gpa, &expanded.base);
+
+    const size = column.base.layout(layout.BoxConstraints.tight(.{ .width = 800, .height = 600 }));
+    try std.testing.expectEqual(@as(f32, 600), size.height);
+    // The bar is a Row of one 40 high child. A Row that filled the height it was
+    // offered would leave the body nothing and push it off the bottom edge.
+    try std.testing.expectEqual(@as(f32, 40), bar.base.size.height);
+    try std.testing.expectEqual(@as(f32, 800), bar.base.size.width);
+    try std.testing.expectEqual(@as(f32, 40), column.offsets.items[1].y);
+    try std.testing.expectEqual(@as(f32, 560), body.base.size.height);
 }
