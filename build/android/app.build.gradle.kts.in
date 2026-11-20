@@ -2,6 +2,15 @@ plugins {
     id("com.android.application")
 }
 
+val releaseSigningValues = listOf(
+    "PHANTOM_ANDROID_KEYSTORE", "PHANTOM_ANDROID_STORE_PASSWORD",
+    "PHANTOM_ANDROID_KEY_ALIAS", "PHANTOM_ANDROID_KEY_PASSWORD"
+).map { System.getenv(it) }
+require(releaseSigningValues.all { it != null } || releaseSigningValues.all { it == null }) {
+    "Set all PHANTOM_ANDROID_KEYSTORE, PHANTOM_ANDROID_STORE_PASSWORD, PHANTOM_ANDROID_KEY_ALIAS and PHANTOM_ANDROID_KEY_PASSWORD variables, or none of them"
+}
+val hasReleaseSigning = releaseSigningValues.all { it != null }
+
 android {
     namespace = "@APP_ID@"
     compileSdk = 36
@@ -10,16 +19,19 @@ android {
         applicationId = "@APP_ID@"
         minSdk = @API_LEVEL@
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = @VERSION_CODE@
+        versionName = "@VERSION_NAME@"
         resValue("string", "app_name", "@APP_NAME@")
     }
-    buildTypes {
-        // Android will not scan an unsigned APK, including one preinstalled on
-        // a system partition. Use Gradle's development key until callers can
-        // supply their own release signing configuration.
-        getByName("release") {
-            signingConfig = signingConfigs.getByName("debug")
+    if (hasReleaseSigning) {
+        val releaseKey = signingConfigs.create("phantomRelease") {
+            storeFile = file(releaseSigningValues[0]!!)
+            storePassword = releaseSigningValues[1]
+            keyAlias = releaseSigningValues[2]
+            keyPassword = releaseSigningValues[3]
+        }
+        buildTypes.getByName("release") {
+            signingConfig = releaseKey
         }
     }
 }
@@ -31,7 +43,7 @@ tasks.register("phantomApk") {
         val output = file(phantomOutput.get())
         output.parentFile.mkdirs()
         copy {
-            from(layout.buildDirectory.file("@APK_SOURCE@"))
+            from(layout.buildDirectory.file("@APK_SOURCE@" + if ("@ASSEMBLE_TASK@" == "assembleRelease" && !hasReleaseSigning) "-unsigned.apk" else ".apk"))
             into(output.parentFile)
             rename { output.name }
         }

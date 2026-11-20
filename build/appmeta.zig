@@ -47,6 +47,10 @@ pub const LocalizedText = struct {
 pub const Icon = struct { path: std.Build.LazyPath, size: u32 };
 
 pub const AndroidOptions = struct {
+    /// Increment for each Android release; Android uses this to order updates.
+    version_code: u32 = 1,
+    /// User-visible Android version.
+    version_name: []const u8 = "0.1.0",
     permissions: []const Permission = &.{},
     /// How the Activity shares the display with Android's system bars.
     /// `.edge_to_edge` draws behind them and reports their safe insets to the

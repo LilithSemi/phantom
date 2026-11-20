@@ -123,6 +123,9 @@ pub fn addApp(b: *std.Build, phantom_dep: *std.Build.Dependency, opts: appmeta.A
 /// Android runtime work can grow this entry without changing the app module or
 /// the artifact Gradle consumes.
 fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod: *std.Build.Module, opts: appmeta.AppOptions) *std.Build.Step {
+    if (opts.android.version_code == 0 or opts.android.version_code > 2_100_000_000) {
+        return &b.addFail("phantom.addApp: Android version_code must be between 1 and 2100000000").step;
+    }
     const api_level = opts.target.result.os.version_range.linux.android;
     const abi, const ndk_triple = switch (opts.target.result.cpu.arch) {
         .aarch64 => .{ "arm64-v8a", "aarch64-linux-android" },
@@ -209,8 +212,10 @@ fn addAndroidApp(b: *std.Build, phantom_dep: *std.Build.Dependency, phantom_mod:
         .APP_ID = opts.id,
         .API_LEVEL = api_level,
         .APP_NAME = androidStringEscape(b, opts.name.default),
+        .VERSION_CODE = opts.android.version_code,
+        .VERSION_NAME = androidStringEscape(b, opts.android.version_name),
         .ASSEMBLE_TASK = if (android_release) "assembleRelease" else "assembleDebug",
-        .APK_SOURCE = if (android_release) "outputs/apk/release/app-release.apk" else "outputs/apk/debug/app-debug.apk",
+        .APK_SOURCE = if (android_release) "outputs/apk/release/app-release" else "outputs/apk/debug/app-debug",
     });
     const android_manifest = androidManifest(b, opts.android);
 

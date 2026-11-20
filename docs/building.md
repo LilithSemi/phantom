@@ -39,6 +39,16 @@ Outside Nix, set `ANDROID_NDK_ROOT` and put Gradle on `PATH`. The
 Debug builds produce `<name>-debug.apk`; every non-debug optimization mode
 produces `<name>-release.apk`.
 
+Set `AndroidOptions.version_code` to a positive integer that increases with
+each release, and `AndroidOptions.version_name` to the user-visible version.
+They default to `1` and `"0.1.0"`, respectively.
+
+Release APKs are unsigned unless all four environment variables are set:
+`PHANTOM_ANDROID_KEYSTORE` (an absolute keystore path),
+`PHANTOM_ANDROID_STORE_PASSWORD`, `PHANTOM_ANDROID_KEY_ALIAS`, and
+`PHANTOM_ANDROID_KEY_PASSWORD`. An unsigned APK must be signed before it can
+be installed. Debug APKs use the Android development key.
+
 ### System UI and shell mode
 
 `AndroidOptions.system_ui` defaults to `.edge_to_edge`: Phantom draws behind
